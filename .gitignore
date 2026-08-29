@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Runtime state
+data/
+models/
+*.sqlite
+*.sqlite3
+*.db
+*.joblib
+
+# Generated exports / capture artifacts
+*.rows.csv
+*.rows.json
+*.selection.txt
+*.selection.json
+axiom_predictions*.csv
+api_handoff_*.csv
+
+# Patch / temporary artifacts
+*.patch
+*.tmp
+*.bak

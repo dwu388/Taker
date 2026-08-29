@@ -1,0 +1,20 @@
+V24 VALIDATION
+
+This file defines the validation procedure for the cleaned repository. It does not claim that GitHub CI has run unless a status check reports that separately.
+
+Run:
+  .venv\Scripts\python.exe -m pytest
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\live.sqlite
+
+For an initialized research database, also exercise as appropriate:
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 bootstrap --db data\live.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 maintain --db data\live.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 rebuild-sequence-cache --db data\live.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 audit-manifest --db data\live.sqlite
+
+Review invariants:
+  - no V15-V18 model/OCR/provider entry point is imported by the active collector;
+  - V24 defaults point to models/axiom_v24, models/axiom_policy_v24, and data/axiom_predictions_v24.csv;
+  - confirmation timestamps remain part of peak labels;
+  - paper execution fills on a later observable snapshot;
+  - V24 token assignment, heartbeat, policy promotion, calibration, counterfactual, sequence and data-vintage tables are present in migration code.
