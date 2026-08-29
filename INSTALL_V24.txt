@@ -1,17 +1,37 @@
-V24 INSTALLATION
+V24 INSTALLATION / PRODUCTION RESEARCH COLLECTION
 
 Windows:
   1. Run setup_v24.bat
   2. Keep Axiom open in an interactive desktop session for clipboard collection.
-  3. Use run_axiom_loop.bat for one-minute collection.
+  3. Run run_axiom_once.bat once as a smoke test.
+  4. Run collection_status.bat and require ready_to_collect=true.
+  5. Start/resume continuous one-minute collection with run_axiom_loop.bat.
+
+Canonical raw database:
+  data\axiom_v24_raw.sqlite
+
+The production collector creates exactly one marked collection session and refuses
+unmarked existing raw data. Each successful capture must commit one observation per
+parsed Axiom card plus the exact UTF-8 clipboard payload (SHA-256 + zlib) atomically.
+Failed captures are logged separately and never become token-absence evidence.
 
 Manual setup:
   py -3 -m venv .venv
   .venv\Scripts\python.exe -m pip install --upgrade pip
   .venv\Scripts\python.exe -m pip install -r requirements.txt
   .venv\Scripts\python.exe -m pytest
-  .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\live.sqlite
+  .venv\Scripts\python.exe -m profit_taker.collection_admin init --db data\axiom_v24_raw.sqlite --purpose v24_production_raw_collection
+  .venv\Scripts\python.exe -m profit_taker.collection_admin status --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\axiom_v24_raw.sqlite
 
-No Tesseract, RapidOCR, ONNX Runtime, provider keys, or screenshot tooling is required by this V24-only repository.
+Do not substitute data\live.sqlite when starting the fresh production research
+collection. V24 direct CLI defaults are also pinned to data\axiom_v24_raw.sqlite.
 
-PyTorch is included because the V24 causal sequence challenger imports it. LightGBM and XGBoost remain the tabular model backends.
+No Tesseract, RapidOCR, ONNX Runtime, provider keys, or screenshot tooling is
+required. PyTorch is included for the causal sequence challenger; LightGBM and
+XGBoost remain the tabular model backends.
+
+This setup is approved for fresh research-data collection and paper evaluation. It
+does not constitute approval for unattended real-money execution; that requires
+mature one-use promotion cohorts, sealed prospective audit evidence, calibrated
+paper-policy performance, and execution/liquidity evidence.

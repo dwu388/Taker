@@ -2,7 +2,7 @@ name: V24 CI
 
 on:
   push:
-    branches: [main, "hardening/**"]
+    branches: [main, "hardening/**", "fix/**"]
   pull_request:
 
 jobs:
@@ -16,7 +16,24 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-collector.txt
-      - run: python -m pytest -q tests/test_collection_readiness.py
+      - name: Collector session, provenance and status integrity
+        run: >-
+          python -m pytest -q
+          tests/test_collection_readiness.py::test_fresh_collection_session_is_idempotent_and_duration_agnostic
+          tests/test_collection_readiness.py::test_fresh_collection_refuses_unmarked_existing_raw_data
+          tests/test_collection_readiness.py::test_collection_status_detects_payload_coverage_gap
+          tests/test_final_collection_session.py
+          tests/test_capture_provenance.py
+      - name: Collector atomic persistence integrity
+        run: >-
+          python -m pytest -q
+          tests/test_collection_readiness.py::test_exact_raw_clipboard_payload_is_durable_and_hashed
+          tests/test_collection_readiness.py::test_post_commit_artifact_failure_is_nonfatal
+          tests/test_collection_readiness.py::test_failed_attempt_keeps_debug_payload_out_of_observations
+      - name: Collector partial-parse rejection
+        run: >-
+          python -m pytest -q
+          tests/test_collection_readiness.py::test_runner_rejects_partial_clipboard_parse_before_persistence
 
   v24-regression:
     runs-on: ubuntu-latest
@@ -28,4 +45,9 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m pytest -q
+      - name: Existing V24 hardening regressions
+        run: python -m pytest -q tests/test_v24_hardening.py
+      - name: Policy cfg forwarding regression
+        run: python -m pytest -q tests/test_v24_policy_cfg.py
+      - name: Final production-readiness regressions
+        run: python -m pytest -q tests/test_final_production_readiness.py
