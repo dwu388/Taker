@@ -26,7 +26,7 @@ MACRO_EVENTS = [
 ]
 
 
-def _capture_clipboard(cfg: dict) -> tuple[str, str]:
+def _capture_clipboard(cfg: dict, cycle_count: int) -> tuple[str, str]:
     try:
         import pyautogui
         import pyperclip
@@ -42,7 +42,15 @@ def _capture_clipboard(cfg: dict) -> tuple[str, str]:
         pass
 
     clipboard_text = ""
-    for delay_seconds, action, payload in MACRO_EVENTS:
+    macro_events = MACRO_EVENTS.copy()
+
+    if cycle_count % 601 == 0:
+        macro_events.insert(
+            2,
+            (2.000, "hotkey", ("ctrl", "shift", "r"))
+        )
+
+    for delay_seconds, action, payload in macro_events:
         time.sleep(delay_seconds)
         if action == "mouse_down":
             x, y = payload; pyautogui.moveTo(x, y); pyautogui.mouseDown(button="left")
@@ -81,13 +89,13 @@ def _safe_capture_stem(snapshot_at: str) -> str:
     return "Axiom-Clipboard-" + dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def run_once(args) -> dict:
+def run_once(args, cycle_count: int) -> dict:
     cfg = load_json(args.config, {})
     if args.clipboard_file:
         clipboard_text = Path(args.clipboard_file).read_text(encoding="utf-8")
         snapshot_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     else:
-        clipboard_text, snapshot_at = _capture_clipboard(cfg)
+        clipboard_text, snapshot_at = _capture_clipboard(cfg, cycle_count)
 
     if not clipboard_looks_like_axiom(clipboard_text):
         raise RuntimeError("Clipboard selection is not a valid Axiom capture; no observation was written")
@@ -123,10 +131,21 @@ def main() -> None:
 
     cfg = load_json(args.config, {})
     interval = max(1, int(cfg.get("capture", {}).get("cycle_seconds", 60)))
+    cycle_count = 0
+
     while True:
+        cycle_count += 1
         started = time.monotonic()
+
         try:
-            print(json.dumps(run_once(args), indent=2, default=str), flush=True)
+            print(
+                json.dumps(
+                    run_once(args, cycle_count),
+                    indent=2,
+                    default=str
+                ),
+                flush=True
+            )
         except Exception as exc:
             print(json.dumps({"error": type(exc).__name__, "message": str(exc), "collection_mode": "clipboard_only", "stored": 0}, indent=2), flush=True)
             if args.once or args.clipboard_file:
