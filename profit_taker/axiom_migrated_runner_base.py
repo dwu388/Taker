@@ -18,13 +18,13 @@ from .common import load_json
 from .db import RAW_DB_DEFAULT
 
 MACRO_EVENTS = [
-    (1.857, "mouse_down", (785, 116)),
-    (0.124, "mouse_up", (785, 116)),
+    (1.857, "mouse_down", (662, 114)),
+    (0.124, "mouse_up", (662, 114)),
     (2.000, "hotkey", ("ctrl", "a")),
     (2.000, "hotkey", ("ctrl", "c")),
     (2.500, "read_clipboard", ()),
-    (1.857, "mouse_down", (785, 116)),
-    (0.124, "mouse_up", (785, 116)),
+    (1.857, "mouse_down", (662, 114)),
+    (0.124, "mouse_up", (662, 114)),
 ]
 
 
