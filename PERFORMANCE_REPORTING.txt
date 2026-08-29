@@ -1,0 +1,70 @@
+V24 PERFORMANCE REPORTING
+=========================
+
+Runtime report
+--------------
+The collector automatically maintains:
+
+    data/CURRENT_MODEL_PERFORMANCE.txt
+
+Default cadence: every 60 minutes after a successful collection cycle.
+
+The cadence is configured in axiom_migrated_config.json:
+
+    performance_report.enabled
+    performance_report.interval_minutes
+    performance_report.output_path
+    performance_report.benchmark_db
+    performance_report.recent_events
+
+The report can also be regenerated immediately with:
+
+    performance_report.bat
+
+or:
+
+    python -m profit_taker.performance_report --force
+
+What the report calls a success
+-------------------------------
+- A forecast promotion is a validated success only when a challenger passes its
+  one-use out-of-sample promotion cohort and the V24 promotion rules.
+- A policy promotion is a validated policy success only when the separate policy
+  challenger passes its own one-use promotion test.
+- Positive execution-conservative paper returns are reported as paper successes,
+  but are kept separate from prospective audit evidence.
+- Positive execution-equity performance in the isolated $1,000 benchmark is shown
+  as end-to-end strategy evidence, together with drawdown.
+- A clean collection integrity gate is shown as a data-quality success, not as
+  evidence of trading alpha.
+
+What the report calls a failure or unresolved result
+----------------------------------------------------
+- Rejected forecast or policy challengers are shown explicitly as failures of the
+  challenger/promotion test rather than being hidden.
+- Losing/non-positive paper trades and negative execution-average returns are shown
+  explicitly.
+- Benchmark losses/drawdown and cancelled pending entries are surfaced.
+- Missing sealed-audit evidence, no closed paper trades, or no promoted policy are
+  reported as unresolved evidence. They are not counted as successes merely because
+  the system has collected many rows or has run for many days.
+- Collector failures, row-count mismatches, payload-integrity errors and identity
+  conflicts are shown separately as data-quality failures.
+
+Main sections
+-------------
+1. Executive performance summary
+2. Collection / data quality
+3. Forecast model registry, promotions and prediction provenance
+4. Sealed prospective audit metrics
+5. Calibration and sequence challenger status
+6. Policy registry, policy promotions and counterfactual-target maturity
+7. Paper-trading returns, win rate, reward, MFE/MAE, peak capture and close reasons
+8. Isolated $1,000 benchmark execution equity, return, drawdown and position results
+9. Interpretation guide explaining exactly what each success/failure signal means
+
+Important
+---------
+The runtime SQLite databases are intentionally excluded from Git. Therefore the
+repository itself does not contain live performance numbers. The report is populated
+from the current local V24 databases when the collector/report command runs.
