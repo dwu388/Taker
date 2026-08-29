@@ -300,8 +300,29 @@ def main(argv=None) -> int:
     return _impl.main(_argv_with_canonical_db(args))
 
 
-# Preserve the already-fixed policy training entry point from the prior facade.
-train_distributional_policy = _base.train_distributional_policy
+# ---------------------------------------------------------------------------
+# Preserve policy cfg forwarding through this outer safety facade.
+# ---------------------------------------------------------------------------
+def train_distributional_policy(db, policy_root, cfg, *, allow_small=False):
+    """Delegate to the cfg-fixed policy trainer using active public bindings.
+
+    The previous facade owns the policy implementation.  Synchronizing these
+    helper bindings preserves monkeypatch/extension behavior and guarantees the
+    active V24Config continues to reach cohort and token-assignment refreshes.
+    """
+    for name in (
+        "migrate",
+        "refresh_counterfactual_policy_targets",
+        "refresh_policy_cohorts",
+        "refresh_token_assignments",
+        "next_one_use_policy_cohort",
+    ):
+        setattr(_base, name, globals()[name])
+    return _base.train_distributional_policy(
+        db, policy_root, cfg, allow_small=allow_small
+    )
+
+
 _impl.train_distributional_policy = train_distributional_policy
 
 
