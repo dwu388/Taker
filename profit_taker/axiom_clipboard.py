@@ -11,6 +11,7 @@ class ClipboardCard:
     name: str | None = None
     ticker: str | None = None
     short_address_hint: str | None = None
+    token_address: str | None = None
 
     age_raw: str | None = None
     age_minutes: int | None = None
@@ -53,43 +54,23 @@ ADDRESS_RE = re.compile(
     r")\b"
 )
 
-DURATION_RE = re.compile(
-    r"^(\d+)\s*(s|m|h|d|w|mo|y)$",
-    re.I,
+# Solana public keys/mints are base58 and normally 32-44 characters. A full
+# candidate is accepted only when it agrees with both visible sides of Axiom's
+# shortened token address. Base58 identity is case-sensitive and is preserved.
+FULL_BASE58_RE = re.compile(
+    r"(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{32,44})(?![1-9A-HJ-NP-Za-km-z])"
 )
 
-PERCENT_RE = re.compile(
-    r"^(\d+(?:\.\d+)?)%$"
-)
-
-DEV_PAIR_RE = re.compile(
-    r"^(\d+)\s*/\s*(\d+)$"
-)
-
+DURATION_RE = re.compile(r"^(\d+)\s*(s|m|h|d|w|mo|y)$", re.I)
+PERCENT_RE = re.compile(r"^(\d+(?:\.\d+)?)%$")
+DEV_PAIR_RE = re.compile(r"^(\d+)\s*/\s*(\d+)$")
 
 CORE_FIELD_NAMES = (
-    "name",
-    "short_address_hint",
-    "age_minutes",
-    "image_reuse_count",
-    "market_cap_usd",
-    "volume_usd",
-    "fees_sol",
-    "txns",
-    "holders",
-    "pro_traders",
-    "kols",
-    "dev_migrations",
-    "dev_creations",
-    "recent_visitors",
-    "top10_holders_pct",
-    "tracked_dev_status_raw",
-    "funding_time_raw",
-    "funding_time_minutes",
-    "sniper_pct",
-    "insider_pct",
-    "bundler_pct",
-    "dex_paid",
+    "name", "short_address_hint", "token_address", "age_minutes", "image_reuse_count",
+    "market_cap_usd", "volume_usd", "fees_sol", "txns", "holders", "pro_traders",
+    "kols", "dev_migrations", "dev_creations", "recent_visitors", "top10_holders_pct",
+    "tracked_dev_status_raw", "funding_time_raw", "funding_time_minutes", "sniper_pct",
+    "insider_pct", "bundler_pct", "dex_paid",
 )
 
 
@@ -106,25 +87,13 @@ def clipboard_looks_like_axiom(text: str) -> bool:
     """Strictly reject stale/unrelated clipboard contents."""
     if not text or len(text) < 250:
         return False
-
     lower = text.lower()
-    required = (
-        "pulse",
-        "migrated",
-        "mc",
-        "tx",
-    )
+    required = ("pulse", "migrated", "mc", "tx")
     if sum(term in lower for term in required) < 3:
         return False
-
     lines = _clean_lines(text)
     mc_count = sum(line.upper() == "MC" for line in lines)
     address_count = sum(bool(ADDRESS_RE.search(line)) for line in lines)
-
-    # A valid Axiom Migrated selection should contain several card-shaped
-    # repetitions. Requiring both MC labels and shortened addresses prevents a
-    # copied search box, random browser text, or stale clipboard from entering
-    # the training database.
     return mc_count >= 2 and address_count >= 2
 
 
@@ -133,15 +102,8 @@ def _parse_compact_number(value: str) -> float | None:
     m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMB]?)", s, re.I)
     if not m:
         return None
-
     number = float(m.group(1))
-    suffix = m.group(2).upper()
-    multiplier = {
-        "": 1.0,
-        "K": 1_000.0,
-        "M": 1_000_000.0,
-        "B": 1_000_000_000.0,
-    }[suffix]
+    multiplier = {"": 1.0, "K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0}[m.group(2).upper()]
     return number * multiplier
 
 
@@ -169,61 +131,29 @@ def _duration_minutes(raw: str) -> int | None:
     m = DURATION_RE.fullmatch(raw.strip())
     if not m:
         return None
-
     count = int(m.group(1))
-    unit = m.group(2).lower()
-    multipliers = {
-        "s": 1 / 60,
-        "m": 1,
-        "h": 60,
-        "d": 1_440,
-        "w": 10_080,
-        "mo": 43_200,
-        "y": 525_600,
-    }
-    return int(round(count * multipliers[unit]))
+    multipliers = {"s": 1 / 60, "m": 1, "h": 60, "d": 1_440, "w": 10_080, "mo": 43_200, "y": 525_600}
+    return int(round(count * multipliers[m.group(2).lower()]))
 
 
 def _duration_precision_minutes(raw: str) -> int:
     m = DURATION_RE.fullmatch(raw.strip())
     if not m:
         return 1
-
-    unit = m.group(2).lower()
-    return {
-        "s": 1,
-        "m": 1,
-        "h": 60,
-        "d": 1_440,
-        "w": 10_080,
-        "mo": 43_200,
-        "y": 525_600,
-    }[unit]
+    return {"s": 1, "m": 1, "h": 60, "d": 1_440, "w": 10_080, "mo": 43_200, "y": 525_600}[m.group(2).lower()]
 
 
-def _find_metric(
-    lines: list[str],
-    label: str,
-    *,
-    compact: bool,
-) -> float | None:
+def _find_metric(lines: list[str], label: str, *, compact: bool) -> float | None:
     label_upper = label.upper()
-
     for i, line in enumerate(lines):
         if line.upper() != label_upper:
             continue
-
         j = i + 1
         if j < len(lines) and lines[j].upper() == "SOL":
             j += 1
-
         if j >= len(lines):
             return None
-
-        if compact:
-            return _parse_compact_number(lines[j])
-        return _parse_float(lines[j])
-
+        return _parse_compact_number(lines[j]) if compact else _parse_float(lines[j])
     return None
 
 
@@ -232,10 +162,8 @@ def _find_tx(lines: list[str]) -> int | None:
         m = re.fullmatch(r"TX\s*([0-9][0-9,]*)", line, re.I)
         if m:
             return _parse_int(m.group(1))
-
         if line.upper() == "TX" and i + 1 < len(lines):
             return _parse_int(lines[i + 1])
-
     return None
 
 
@@ -247,17 +175,33 @@ def _find_address_index(lines: list[str]) -> tuple[int | None, str | None]:
     return None, None
 
 
+def _short_address_parts(value: str | None) -> tuple[str, str] | None:
+    if not value:
+        return None
+    normalized = value.replace("…", "...")
+    if "..." not in normalized:
+        return None
+    prefix, suffix = normalized.split("...", 1)
+    return (prefix, suffix) if prefix and suffix else None
+
+
+def _matching_full_mint(lines: list[str], short_address: str | None) -> str | None:
+    parts = _short_address_parts(short_address)
+    if parts is None:
+        return None
+    prefix, suffix = parts
+    matches: list[str] = []
+    for line in lines:
+        for candidate in FULL_BASE58_RE.findall(line):
+            if candidate.startswith(prefix) and candidate.endswith(suffix):
+                matches.append(candidate)
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
 def _is_metric_or_ui_line(value: str) -> bool:
     s = value.strip().lower()
-    if s in {
-        "mc",
-        "v",
-        "f",
-        "sol",
-        "pump amm",
-        "raydium clmm",
-        "paid",
-    }:
+    if s in {"mc", "v", "f", "sol", "pump amm", "raydium clmm", "paid"}:
         return True
     if s.startswith("tx "):
         return True
@@ -270,26 +214,16 @@ def _parse_identity(lines: list[str], card: ClipboardCard) -> None:
     addr_idx, address = _find_address_index(lines)
     if addr_idx is None:
         return
-
     card.short_address_hint = address
-
-    # Selected Axiom DOM order around identity is consistently:
-    #   [optional image-reuse badge]
-    #   display name
-    #   short address
-    #   ticker
-    #   full/display name
-    #   age
+    card.token_address = _matching_full_mint(lines, address)
     if addr_idx + 1 < len(lines):
         candidate = lines[addr_idx + 1]
         if not _is_metric_or_ui_line(candidate) and not DURATION_RE.fullmatch(candidate):
             card.ticker = candidate[:120]
-
     if addr_idx + 2 < len(lines):
         candidate = lines[addr_idx + 2]
         if not _is_metric_or_ui_line(candidate) and not DURATION_RE.fullmatch(candidate):
             card.name = candidate[:120]
-
     if not card.name and addr_idx > 0:
         candidate = lines[addr_idx - 1]
         if not _is_metric_or_ui_line(candidate):
@@ -300,16 +234,10 @@ def _parse_image_reuse(lines: list[str], card: ClipboardCard) -> None:
     for i, line in enumerate(lines):
         if line.lower() not in {"pump amm", "raydium clmm"}:
             continue
-
-        if i + 1 >= len(lines):
-            return
-
-        # The image reuse badge, when present, is an isolated integer directly
-        # after the AMM line. A token name such as "200ms" is deliberately not
-        # accepted as an integer.
-        value = _parse_int(lines[i + 1])
-        if value is not None:
-            card.image_reuse_count = value
+        if i + 1 < len(lines):
+            value = _parse_int(lines[i + 1])
+            if value is not None:
+                card.image_reuse_count = value
         return
 
 
@@ -317,7 +245,6 @@ def _parse_age(lines: list[str], card: ClipboardCard) -> int | None:
     addr_idx, _ = _find_address_index(lines)
     start = 0 if addr_idx is None else addr_idx + 1
     end = len(lines) if addr_idx is None else min(len(lines), addr_idx + 8)
-
     for i in range(start, end):
         raw = lines[i].strip()
         if DURATION_RE.fullmatch(raw):
@@ -325,90 +252,59 @@ def _parse_age(lines: list[str], card: ClipboardCard) -> int | None:
             card.age_minutes = _duration_minutes(card.age_raw)
             card.age_precision_minutes = _duration_precision_minutes(card.age_raw)
             return i
-
     return None
 
 
 def _parse_lifecycle_tail(lines: list[str], card: ClipboardCard, age_idx: int | None) -> None:
     if age_idx is None:
         return
-
     tail = lines[age_idx + 1:]
     if not tail:
         return
-
-    # The first three isolated integers are holders, pro traders, and KOLs.
-    # Stop collecting those once the dev pair is reached so a visitor count
-    # cannot be shifted into one of the first three fields.
     prefix_ints: list[int] = []
     dev_pair_index: int | None = None
-
     for i, value in enumerate(tail):
         pair = DEV_PAIR_RE.fullmatch(value)
         if pair:
-            a = int(pair.group(1))
-            b = int(pair.group(2))
+            a, b = int(pair.group(1)), int(pair.group(2))
             if a <= b:
-                card.dev_migrations = a
-                card.dev_creations = b
+                card.dev_migrations, card.dev_creations = a, b
             dev_pair_index = i
             break
-
         parsed_int = _parse_int(value)
         if parsed_int is not None:
             prefix_ints.append(parsed_int)
-
     if prefix_ints:
         card.holders = prefix_ints[0]
     if len(prefix_ints) >= 2:
         card.pro_traders = prefix_ints[1]
     if len(prefix_ints) >= 3:
         card.kols = prefix_ints[2]
-
     if dev_pair_index is not None:
-        # Recent visitors is the first isolated integer after the dev pair and
-        # before the audit/funding tail begins.
         for value in tail[dev_pair_index + 1:]:
             parsed_int = _parse_int(value)
             if parsed_int is not None:
                 card.recent_visitors = parsed_int
                 break
-            if PERCENT_RE.fullmatch(value) or DURATION_RE.fullmatch(value):
+            if PERCENT_RE.fullmatch(value) or DURATION_RE.fullmatch(value) or value.upper() in {"DS", "PAID"}:
                 break
-            if value.upper() in {"DS", "PAID"}:
-                break
-
     percentages: list[tuple[int, float]] = []
     durations: list[tuple[int, str]] = []
-
     for i, value in enumerate(tail):
         pct = PERCENT_RE.fullmatch(value)
         if pct:
             percentages.append((i, float(pct.group(1))))
-            continue
-
-        if DURATION_RE.fullmatch(value):
+        elif DURATION_RE.fullmatch(value):
             durations.append((i, value.replace(" ", "")))
-
-    # First percentage after the lifecycle counts is Top 10. The final three
-    # percentages are the stable sniper / insider / bundler audit fields.
     if percentages:
         card.top10_holders_pct = percentages[0][1]
     if len(percentages) >= 4:
-        card.sniper_pct = percentages[-3][1]
-        card.insider_pct = percentages[-2][1]
-        card.bundler_pct = percentages[-1][1]
-
-    # The first duration after token age is the funding-time field. Token age
-    # itself is outside this tail, so there is no need for a "second duration"
-    # heuristic here.
+        card.sniper_pct, card.insider_pct, card.bundler_pct = percentages[-3][1], percentages[-2][1], percentages[-1][1]
     if durations:
         card.funding_time_raw = durations[0][1]
         card.funding_time_minutes = _duration_minutes(card.funding_time_raw)
-
     if any(value.upper() == "DS" for value in tail):
         card.tracked_dev_status_raw = "DS"
-
     if any(value.lower() == "paid" for value in tail):
         card.dex_paid = True
 
@@ -417,44 +313,26 @@ def _parse_block(block: str) -> ClipboardCard | None:
     lines = _clean_lines(block)
     if len(lines) < 8:
         return None
-
     card = ClipboardCard(source_block=block)
-
     card.market_cap_usd = _find_metric(lines, "MC", compact=True)
     card.volume_usd = _find_metric(lines, "V", compact=True)
     card.fees_sol = _find_metric(lines, "F", compact=False)
     card.txns = _find_tx(lines)
-
     _parse_identity(lines, card)
     _parse_image_reuse(lines, card)
     age_idx = _parse_age(lines, card)
     _parse_lifecycle_tail(lines, card, age_idx)
-
-    # Identity is mandatory. Without the shortened mint/address the row cannot
-    # be linked safely across five-minute captures and therefore must not be
-    # invented from a token name.
     if not card.short_address_hint:
         return None
-
-    # Keep cards when the stable identity exists and at least two core market
-    # metrics parse. Individual missing features remain NULL and are handled by
-    # the existing feature-store missingness logic.
-    core_market = (
-        card.market_cap_usd,
-        card.volume_usd,
-        card.fees_sol,
-        card.txns,
-    )
+    core_market = (card.market_cap_usd, card.volume_usd, card.fees_sol, card.txns)
     if sum(value is not None for value in core_market) < 2:
         return None
-
     return card
 
 
 def _split_mc_blocks(text: str) -> list[str]:
     lines = _clean_lines(text)
     starts = [i for i, line in enumerate(lines) if line.upper() == "MC"]
-
     blocks: list[str] = []
     for position, start in enumerate(starts):
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
@@ -467,22 +345,19 @@ def _split_mc_blocks(text: str) -> list[str]:
 def parse_clipboard_cards(text: str) -> list[ClipboardCard]:
     if not clipboard_looks_like_axiom(text):
         return []
-
     cards: list[ClipboardCard] = []
     seen_addresses: set[str] = set()
-
     for block in _split_mc_blocks(text):
         card = _parse_block(block)
         if card is None or card.short_address_hint is None:
             continue
-
-        address_key = _normalize_token_key(card.short_address_hint)
+        # Full mints are case-sensitive; shortened hints retain the historical
+        # normalized key behavior until the full mint becomes available.
+        address_key = card.token_address or _normalize_token_key(card.short_address_hint)
         if not address_key or address_key in seen_addresses:
             continue
-
         seen_addresses.add(address_key)
         cards.append(card)
-
     return cards
 
 
@@ -492,46 +367,24 @@ def _normalize_token_key(value: str | None) -> str:
 
 def clipboard_card_to_row(card: ClipboardCard, card_index: int) -> dict[str, Any]:
     """Convert one parsed clipboard card into the canonical observation row."""
-    token_key = _normalize_token_key(card.short_address_hint)
-
+    token_key = card.token_address or _normalize_token_key(card.short_address_hint)
     field_values = {
-        "name": card.name,
-        "short_address_hint": card.short_address_hint,
-        "age_minutes": card.age_minutes,
-        "image_reuse_count": card.image_reuse_count,
-        "market_cap_usd": card.market_cap_usd,
-        "volume_usd": card.volume_usd,
-        "fees_sol": card.fees_sol,
-        "txns": card.txns,
-        "holders": card.holders,
-        "pro_traders": card.pro_traders,
-        "kols": card.kols,
-        "dev_migrations": card.dev_migrations,
-        "dev_creations": card.dev_creations,
-        "recent_visitors": card.recent_visitors,
-        "top10_holders_pct": card.top10_holders_pct,
-        "tracked_dev_status_raw": card.tracked_dev_status_raw,
-        "funding_time_raw": card.funding_time_raw,
-        "funding_time_minutes": card.funding_time_minutes,
-        "sniper_pct": card.sniper_pct,
-        "insider_pct": card.insider_pct,
-        "bundler_pct": card.bundler_pct,
-        "dex_paid": card.dex_paid,
+        "name": card.name, "short_address_hint": card.short_address_hint, "token_address": card.token_address,
+        "age_minutes": card.age_minutes, "image_reuse_count": card.image_reuse_count,
+        "market_cap_usd": card.market_cap_usd, "volume_usd": card.volume_usd, "fees_sol": card.fees_sol,
+        "txns": card.txns, "holders": card.holders, "pro_traders": card.pro_traders, "kols": card.kols,
+        "dev_migrations": card.dev_migrations, "dev_creations": card.dev_creations,
+        "recent_visitors": card.recent_visitors, "top10_holders_pct": card.top10_holders_pct,
+        "tracked_dev_status_raw": card.tracked_dev_status_raw, "funding_time_raw": card.funding_time_raw,
+        "funding_time_minutes": card.funding_time_minutes, "sniper_pct": card.sniper_pct,
+        "insider_pct": card.insider_pct, "bundler_pct": card.bundler_pct, "dex_paid": card.dex_paid,
     }
-
-    confidence = {
-        key: (1.0 if value is not None else 0.0)
-        for key, value in field_values.items()
-    }
-    field_source = {
-        key: ("clipboard_primary" if value is not None else "missing")
-        for key, value in field_values.items()
-    }
-
+    confidence = {key: (1.0 if value is not None else 0.0) for key, value in field_values.items()}
+    field_source = {key: ("clipboard_primary" if value is not None else "missing") for key, value in field_values.items()}
     confidence["token_key"] = 1.0 if token_key else 0.0
     field_source["token_key"] = "clipboard_primary" if token_key else "missing"
-
-    row: dict[str, Any] = {
+    identity_method = "full_mint_matched_to_short_address" if card.token_address else "short_address"
+    return {
         **field_values,
         "token_key": token_key or None,
         "data_origin": "clipboard_only",
@@ -544,7 +397,8 @@ def clipboard_card_to_row(card: ClipboardCard, card_index: int) -> dict[str, Any
             "training_eligible": bool(token_key),
             "clipboard_only": {
                 "clipboard_card": card_index,
-                "identity_method": "short_address",
+                "identity_method": identity_method,
+                "full_mint_available": bool(card.token_address),
                 "timing": "clipboard_selection",
                 "age_raw": card.age_raw,
                 "age_precision_minutes": card.age_precision_minutes,
@@ -552,12 +406,9 @@ def clipboard_card_to_row(card: ClipboardCard, card_index: int) -> dict[str, Any
         },
     }
 
-    return row
-
 
 def rows_from_clipboard(text: str) -> list[dict[str, Any]]:
-    cards = parse_clipboard_cards(text)
-    return [clipboard_card_to_row(card, i) for i, card in enumerate(cards)]
+    return [clipboard_card_to_row(card, i) for i, card in enumerate(parse_clipboard_cards(text))]
 
 
 def clipboard_diagnostics(text: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -567,6 +418,8 @@ def clipboard_diagnostics(text: str, rows: list[dict[str, Any]]) -> dict[str, An
         "clipboard_cards": len(rows),
         "observations": len(rows),
         "unique_token_keys": len({row.get("token_key") for row in rows if row.get("token_key")}),
+        "full_mint_rows": sum(1 for row in rows if row.get("token_address")),
+        "short_only_rows": sum(1 for row in rows if row.get("token_key") and not row.get("token_address")),
         "ocr_enabled": False,
         "screenshot_enabled": False,
         "ocr_rows": 0,
