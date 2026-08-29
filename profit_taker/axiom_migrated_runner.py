@@ -88,6 +88,7 @@ def _safe_capture_stem(snapshot_at: str) -> str:
     dt = datetime.fromisoformat(snapshot_at.replace("Z", "+00:00"))
     return "Axiom-Clipboard-" + dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+
 ARTIFACT_RETENTION_CYCLES = 10
 
 
@@ -95,53 +96,57 @@ def _prune_cycle_artifacts(
     output_dir: str | Path,
     keep_cycles: int = ARTIFACT_RETENTION_CYCLES,
 ) -> dict:
-    out_dir = Path(output_dir)
+    """Best-effort cleanup of disposable per-capture diagnostics.
 
+    Database persistence is authoritative. Cleanup errors are reported but never
+    allowed to make a successfully committed observation cycle look failed.
+    """
+    out_dir = Path(output_dir)
+    result = {
+        "cycles_retained": 0,
+        "cycles_deleted": 0,
+        "files_deleted": 0,
+        "errors": [],
+    }
     if not out_dir.exists():
-        return {
-            "cycles_retained": 0,
-            "cycles_deleted": 0,
-            "files_deleted": 0,
-        }
+        return result
 
     cycles: dict[str, list[Path]] = {}
+    try:
+        paths = list(out_dir.glob("Axiom-Clipboard-*.selection*"))
+    except OSError as exc:
+        result["errors"].append(f"glob: {type(exc).__name__}: {exc}")
+        return result
 
-    # One cycle currently creates files such as:
-    #
-    # Axiom-Clipboard-20260828T230100Z.selection.txt
-    # Axiom-Clipboard-20260828T230100Z.selection.json
-    # Axiom-Clipboard-20260828T230100Z.selection.rows.json
-    # Axiom-Clipboard-20260828T230100Z.selection.rows.csv
-    #
-    # Group all four by the capture timestamp.
-    for path in out_dir.glob("Axiom-Clipboard-*.selection*"):
-        if not path.is_file():
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+        except OSError as exc:
+            result["errors"].append(f"stat {path}: {type(exc).__name__}: {exc}")
             continue
-
         cycle_stem = path.name.split(".selection", 1)[0]
         cycles.setdefault(cycle_stem, []).append(path)
 
-    # Timestamp format YYYYMMDDTHHMMSSZ sorts chronologically.
     ordered = sorted(cycles.items(), key=lambda item: item[0], reverse=True)
+    result["cycles_retained"] = min(len(ordered), max(0, int(keep_cycles)))
 
-    deleted_cycles = 0
-    deleted_files = 0
-
-    for _, files in ordered[keep_cycles:]:
+    for _, files in ordered[max(0, int(keep_cycles)):]:
+        cycle_had_file = False
         for path in files:
             try:
                 path.unlink()
-                deleted_files += 1
+                result["files_deleted"] += 1
+                cycle_had_file = True
             except FileNotFoundError:
-                pass
+                continue
+            except OSError as exc:
+                result["errors"].append(f"delete {path}: {type(exc).__name__}: {exc}")
+        if cycle_had_file:
+            result["cycles_deleted"] += 1
 
-        deleted_cycles += 1
+    return result
 
-    return {
-        "cycles_retained": min(len(ordered), keep_cycles),
-        "cycles_deleted": deleted_cycles,
-        "files_deleted": deleted_files,
-    }
 
 def run_once(args, cycle_count: int) -> dict:
     cfg = load_json(args.config, {})
@@ -176,18 +181,14 @@ def run_once(args, cycle_count: int) -> dict:
         rows,
         True,
         args.output_dir,
-        screenshot_rows_detected=0,
+        screenshot_rows_detected=len(rows),
     )
 
     result["clipboard_report"] = diag
-
-    # Keep only the most recent 10 successfully generated
-    # capture-artifact groups on disk.
     result["artifact_cleanup"] = _prune_cycle_artifacts(
         args.output_dir,
-        keep_cycles=10,
+        keep_cycles=ARTIFACT_RETENTION_CYCLES,
     )
-
     return result
 
 
