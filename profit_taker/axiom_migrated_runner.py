@@ -88,6 +88,60 @@ def _safe_capture_stem(snapshot_at: str) -> str:
     dt = datetime.fromisoformat(snapshot_at.replace("Z", "+00:00"))
     return "Axiom-Clipboard-" + dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+ARTIFACT_RETENTION_CYCLES = 10
+
+
+def _prune_cycle_artifacts(
+    output_dir: str | Path,
+    keep_cycles: int = ARTIFACT_RETENTION_CYCLES,
+) -> dict:
+    out_dir = Path(output_dir)
+
+    if not out_dir.exists():
+        return {
+            "cycles_retained": 0,
+            "cycles_deleted": 0,
+            "files_deleted": 0,
+        }
+
+    cycles: dict[str, list[Path]] = {}
+
+    # One cycle currently creates files such as:
+    #
+    # Axiom-Clipboard-20260828T230100Z.selection.txt
+    # Axiom-Clipboard-20260828T230100Z.selection.json
+    # Axiom-Clipboard-20260828T230100Z.selection.rows.json
+    # Axiom-Clipboard-20260828T230100Z.selection.rows.csv
+    #
+    # Group all four by the capture timestamp.
+    for path in out_dir.glob("Axiom-Clipboard-*.selection*"):
+        if not path.is_file():
+            continue
+
+        cycle_stem = path.name.split(".selection", 1)[0]
+        cycles.setdefault(cycle_stem, []).append(path)
+
+    # Timestamp format YYYYMMDDTHHMMSSZ sorts chronologically.
+    ordered = sorted(cycles.items(), key=lambda item: item[0], reverse=True)
+
+    deleted_cycles = 0
+    deleted_files = 0
+
+    for _, files in ordered[keep_cycles:]:
+        for path in files:
+            try:
+                path.unlink()
+                deleted_files += 1
+            except FileNotFoundError:
+                pass
+
+        deleted_cycles += 1
+
+    return {
+        "cycles_retained": min(len(ordered), keep_cycles),
+        "cycles_deleted": deleted_cycles,
+        "files_deleted": deleted_files,
+    }
 
 def run_once(args, cycle_count: int) -> dict:
     cfg = load_json(args.config, {})
@@ -115,8 +169,25 @@ def run_once(args, cycle_count: int) -> dict:
     diag["selection_path"] = str(selection_path)
     (out_dir / f"{stem}.selection.json").write_text(diagnostics_json(diag), encoding="utf-8")
 
-    result = process_rows(args.db, snapshot_at, str(selection_path), rows, True, args.output_dir, screenshot_rows_detected=0)
+    result = process_rows(
+        args.db,
+        snapshot_at,
+        str(selection_path),
+        rows,
+        True,
+        args.output_dir,
+        screenshot_rows_detected=0,
+    )
+
     result["clipboard_report"] = diag
+
+    # Keep only the most recent 10 successfully generated
+    # capture-artifact groups on disk.
+    result["artifact_cleanup"] = _prune_cycle_artifacts(
+        args.output_dir,
+        keep_cycles=10,
+    )
+
     return result
 
 
