@@ -64,6 +64,7 @@ def _sync_test_and_extension_hooks() -> None:
         "rows_from_clipboard",
         "clipboard_diagnostics",
         "diagnostics_json",
+        "_raw_mc_card_count",
         "process_rows",
         "record_failed_capture_attempt",
     ):
