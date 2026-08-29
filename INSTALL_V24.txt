@@ -3,9 +3,20 @@ V24 INSTALLATION / PRODUCTION RESEARCH COLLECTION
 Windows:
   1. Run setup_v24.bat
   2. Keep Axiom open in an interactive desktop session for clipboard collection.
-  3. Run run_axiom_once.bat once as a smoke test.
-  4. Run collection_status.bat and require ready_to_collect=true.
-  5. Start/resume continuous one-minute collection with run_axiom_loop.bat.
+  3. Configure the Axiom Migrated view to expose tokens through 25 hours.
+  4. Run run_axiom_once.bat once as a smoke test.
+  5. Run collection_status.bat and require ready_to_collect=true.
+  6. Start/resume continuous one-minute collection with run_axiom_loop.bat.
+
+Active lifecycle contract:
+  prediction horizon:       1440 minutes / 24 hours
+  Axiom viewing window:     1500 minutes / 25 hours
+  natural age-out guard:    1440 minutes / 24 hours
+  view-only safety buffer:    60 minutes / 1 hour
+
+The 25th visible hour is deliberately not a prediction horizon. It exists so a token
+that reaches the complete 24-hour lifecycle can still be observed across the model
+boundary without teaching UI age-out as operational death.
 
 Canonical raw database:
   data\axiom_v24_raw.sqlite
@@ -23,6 +34,15 @@ Manual setup:
   .venv\Scripts\python.exe -m profit_taker.collection_admin init --db data\axiom_v24_raw.sqlite --purpose v24_production_raw_collection
   .venv\Scripts\python.exe -m profit_taker.collection_admin status --db data\axiom_v24_raw.sqlite
   .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\axiom_v24_raw.sqlite
+
+Migration from the former 72-hour target:
+  - keep valid authoritative raw observations;
+  - the first label refresh under this version detects old finalized target metadata
+    and rebuilds derived peak/lifecycle labels from the raw observations;
+  - do not treat an old 72-hour champion as the new champion. V24 schema and target
+    hashes intentionally separate the generations and refuse warm continuation;
+  - bootstrap the 24-hour generation only after a mature one-use promotion cohort is
+    available under the new 24h lifecycle/outcome timing.
 
 Do not substitute data\live.sqlite when starting the fresh production research
 collection. V24 direct CLI defaults are also pinned to data\axiom_v24_raw.sqlite.

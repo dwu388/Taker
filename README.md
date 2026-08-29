@@ -14,15 +14,34 @@ SQLite with SHA-256 + zlib.
 `collection_status.bat` is the operational readiness gate. Do not treat a dataset as
 an authoritative fresh collection unless it reports `ready_to_collect=true`.
 
+## Active 24-hour lifecycle contract
+
+V24 now predicts the token lifecycle through **24 hours** while Axiom is configured
+to expose tokens through **25 hours**. The last visible hour is deliberately a
+collection buffer; it is not a target horizon and disappearance at the model boundary
+is not learned as operational death.
+
+- prediction horizon: 1,440 minutes (24h)
+- Axiom view: 1,500 minutes (25h)
+- natural model age-out guard: 1,440 minutes (24h)
+- collection cadence: 1 minute
+- operational disappearance gap: 50 minutes of contiguous successful captures
+- primary probability horizons: 1h, 4h, 8h, 12h and 24h
+- causal sequence windows: 1h, 4h, 6h, 12h and 24h
+
+Changing from the former 72h target is a model-generation change. Raw prospective
+observations remain usable, but derived labels are rebuilt under the 24h contract and
+old 72h forecaster/policy champions are not warm-promoted into the new generation.
+
 ## Active architecture
 
 - `profit_taker/axiom_migrated_runner.py`: production-hardened one-minute clipboard-only Axiom capture. No screenshots or OCR.
 - `profit_taker/axiom_clipboard.py`: Axiom clipboard parsing, complete-card validation and full-mint matching.
 - `profit_taker/axiom_migrated_process.py`: atomic raw observation + exact-payload persistence; silent duplicate loss is forbidden.
 - `profit_taker/collection_admin.py`: fresh-session initialization and end-to-end raw collection integrity audit.
-- `profit_taker/axiom_peak_structure.py`: confirmation-safe recurrent peak structure and causal feature cache; operational DB IDs are excluded from model inputs.
+- `profit_taker/axiom_peak_structure.py`: 24h confirmation-safe recurrent peak structure, natural-age-out protection and causal feature cache; operational DB IDs are excluded from model inputs.
 - `profit_taker/axiom_self_teach.py`: paper-policy compatibility substrate, including next-observable fills and behavior-policy accounting.
-- `profit_taker/axiom_v24.py`: V24 forecaster/policy/audit implementation, with token-first holdouts, data vintage, sequence-cache invalidation and sealed prospective audit.
+- `profit_taker/axiom_v24.py`: 24h V24 forecaster/policy/audit implementation, with token-first holdouts, data vintage, sequence-cache invalidation and sealed prospective audit.
 - `profit_taker/axiom_budget_benchmark.py`: V24-aware isolated $1,000 paper benchmark.
 
 V24 model outputs default to `models/axiom_v24`, policy artifacts to
@@ -36,7 +55,8 @@ setup_v24.bat
 
 ## Start a fresh authoritative collection
 
-Smoke-test one capture, then inspect readiness:
+Configure the Axiom page to show the 25-hour window, smoke-test one capture, then
+inspect readiness:
 
 ```bat
 run_axiom_once.bat
@@ -49,8 +69,8 @@ If `ready_to_collect=true`, start/resume continuous collection:
 run_axiom_loop.bat
 ```
 
-The collector does **not** contain a hardcoded 17-day or 20-day training trigger.
-Collection duration is an evidence/maturity decision, not a stop condition.
+The collector does **not** contain a hardcoded training-day trigger. Collection
+duration is an evidence/maturity decision, not a stop condition.
 
 ## V24 operations
 

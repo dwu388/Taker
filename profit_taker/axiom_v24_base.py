@@ -1,8 +1,10 @@
 """Public V24 compatibility facade.
 
 The full V24 implementation is kept in :mod:`profit_taker.axiom_v24_impl`.
-This facade preserves the historical ``profit_taker.axiom_v24`` import path while
-allowing small, reviewable fixes without rewriting the large implementation file.
+This facade preserves the historical import path while keeping small production
+hardening fixes reviewable. The active outer facade specializes the lifecycle to
+24 hours; this layer also prevents missing retired horizon heads and incompatible
+policy champions from crossing that target-definition boundary.
 """
 from __future__ import annotations
 
@@ -15,10 +17,27 @@ import uuid
 
 from . import axiom_v24_impl as _impl
 
-# Preserve the complete public/private module surface expected by existing callers.
 for _name in dir(_impl):
     if not _name.startswith("__"):
         globals()[_name] = getattr(_impl, _name)
+
+
+# Retained implementation fit loops contain historical horizon literals. The active
+# facade may deliberately omit a retired target (for example 4320m in the 24h line).
+# A missing target is therefore an unavailable head, not an exception or an invented
+# all-zero target.
+_original_fit_blended_regression = _impl._fit_blended_regression
+
+
+def _fit_blended_regression(data, features, target, n_estimators, *, quantile=None, poisson=False):
+    if target not in data.columns:
+        return None
+    return _original_fit_blended_regression(
+        data, features, target, n_estimators, quantile=quantile, poisson=poisson
+    )
+
+
+_impl._fit_blended_regression = _fit_blended_regression
 
 
 def train_distributional_policy(
@@ -30,9 +49,9 @@ def train_distributional_policy(
 ) -> dict[str, Any]:
     """Train/promote the V24 distributional policy using the supplied config.
 
-    ``refresh_policy_cohorts`` and ``refresh_token_assignments`` both require the
-    active :class:`V24Config`.  Forwarding ``cfg`` here is essential because policy
-    cohort scheduling and immutable token assignment depend on those settings.
+    Policy cohorts and token assignments receive the active V24Config. A champion
+    from a different target definition (notably the former 72h lifecycle) is never
+    compared against or warm-promoted into the active generation.
     """
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
@@ -54,8 +73,10 @@ def train_distributional_policy(
         if entry_head is None and hold_head is None:
             raise RuntimeError("No V24 counterfactual policy head has enough development-eligible OOS forecasts.")
 
+        active_target_hash = target_definition_hash(cfg)
+        active_execution_hash = execution_definition_hash(cfg)
         candidate = {
-            "schema_version": "v21_self_teaching_incremental_72h_2_execution_accounting",
+            "schema_version": selfteach.SCHEMA_VERSION,
             "v24_policy_schema": SCHEMA_VERSION,
             "created_at": _now_iso(),
             "entry_head": entry_head,
@@ -65,8 +86,8 @@ def train_distributional_policy(
             "config": asdict(cfg),
             "training_rows_entry": int(len(entry)),
             "training_rows_hold": int(len(hold)),
-            "target_definition_hash": target_definition_hash(cfg),
-            "execution_definition_hash": execution_definition_hash(cfg),
+            "target_definition_hash": active_target_hash,
+            "execution_definition_hash": active_execution_hash,
         }
 
         eval_entry = _entry_policy_training_rows(conn, eval_cohort_id=str(cohort["cohort_id"]), horizon=60)
@@ -74,6 +95,16 @@ def train_distributional_policy(
         cand_eval = evaluate_policy_bundle(candidate, eval_entry, eval_hold, cfg)
         champion_path = Path(policy_root) / "champion.joblib"
         champion = joblib.load(champion_path) if champion_path.exists() else None
+        champion_compatible = bool(
+            champion
+            and champion.get("target_definition_hash") == active_target_hash
+            and champion.get("execution_definition_hash") == active_execution_hash
+            and champion.get("v24_policy_schema") == SCHEMA_VERSION
+            and bool(champion.get("oos_only", False))
+        )
+        if champion and not champion_compatible:
+            champion = None
+
         champ_eval = (
             evaluate_policy_bundle(champion, eval_entry, eval_hold, cfg)
             if champion
@@ -102,6 +133,8 @@ def train_distributional_policy(
             f"paired_token_value_mean={boot['mean']:.6f}; "
             f"ci=[{boot['ci_low']:.6f},{boot['ci_high']:.6f}]; n={boot['n_tokens']}"
         )
+        if not champion_compatible and champion_path.exists():
+            reason += "; previous champion excluded because target/execution/schema definition changed"
 
         Path(policy_root).mkdir(parents=True, exist_ok=True)
         stamp = _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -116,20 +149,14 @@ def train_distributional_policy(
             "candidate": {k: v for k, v in cand_eval.items() if k != "token_values"},
             "champion": {k: v for k, v in champ_eval.items() if k != "token_values"},
             "bootstrap": boot,
+            "previous_champion_compatible": champion_compatible,
         }
         conn.execute(
             f"INSERT INTO {POLICY_PROMOTION_TABLE}(promotion_id,created_at,cohort_id,candidate_path,candidate_hash,champion_before_path,champion_before_hash,promoted,metrics_json,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
-                pid,
-                _now_iso(),
-                cohort["cohort_id"],
-                str(cand_path),
-                _hash_file(cand_path),
-                str(champion_path) if champion_path.exists() else None,
-                before_hash,
-                int(promoted),
-                _json(metrics),
-                reason,
+                pid, _now_iso(), cohort["cohort_id"], str(cand_path), _hash_file(cand_path),
+                str(champion_path) if champion_path.exists() else None, before_hash,
+                int(promoted), _json(metrics), reason,
             ),
         )
         conn.execute(
@@ -141,18 +168,9 @@ def train_distributional_policy(
         conn.execute(
             f"INSERT INTO {POLICY_REGISTRY}(version_id,created_at,model_path,model_hash,status,training_rows_entry,training_rows_hold,oos_only,metrics_json,notes,target_definition_hash,execution_definition_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                vid,
-                _now_iso(),
-                str(cand_path),
-                _hash_file(cand_path),
-                status_value,
-                len(entry),
-                len(hold),
-                1,
-                _json(metrics),
-                reason,
-                candidate["target_definition_hash"],
-                candidate["execution_definition_hash"],
+                vid, _now_iso(), str(cand_path), _hash_file(cand_path), status_value,
+                len(entry), len(hold), 1, _json(metrics), reason,
+                candidate["target_definition_hash"], candidate["execution_definition_hash"],
             ),
         )
         if promoted:
@@ -160,15 +178,9 @@ def train_distributional_policy(
             conn.execute(
                 "INSERT INTO axiom_policy_versions_v20(version_id,created_at,model_path,model_hash,status,metrics_json,training_closed_trades,training_hold_samples,notes) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
-                    vid,
-                    _now_iso(),
-                    str(champion_path),
-                    _hash_file(champion_path),
-                    "champion",
-                    _json({"v24_oos_only": True, "counterfactual": True}),
-                    len(entry),
-                    len(hold),
-                    "V24 one-use promoted counterfactual distributional policy",
+                    vid, _now_iso(), str(champion_path), _hash_file(champion_path), "champion",
+                    _json({"v24_oos_only": True, "counterfactual": True, "target_definition_hash": active_target_hash}),
+                    len(entry), len(hold), "V24 one-use promoted counterfactual distributional policy",
                 ),
             )
         ope = doubly_robust_entry_ope(conn, candidate, cfg, 60)
@@ -186,9 +198,6 @@ def train_distributional_policy(
         }
 
 
-# The implementation CLI resolves globals in axiom_v24_impl; replace its buggy
-# function binding so ``python -m profit_taker.axiom_v24 train-policy`` also uses
-# the corrected function above.
 _impl.train_distributional_policy = train_distributional_policy
 main = _impl.main
 
