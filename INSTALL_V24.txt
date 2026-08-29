@@ -1,0 +1,17 @@
+V24 INSTALLATION
+
+Windows:
+  1. Run setup_v24.bat
+  2. Keep Axiom open in an interactive desktop session for clipboard collection.
+  3. Use run_axiom_loop.bat for one-minute collection.
+
+Manual setup:
+  py -3 -m venv .venv
+  .venv\Scripts\python.exe -m pip install --upgrade pip
+  .venv\Scripts\python.exe -m pip install -r requirements.txt
+  .venv\Scripts\python.exe -m pytest
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\live.sqlite
+
+No Tesseract, RapidOCR, ONNX Runtime, provider keys, or screenshot tooling is required by this V24-only repository.
+
+PyTorch is included because the V24 causal sequence challenger imports it. LightGBM and XGBoost remain the tabular model backends.
