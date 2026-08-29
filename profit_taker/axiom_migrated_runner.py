@@ -1,13 +1,13 @@
 """Production-hardened public collector facade.
 
 The previous collector is preserved byte-for-byte in
-:mod:`profit_taker.axiom_migrated_runner_base`.  This facade adds two production
+:mod:`profit_taker.axiom_migrated_runner_base`. This facade adds production
 invariants without changing parsing/cadence behavior:
 
 1. every browser copy is preceded by a unique verified clipboard sentinel, so a
    failed clipboard clear/copy can never replay the previous valid Axiom snapshot;
-2. direct interactive invocation initializes/resumes the marked production
-   collection session just like the BAT launchers do.
+2. direct invocation initializes/resumes a session whose purpose matches capture
+   provenance, keeping replay files out of the authoritative production session.
 """
 from __future__ import annotations
 
@@ -47,9 +47,6 @@ def _capture_clipboard(cfg: dict, cycle_count: int) -> tuple[str, str]:
         import pyperclip
     except Exception as exc:
         raise RuntimeError("Clipboard collection requires pyperclip in an interactive desktop session") from exc
-    # The preserved implementation subsequently tries to clear the clipboard. If
-    # that clear fails, the sentinel remains. A failed Ctrl+C therefore yields a
-    # non-Axiom sentinel rather than the previous minute's valid Axiom payload.
     _prime_clipboard_with_sentinel(pyperclip)
     return _original_capture_clipboard(cfg, cycle_count)
 
@@ -87,12 +84,17 @@ def _db_from_argv(argv: list[str]) -> str:
     return RAW_DB_DEFAULT
 
 
+def _has_clipboard_file(argv: list[str]) -> bool:
+    return any(arg == "--clipboard-file" or arg.startswith("--clipboard-file=") for arg in argv)
+
+
 def main() -> None:
     argv = list(sys.argv[1:])
-    # Replay files are still explicit research captures and get a marked session;
-    # this prevents accidental writes to an unmarked database regardless of entry
-    # point. initialize_collection is idempotent when resuming the one session.
-    initialize_collection(_db_from_argv(argv))
+    replay = _has_clipboard_file(argv)
+    purpose = "v24_replay_experiment" if replay else "v24_production_raw_collection"
+    # Replays get their own explicitly non-production session and therefore cannot
+    # be mixed into an existing authoritative production raw database.
+    initialize_collection(_db_from_argv(argv), purpose=purpose)
     _sync_test_and_extension_hooks()
     _impl.main()
 
