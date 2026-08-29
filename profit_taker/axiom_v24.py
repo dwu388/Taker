@@ -1,196 +1,308 @@
-"""Public V24 compatibility facade.
+"""Final production-readiness facade for V24.
 
-The full V24 implementation is kept in :mod:`profit_taker.axiom_v24_impl`.
-This facade preserves the historical ``profit_taker.axiom_v24`` import path while
-allowing small, reviewable fixes without rewriting the large implementation file.
+The policy-cfg fix and full statistical implementation remain preserved in
+:mod:`profit_taker.axiom_v24_base` / ``axiom_v24_impl``.  This layer closes
+operational-feature, sequence-vintage, sealed-audit and canonical-DB gaps found in
+the final repository audit.
 """
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
-import datetime as _datetime
-import joblib
+import json
+import math
 import sqlite3
+import sys
 import uuid
 
-from . import axiom_v24_impl as _impl
+import numpy as np
+import pandas as pd
+from sklearn.metrics import log_loss
 
-# Preserve the complete public/private module surface expected by existing callers.
-for _name in dir(_impl):
+from . import axiom_v24_base as _base
+from .db import RAW_DB_DEFAULT
+
+for _name in dir(_base):
     if not _name.startswith("__"):
-        globals()[_name] = getattr(_impl, _name)
+        globals()[_name] = getattr(_base, _name)
+
+_impl = _base._impl
+MODEL_DB_DEFAULT = RAW_DB_DEFAULT
 
 
-def train_distributional_policy(
-    db: str,
-    policy_root: str,
-    cfg: V24Config,
-    *,
-    allow_small: bool = False,
-) -> dict[str, Any]:
-    """Train/promote the V24 distributional policy using the supplied config.
+# ---------------------------------------------------------------------------
+# Keep collection/provenance metadata out of the market model.
+# ---------------------------------------------------------------------------
+_OPERATIONAL_EXACT = {
+    "observation_id", "cycle_id", "capture_id", "attempt_id", "session_id",
+    "created_at", "first_ingested_at", "last_corrected_at", "value_version",
+    "birth_ordinal", "assigned_at",
+}
+_OPERATIONAL_FRAGMENTS = (
+    "observation_id", "cycle_id", "capture_id", "attempt_id", "session_id",
+    "raw_payload", "payload_sha", "collector_schema", "ingestion_provenance",
+    "data_vintage_hash", "row_fingerprint",
+)
 
-    ``refresh_policy_cohorts`` and ``refresh_token_assignments`` both require the
-    active :class:`V24Config`.  Forwarding ``cfg`` here is essential because policy
-    cohort scheduling and immutable token assignment depend on those settings.
-    """
-    with sqlite3.connect(db) as conn:
-        conn.row_factory = sqlite3.Row
-        migrate(conn)
-        from . import axiom_self_teach as selfteach
 
-        selfteach.migrate(conn)
-        refresh_counterfactual_policy_targets(conn, cfg)
-        refresh_policy_cohorts(conn, cfg)
-        refresh_token_assignments(conn, cfg)
-        cohort = next_one_use_policy_cohort(conn, cfg)
-        if cohort is None:
-            return {"trained": False, "reason": "no mature unused policy-promotion cohort"}
+def _safe_feature_columns(frame: pd.DataFrame) -> list[str]:
+    blocked_fragments = (
+        "label", "future", "target", "terminal", "path_end", "learning_updated",
+        "fingerprint", "next_substantial_peak", "later_higher_peak", "recurrent_",
+        "event_", "interval_", "calendar_cohort", "lifetime_id", "decision_market_cap", "hit_plus",
+    )
+    blocked_exact = {
+        "token_key", "snapshot_at", "decision_at", "schema_version", "config_json",
+        "label_status_next_peak", "next_substantial_peak_at", "next_substantial_peak_confirmed_at",
+        "later_higher_peak_at", "label_ready_at",
+    } | _OPERATIONAL_EXACT
+    cols: list[str] = []
+    for c in frame.columns:
+        lc = str(c).lower()
+        if c in blocked_exact or any(x in lc for x in blocked_fragments):
+            continue
+        if any(x in lc for x in _OPERATIONAL_FRAGMENTS):
+            continue
+        s = pd.to_numeric(frame[c], errors="coerce")
+        if s.notna().sum() >= 5:
+            frame[c] = s
+            cols.append(c)
+    return sorted(set(cols))
 
-        entry = _entry_policy_training_rows(conn, horizon=60)
-        hold = _hold_policy_training_rows(conn, horizon=60)
-        entry_head = _fit_distribution_head(entry, "target", cfg, allow_small)
-        hold_head = _fit_distribution_head(hold, "target", cfg, allow_small)
-        if entry_head is None and hold_head is None:
-            raise RuntimeError("No V24 counterfactual policy head has enough development-eligible OOS forecasts.")
 
-        candidate = {
-            "schema_version": "v21_self_teaching_incremental_72h_2_execution_accounting",
-            "v24_policy_schema": SCHEMA_VERSION,
-            "created_at": _now_iso(),
-            "entry_head": entry_head,
-            "hold_head": hold_head,
-            "oos_only": True,
-            "counterfactual_targets": True,
-            "config": asdict(cfg),
-            "training_rows_entry": int(len(entry)),
-            "training_rows_hold": int(len(hold)),
-            "target_definition_hash": target_definition_hash(cfg),
-            "execution_definition_hash": execution_definition_hash(cfg),
-        }
+_impl._safe_feature_columns = _safe_feature_columns
 
-        eval_entry = _entry_policy_training_rows(conn, eval_cohort_id=str(cohort["cohort_id"]), horizon=60)
-        eval_hold = _hold_policy_training_rows(conn, eval_cohort_id=str(cohort["cohort_id"]), horizon=60)
-        cand_eval = evaluate_policy_bundle(candidate, eval_entry, eval_hold, cfg)
-        champion_path = Path(policy_root) / "champion.joblib"
-        champion = joblib.load(champion_path) if champion_path.exists() else None
-        champ_eval = (
-            evaluate_policy_bundle(champion, eval_entry, eval_hold, cfg)
-            if champion
-            else {
-                "available": True,
-                "tokens": cand_eval.get("tokens", 0),
-                "mean_value": 0.0,
-                "token_values": {k: 0.0 for k in cand_eval.get("token_values", {})},
-            }
+
+# ---------------------------------------------------------------------------
+# Late historical inserts must invalidate all later sequence states for a token.
+# ---------------------------------------------------------------------------
+_original_sequence_refresh = _impl.refresh_sequence_fingerprint_cache
+
+
+def _invalidate_sequence_cache_for_late_insertions(
+    conn: sqlite3.Connection, observations: pd.DataFrame
+) -> dict[str, int]:
+    if observations.empty or not _table_exists(conn, SEQUENCE_CACHE_TABLE):
+        return {"tokens": 0, "rows": 0}
+    invalidated_tokens = 0
+    invalidated_rows = 0
+    for token, g in observations.groupby("token_key", sort=False):
+        cached = pd.read_sql_query(
+            f"SELECT snapshot_at FROM {SEQUENCE_CACHE_TABLE} WHERE token_key=? ORDER BY snapshot_at",
+            conn,
+            params=(str(token),),
         )
-        common = sorted(set(cand_eval.get("token_values", {})) & set(champ_eval.get("token_values", {})))
-        diff = pd.Series(
-            {k: float(cand_eval["token_values"][k]) - float(champ_eval["token_values"][k]) for k in common},
-            dtype=float,
+        if cached.empty:
+            continue
+        cached_times = set(pd.to_datetime(cached.snapshot_at, utc=True, errors="coerce").dropna())
+        if not cached_times:
+            continue
+        last_cached = max(cached_times)
+        observed_times = pd.to_datetime(g.snapshot_at, utc=True, errors="coerce").dropna()
+        missing_historical = sorted(
+            t for t in observed_times if t <= last_cached and t not in cached_times
         )
-        boot = _paired_token_bootstrap(
-            diff,
-            cfg.policy_promotion_bootstrap_samples,
-            cfg.policy_promotion_confidence,
-        )
-        promoted = bool(
-            boot["n_tokens"] >= (3 if allow_small else cfg.policy_min_promotion_tokens)
-            and boot["ci_low"] > 0.0
-        )
-        reason = (
-            f"paired_token_value_mean={boot['mean']:.6f}; "
-            f"ci=[{boot['ci_low']:.6f},{boot['ci_high']:.6f}]; n={boot['n_tokens']}"
-        )
-
-        Path(policy_root).mkdir(parents=True, exist_ok=True)
-        stamp = _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        cand_path = Path(policy_root) / f"policy_v24_{stamp}.joblib"
-        joblib.dump(candidate, cand_path)
-        before_hash = _hash_file(champion_path) if champion_path.exists() else None
-        if promoted:
-            joblib.dump(candidate, champion_path)
-
-        pid = str(uuid.uuid4())
-        metrics = {
-            "candidate": {k: v for k, v in cand_eval.items() if k != "token_values"},
-            "champion": {k: v for k, v in champ_eval.items() if k != "token_values"},
-            "bootstrap": boot,
-        }
+        if not missing_historical:
+            continue
+        dirty = missing_historical[0]
         conn.execute(
-            f"INSERT INTO {POLICY_PROMOTION_TABLE}(promotion_id,created_at,cohort_id,candidate_path,candidate_hash,champion_before_path,champion_before_hash,promoted,metrics_json,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (
-                pid,
-                _now_iso(),
-                cohort["cohort_id"],
-                str(cand_path),
-                _hash_file(cand_path),
-                str(champion_path) if champion_path.exists() else None,
-                before_hash,
-                int(promoted),
-                _json(metrics),
-                reason,
-            ),
+            f"DELETE FROM {SEQUENCE_CACHE_TABLE} WHERE token_key=? AND snapshot_at>=?",
+            (str(token), _iso(dirty)),
         )
-        conn.execute(
-            f"UPDATE {POLICY_COHORT_TABLE} SET status='consumed',consumed_at=?,promotion_id=? WHERE cohort_id=?",
-            (_now_iso(), pid, cohort["cohort_id"]),
-        )
-        status_value = "champion" if promoted else "rejected"
-        vid = str(uuid.uuid4())
-        conn.execute(
-            f"INSERT INTO {POLICY_REGISTRY}(version_id,created_at,model_path,model_hash,status,training_rows_entry,training_rows_hold,oos_only,metrics_json,notes,target_definition_hash,execution_definition_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                vid,
-                _now_iso(),
-                str(cand_path),
-                _hash_file(cand_path),
-                status_value,
-                len(entry),
-                len(hold),
-                1,
-                _json(metrics),
-                reason,
-                candidate["target_definition_hash"],
-                candidate["execution_definition_hash"],
-            ),
-        )
-        if promoted:
-            conn.execute("UPDATE axiom_policy_versions_v20 SET status='retired' WHERE status='champion'")
-            conn.execute(
-                "INSERT INTO axiom_policy_versions_v20(version_id,created_at,model_path,model_hash,status,metrics_json,training_closed_trades,training_hold_samples,notes) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    vid,
-                    _now_iso(),
-                    str(champion_path),
-                    _hash_file(champion_path),
-                    "champion",
-                    _json({"v24_oos_only": True, "counterfactual": True}),
-                    len(entry),
-                    len(hold),
-                    "V24 one-use promoted counterfactual distributional policy",
-                ),
-            )
-        ope = doubly_robust_entry_ope(conn, candidate, cfg, 60)
+        changed = int(conn.execute("SELECT changes()").fetchone()[0])
+        invalidated_rows += changed
+        invalidated_tokens += 1
+    if invalidated_rows:
         conn.commit()
-        return {
-            "trained": True,
-            "promoted": promoted,
-            "policy_candidate": str(cand_path),
-            "champion": str(champion_path) if champion_path.exists() else None,
-            "cohort_id": cohort["cohort_id"],
-            "entry_rows": len(entry),
-            "hold_rows": len(hold),
-            "promotion": metrics,
-            "dr_ope": ope,
-        }
+    return {"tokens": invalidated_tokens, "rows": invalidated_rows}
 
 
-# The implementation CLI resolves globals in axiom_v24_impl; replace its buggy
-# function binding so ``python -m profit_taker.axiom_v24 train-policy`` also uses
-# the corrected function above.
+def refresh_sequence_fingerprint_cache(
+    conn: sqlite3.Connection,
+    observations: pd.DataFrame,
+    cfg: V24Config,
+    force: bool = False,
+) -> dict[str, int]:
+    pre = {"tokens": 0, "rows": 0}
+    if not force:
+        pre = _invalidate_sequence_cache_for_late_insertions(conn, observations)
+    out = _original_sequence_refresh(conn, observations, cfg, force=force)
+    out["late_insert_tokens_invalidated"] = int(pre["tokens"])
+    out["late_insert_rows_invalidated"] = int(pre["rows"])
+    return out
+
+
+_impl.refresh_sequence_fingerprint_cache = refresh_sequence_fingerprint_cache
+
+
+# ---------------------------------------------------------------------------
+# Sealed audit: token-first membership, confirmation-safe truth, token weights.
+# ---------------------------------------------------------------------------
+def _mature_audit_cohorts(conn: sqlite3.Connection, cfg: V24Config) -> pd.DataFrame:
+    latest = _latest_capture(conn)
+    if latest is None:
+        return pd.DataFrame()
+    # A token born near a cohort end can remain visible for ~72h; its late-life
+    # decisions then need another 72h outcome horizon. The extra audit delay is
+    # applied only after that complete prospective window.
+    unlock_before = (
+        latest
+        - pd.Timedelta(minutes=2 * cfg.horizon_minutes)
+        - pd.Timedelta(days=cfg.audit_min_age_days)
+    )
+    return pd.read_sql_query(
+        f"SELECT cohort_id,ordinal,start_at,end_at,status FROM {COHORT_TABLE} "
+        "WHERE role='audit' AND end_at<=? ORDER BY ordinal",
+        conn,
+        params=(unlock_before.isoformat(),),
+    )
+
+
+def audit_manifest(conn: sqlite3.Connection, cfg: V24Config, reveal: bool = False) -> dict[str, object]:
+    migrate(conn)
+    rows = pd.read_sql_query(
+        f"SELECT cohort_id,ordinal,start_at,end_at,status FROM {COHORT_TABLE} WHERE role='audit' ORDER BY ordinal",
+        conn,
+    )
+    if rows.empty:
+        return {"sealed_audit_cohorts": 0, "mature_sealed_audit_cohorts": 0, "revealed": False}
+    mature = _mature_audit_cohorts(conn, cfg)
+    out: dict[str, object] = {
+        "sealed_audit_cohorts": int(len(rows)),
+        "mature_sealed_audit_cohorts": int(len(mature)),
+        "revealed": bool(reveal),
+        "maturity_rule": "cohort_end + 2x72h token-lifetime/outcome window + audit delay",
+        "note": "Audit-born tokens remain sealed for their entire lifetime and are never development-eligible.",
+    }
+    if reveal:
+        out["cohorts"] = rows.to_dict("records")
+    return out
+
+
+def evaluate_sealed_audit_stream(conn: sqlite3.Connection, cfg: V24Config) -> dict[str, object]:
+    migrate(conn)
+    mature = _mature_audit_cohorts(conn, cfg)
+    if mature.empty:
+        return {"available": False, "reason": "no time-unlocked mature audit cohort"}
+    mature_ids = set(mature.cohort_id.astype(str))
+
+    assignments = pd.read_sql_query(
+        f"SELECT token_key,forecast_cohort_id,forecast_role FROM {TOKEN_ASSIGNMENT_TABLE} "
+        "WHERE forecast_role='audit'",
+        conn,
+    )
+    if assignments.empty:
+        return {"available": False, "reason": "no audit-born token assignments"}
+    audit_tokens = set(
+        assignments[assignments.forecast_cohort_id.astype(str).isin(mature_ids)].token_key.astype(str)
+    )
+    if not audit_tokens:
+        return {"available": False, "reason": "no tokens belong to mature audit cohorts"}
+
+    led = pd.read_sql_query(
+        f"SELECT prediction_id,token_key,decision_at,generated_at,prediction_json "
+        f"FROM {PREDICTION_LEDGER} WHERE provenance='live' "
+        "AND ineligibility_reason IN ('sealed_audit_token','sealed_audit_cohort') ORDER BY generated_at",
+        conn,
+    )
+    if led.empty:
+        return {"available": False, "reason": "no prospective sealed-audit live predictions recorded"}
+    led = led[led.token_key.astype(str).isin(audit_tokens)].copy()
+    if led.empty:
+        return {"available": False, "reason": "no live predictions for mature audit-born tokens"}
+    led["decision_at"] = pd.to_datetime(led.decision_at, utc=True, errors="coerce")
+    led["generated_at"] = pd.to_datetime(led.generated_at, utc=True, errors="coerce")
+    # A rerun of a predictor at the same decision timestamp is not an independent
+    # audit sample. Keep the first genuinely prospective prediction only.
+    led = led.sort_values("generated_at").drop_duplicates(["token_key", "decision_at"], keep="first")
+
+    labels = pd.read_sql_query(
+        f"SELECT token_key,decision_at,next_substantial_peak_at,next_substantial_peak_confirmed_at,"
+        f"terminal_at,terminal_reason,path_end_at,label_finalized FROM {peak.LABEL_TABLE}",
+        conn,
+    )
+    if labels.empty:
+        return {"available": False, "reason": "audit labels unavailable"}
+    labels["decision_at"] = pd.to_datetime(labels.decision_at, utc=True, errors="coerce")
+    data = led.merge(labels, on=["token_key", "decision_at"], how="inner")
+    if data.empty:
+        return {"available": False, "reason": "audit predictions do not yet have matching labels"}
+
+    horizon = int(max(cfg.survival_bins_minutes))
+    horizon_key = f"p_first_peak_by_{horizon}m"
+    scored: list[dict[str, object]] = []
+    for _, r in data.iterrows():
+        event, event_min, known = first_competing_event(r, cfg)
+        if not known and event_min < horizon:
+            continue
+        p = _finite(_loads(r.prediction_json).get(horizon_key))
+        if p is None:
+            continue
+        y = 1.0 if event == EVENT_PEAK and event_min <= horizon else 0.0
+        scored.append({"token_key": str(r.token_key), "p": float(np.clip(p, 0.0, 1.0)), "y": y})
+    if not scored:
+        return {"available": False, "reason": f"no usable {horizon_key} audit predictions"}
+
+    score_df = pd.DataFrame(scored)
+    score_df["brier"] = (score_df.p - score_df.y) ** 2
+    token_brier = score_df.groupby("token_key").brier.mean()
+    counts = score_df.token_key.value_counts()
+    weights = np.asarray([1.0 / counts[str(t)] for t in score_df.token_key], dtype=float)
+    weighted_log = None
+    if score_df.y.nunique() > 1:
+        weighted_log = float(
+            log_loss(
+                score_df.y.astype(int).to_numpy(),
+                np.clip(score_df.p.to_numpy(dtype=float), 1e-6, 1 - 1e-6),
+                labels=[0, 1],
+                sample_weight=weights,
+            )
+        )
+    metrics = {
+        "rows": int(len(score_df)),
+        "tokens": int(score_df.token_key.nunique()),
+        "token_balanced_peak_brier": float(token_brier.mean()),
+        "token_balanced_peak_log_loss": weighted_log,
+        "horizon_probability": horizon_key,
+        "audit_membership": "token_first_seen_lifetime",
+    }
+    conn.execute(
+        f"INSERT INTO {AUDIT_RESULTS_TABLE}(audit_result_id,created_at,model_family,prediction_rows,metric_json,note) "
+        "VALUES(?,?,?,?,?,?)",
+        (
+            str(uuid.uuid4()),
+            _now_iso(),
+            SCHEMA_VERSION,
+            len(score_df),
+            _json(metrics),
+            "Prospective sealed audit; token-first membership; confirmation-safe truth; never development-eligible",
+        ),
+    )
+    conn.commit()
+    return {"available": True, **metrics}
+
+
+_impl.audit_manifest = audit_manifest
+_impl.evaluate_sealed_audit_stream = evaluate_sealed_audit_stream
+
+
+# ---------------------------------------------------------------------------
+# Canonical raw DB for direct CLI use, not only BAT wrappers.
+# ---------------------------------------------------------------------------
+def _argv_with_canonical_db(argv: list[str]) -> list[str]:
+    if not argv:
+        return argv
+    if any(arg == "--db" or arg.startswith("--db=") for arg in argv):
+        return argv
+    return [argv[0], "--db", RAW_DB_DEFAULT, *argv[1:]]
+
+
+def main(argv=None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    return _impl.main(_argv_with_canonical_db(args))
+
+
+# Preserve the already-fixed policy training entry point from the prior facade.
+train_distributional_policy = _base.train_distributional_policy
 _impl.train_distributional_policy = train_distributional_policy
-main = _impl.main
 
 
 if __name__ == "__main__":  # pragma: no cover

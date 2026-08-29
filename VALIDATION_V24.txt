@@ -1,20 +1,56 @@
-V24 VALIDATION
+V24 VALIDATION / RELEASE GATE
 
-This file defines the validation procedure for the cleaned repository. It does not claim that GitHub CI has run unless a status check reports that separately.
+Canonical research database:
+  data\axiom_v24_raw.sqlite
 
-Run:
+Repository regression gate:
   .venv\Scripts\python.exe -m pytest
-  .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\live.sqlite
 
-For an initialized research database, also exercise as appropriate:
-  .venv\Scripts\python.exe -m profit_taker.axiom_v24 bootstrap --db data\live.sqlite
-  .venv\Scripts\python.exe -m profit_taker.axiom_v24 maintain --db data\live.sqlite
-  .venv\Scripts\python.exe -m profit_taker.axiom_v24 rebuild-sequence-cache --db data\live.sqlite
-  .venv\Scripts\python.exe -m profit_taker.axiom_v24 audit-manifest --db data\live.sqlite
+Fresh-collection smoke test:
+  run_axiom_once.bat
+  collection_status.bat
+
+Do not begin/continue an authoritative production research collection unless
+collection_status reports:
+  ready_to_collect=true
+  session_marked=true
+  sqlite_integrity_ok=true
+  raw_payload_complete=true
+  raw_payload_integrity_errors=0
+  identity_ok=true
+  cycle_row_count_mismatches=0
+  cycles_outside_active_session=0
+  attempts_outside_active_session=0
+  successful_attempt_cycle_count_difference=0
+
+Model/status checks use the same canonical raw DB:
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 status --db data\axiom_v24_raw.sqlite
+
+Only after sufficient real history exists, exercise as appropriate:
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 bootstrap --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 maintain --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 rebuild-sequence-cache --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 audit-manifest --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 audit-evaluate --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 crossfit-policy-predictions --db data\axiom_v24_raw.sqlite
+  .venv\Scripts\python.exe -m profit_taker.axiom_v24 train-policy --db data\axiom_v24_raw.sqlite
 
 Review invariants:
-  - no V15-V18 model/OCR/provider entry point is imported by the active collector;
-  - V24 defaults point to models/axiom_v24, models/axiom_policy_v24, and data/axiom_predictions_v24.csv;
-  - confirmation timestamps remain part of peak labels;
-  - paper execution fills on a later observable snapshot;
-  - V24 token assignment, heartbeat, policy promotion, calibration, counterfactual, sequence and data-vintage tables are present in migration code.
+  - clipboard capture is primed with a unique verified sentinel before every Ctrl+C;
+  - a successful capture is atomic and stores exactly one durable observation per parsed card;
+  - exact accepted clipboard bytes are retained with SHA-256 and zlib compression;
+  - failed attempts cannot masquerade as successful capture heartbeats/token absence;
+  - canonical raw observation source is axiom_observations;
+  - full-mint identity collisions are hard failures;
+  - database/capture/provenance IDs and repair-version metadata are excluded from model features;
+  - peak_at and confirmed_at both remain in horizon-safe targets;
+  - token role is permanently assigned at first seen;
+  - paper entries/exits fill only on a later observable snapshot;
+  - long-history sequence cache invalidates from a late historical insertion forward;
+  - sealed audit scoring uses audit-born token lifetime membership, confirmation-safe truth, and token-balanced metrics;
+  - policy cohort/token refresh helpers receive the active V24Config.
+
+Interpretation:
+  Passing this gate means the repository is suitable to collect a fresh authoritative
+  research dataset and later conduct leakage-hardened paper evaluation. It does not
+  by itself demonstrate profitable alpha or authorize real-money autonomous trading.
