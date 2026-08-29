@@ -29,10 +29,10 @@ def test_production_resume_rejects_mismatched_collector_schema(tmp_path):
     assert status["ready_to_collect"] is False
 
 
-def test_persistence_rejects_nonproduction_session_purpose(tmp_path):
+def test_interactive_persistence_rejects_mismatched_session_purpose(tmp_path):
     db = tmp_path / "wrong-purpose.sqlite"
     _insert_session(db, purpose="manual_replay_experiment", schema=COLLECTOR_SCHEMA_VERSION)
-    with pytest.raises(RuntimeError, match="non-production purpose"):
+    with pytest.raises(RuntimeError, match="provenance does not match"):
         process_rows(
             str(db),
             "2026-08-29T12:01:00+00:00",
