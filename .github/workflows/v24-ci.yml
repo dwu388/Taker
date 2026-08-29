@@ -1,0 +1,31 @@
+name: V24 CI
+
+on:
+  push:
+    branches: [main, "hardening/**"]
+  pull_request:
+
+jobs:
+  collector-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-collector.txt
+      - run: python -m pytest -q tests/test_collection_readiness.py
+
+  v24-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m pytest -q

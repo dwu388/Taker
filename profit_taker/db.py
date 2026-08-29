@@ -3,12 +3,25 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+RAW_DB_DEFAULT = "data/axiom_v24_raw.sqlite"
+COLLECTOR_SCHEMA_VERSION = "v24_clipboard_raw_v2"
+
 SCHEMA = r'''
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
+PRAGMA synchronous=FULL;
+
+CREATE TABLE IF NOT EXISTS collection_sessions (
+    session_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    collector_schema TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 CREATE TABLE IF NOT EXISTS capture_cycles (
     cycle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
     captured_at TEXT NOT NULL,
     screenshot_path TEXT,
     clipboard_valid INTEGER NOT NULL DEFAULT 0,
@@ -54,15 +67,58 @@ CREATE TABLE IF NOT EXISTS axiom_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_axiom_obs_token_time ON axiom_observations(token_key, snapshot_at);
 CREATE INDEX IF NOT EXISTS idx_axiom_obs_time ON axiom_observations(snapshot_at);
+
+CREATE TABLE IF NOT EXISTS capture_payloads (
+    cycle_id INTEGER PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    compression TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(cycle_id) REFERENCES capture_cycles(cycle_id)
+);
+
+CREATE TABLE IF NOT EXISTS capture_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    clipboard_valid INTEGER NOT NULL DEFAULT 0,
+    rows_detected INTEGER NOT NULL DEFAULT 0,
+    cycle_id INTEGER,
+    source TEXT,
+    error_type TEXT,
+    error_message TEXT,
+    raw_payload_sha256 TEXT,
+    raw_payload_bytes INTEGER,
+    details_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(cycle_id) REFERENCES capture_cycles(cycle_id)
+);
+CREATE INDEX IF NOT EXISTS idx_capture_attempts_time ON capture_attempts(started_at);
+CREATE INDEX IF NOT EXISTS idx_capture_attempts_success ON capture_attempts(success, started_at);
+
+CREATE TABLE IF NOT EXISTS capture_attempt_payloads (
+    attempt_id INTEGER PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    compression TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(attempt_id) REFERENCES capture_attempts(attempt_id)
+);
 '''
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(p))
+    con = sqlite3.connect(str(p), timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("PRAGMA synchronous=FULL")
     return con
 
 
@@ -90,6 +146,7 @@ def _prepare_legacy_name_collisions(con: sqlite3.Connection) -> None:
 def _ensure_columns(con: sqlite3.Connection) -> None:
     additions = {
         "capture_cycles": {
+            "session_id": "TEXT",
             "screenshot_path": "TEXT", "clipboard_valid": "INTEGER NOT NULL DEFAULT 0",
             "rows_detected": "INTEGER NOT NULL DEFAULT 0", "completed": "INTEGER NOT NULL DEFAULT 1",
         },
@@ -102,6 +159,10 @@ def _ensure_columns(con: sqlite3.Connection) -> None:
             "tracked_dev_status_raw": "TEXT", "funding_time_raw": "TEXT", "funding_time_minutes": "INTEGER",
             "sniper_pct": "REAL", "insider_pct": "REAL", "bundler_pct": "REAL", "dex_paid": "INTEGER",
             "field_confidence_json": "TEXT", "raw_ocr_json": "TEXT", "source_json": "TEXT",
+        },
+        "capture_attempts": {
+            "session_id": "TEXT", "source": "TEXT", "error_type": "TEXT", "error_message": "TEXT",
+            "raw_payload_sha256": "TEXT", "raw_payload_bytes": "INTEGER", "details_json": "TEXT",
         },
     }
     for table, cols in additions.items():
