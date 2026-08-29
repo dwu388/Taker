@@ -1,0 +1,9 @@
+[project]
+name = "profit-taker"
+version = "0.18.0"
+description = "Axiom lifecycle capture, OCR, causal features, and maximum-inference boosted-tree modeling"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

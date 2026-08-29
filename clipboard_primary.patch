@@ -1,0 +1,501 @@
+--- v18_clipboard_primary_patch_before/profit_taker/axiom_clipboard.py	2026-08-28 04:54:31.983420134 +0000
++++ v18_clipboard_primary_patch_work/profit_taker_rebuilt_v18/profit_taker/axiom_clipboard.py	2026-08-28 04:54:06.148848113 +0000
+@@ -22,6 +22,8 @@
+     short_address_hint: str | None = None
+ 
+     age_minutes: int | None = None
++    age_raw: str | None = None
++    image_reuse_count: int | None = None
+ 
+     market_cap_usd: float | None = None
+     volume_usd: float | None = None
+@@ -124,21 +126,30 @@
+ 
+ 
+ def clipboard_looks_like_axiom(text: str) -> bool:
+-    s = text.lower()
++    """Require real Axiom card structure, not merely Axiom-related words."""
++    if not text or len(text) < 80:
++        return False
+ 
+-    anchors = sum(
++    lines = _clean_lines(text)
++    mc_count = sum(1 for line in lines if line.upper() == "MC")
++    money_count = sum(
+         1
+-        for term in (
+-            "pulse",
+-            "migrated",
+-            "mc",
+-            "tx",
+-            "sol",
+-        )
+-        if term in s
++        for line in lines
++        if re.fullmatch(r"\$[\d,.]+[KMB]?", line, re.I)
++    )
++    tx_count = sum(
++        1
++        for line in lines
++        if re.fullmatch(r"TX\s+[0-9][0-9,]*", line, re.I)
+     )
++    address_count = sum(1 for line in lines if ADDRESS_RE.search(line))
+ 
+-    return anchors >= 3 and len(text) > 80
++    return (
++        mc_count >= 1
++        and money_count >= 2
++        and tx_count >= 1
++        and address_count >= 1
++    )
+ 
+ 
+ def _norm(s: str | None) -> str:
+@@ -447,12 +458,8 @@
+         )
+ 
+         if m:
+-            card.age_minutes = (
+-                parse_duration_minutes(
+-                    m.group(1)
+-                    + m.group(2).lower()
+-                )
+-            )
++            card.age_raw = m.group(1) + m.group(2).lower()
++            card.age_minutes = parse_duration_minutes(card.age_raw)
+             return
+ 
+ 
+@@ -658,6 +665,38 @@
+             return
+ 
+ 
++def _parse_image_reuse_count(lines: list[str]) -> int | None:
++    """Parse the count that follows Pump AMM / Raydium CLMM when present."""
++    for i, line in enumerate(lines):
++        if line.strip().lower() not in {"pump amm", "raydium clmm"}:
++            continue
++        if i + 1 >= len(lines):
++            return None
++        nxt = lines[i + 1].strip()
++        if re.fullmatch(r"\d+", nxt):
++            return safe_int(nxt)
++        return None
++    return None
++
++
++def _age_precision_minutes(age_raw: str | None) -> int | None:
++    if not age_raw:
++        return None
++    m = AGE_RE.fullmatch(age_raw.strip())
++    if not m:
++        return None
++    unit = m.group(2).lower()
++    return {
++        "s": 1,
++        "m": 1,
++        "h": 60,
++        "d": 1440,
++        "w": 10080,
++        "mo": 43200,
++        "y": 525600,
++    }.get(unit)
++
++
+ def _parse_block(
+     block: str,
+ ) -> ClipboardCard | None:
+@@ -698,6 +737,8 @@
+         lines
+     )
+ 
++    card.image_reuse_count = _parse_image_reuse_count(lines)
++
+     # ---------------------------------------------------------------
+     # Identity.
+     # ---------------------------------------------------------------
+@@ -1102,6 +1143,7 @@
+     "name",
+     "short_address_hint",
+     "age_minutes",
++    "image_reuse_count",
+ 
+     "market_cap_usd",
+     "volume_usd",
+@@ -1443,14 +1485,6 @@
+         )
+ 
+     # ---------------------------------------------------------------
+-    # Row-order alignment rescue.
+-    #
+-    # Clipboard and screenshot use the same visual ordering. Once several
+-    # strong identities establish an offset, use that offset to rescue OCR
+-    # rows whose names were badly mangled.
+-    # ---------------------------------------------------------------
+-
+-        # ---------------------------------------------------------------
+     # Ordered rescue for unmatched screenshot rows.
+     #
+     # Clipboard cards and screenshot cards preserve the same top-to-bottom
+@@ -1542,7 +1576,7 @@
+             )
+ 
+             # Never use market-cap similarity alone to establish token identity.
+-#
++            #
+             # Different tokens frequently have similar MCs. A wrong identity merge is
+             # much more damaging to lifecycle training than leaving a row unmatched.
+             if name_sim < 0.45:
+@@ -1679,6 +1713,13 @@
+             "reason": reason,
+             "clipboard_card": ci,
+         }
++        src["data_origin"] = "hybrid_clipboard_ocr"
++        src["training_eligible"] = True
++        row["data_origin"] = "hybrid_clipboard_ocr"
++        row["training_eligible"] = True
++        if card.age_raw:
++            src["clipboard_age_raw"] = card.age_raw
++            src["clipboard_age_precision_minutes"] = _age_precision_minutes(card.age_raw)
+ 
+         for field in RECONCILE_FIELDS:
+             _reconcile_field(
+@@ -1734,32 +1775,160 @@
+                     "token_key"
+                 ] = "clipboard_identity"
+ 
+-    diag[
+-        "rows_identity_matched"
+-    ] = len(
+-        row_to_card
+-    )
+-
+-    diag[
+-        "clipboard_cards_unmatched"
+-    ] = (
+-        len(cards)
+-        - len(used_cards)
+-    )
+-
+-    diag[
+-        "screenshot_rows_unmatched"
+-    ] = (
+-        len(rows)
+-        - len(used_rows)
+-    )
++    # ---------------------------------------------------------------
++    # Clipboard-primary finalization.
++    #
++    # Build the final observation list in clipboard order. Matched OCR rows
++    # remain hybrid observations. Valid unmatched clipboard cards become
++    # standalone observations. Unmatched OCR rows are retained only when
++    # they have a usable identity; weak OCR fragments are not allowed to
++    # create duplicate/nonsense token histories.
++    # ---------------------------------------------------------------
++
++    def valid_ocr_identity(row: dict[str, Any]) -> bool:
++        addr = str(row.get("short_address_hint") or "").strip()
++        name = str(row.get("name") or "").strip()
++        conf = row.get("field_confidence") or {}
++
++        if ADDRESS_RE.fullmatch(addr) and float(conf.get("short_address_hint", 0.0) or 0.0) >= 0.55:
++            return True
++
++        norm_name = _norm(name)
++        if (
++            len(norm_name) >= 3
++            and float(conf.get("name", 0.0) or 0.0) >= 0.65
++        ):
++            return True
++
++        return False
++
++    def standalone_usable(card: ClipboardCard) -> bool:
++        address = card.short_address_hint or ""
++        return (
++            bool(ADDRESS_RE.fullmatch(address))
++            and bool(_norm(card.ticker or card.name))
++            and card.market_cap_usd is not None
++            and card.market_cap_usd > 0
++            and card.volume_usd is not None
++            and card.volume_usd >= 0
++            and card.txns is not None
++            and card.txns >= 0
++        )
++
++    def card_to_row(card: ClipboardCard, ci: int) -> dict[str, Any]:
++        stable = card.short_address_hint or card.ticker or card.name
++        token_key = _norm(stable)
++        values = {
++            "name": card.name or card.ticker,
++            "short_address_hint": card.short_address_hint,
++            "age_minutes": card.age_minutes,
++            "image_reuse_count": card.image_reuse_count,
++            "market_cap_usd": card.market_cap_usd,
++            "volume_usd": card.volume_usd,
++            "fees_sol": card.fees_sol,
++            "txns": card.txns,
++            "holders": card.holders,
++            "pro_traders": card.pro_traders,
++            "kols": card.kols,
++            "dev_migrations": card.dev_migrations,
++            "dev_creations": card.dev_creations,
++            "recent_visitors": card.recent_visitors,
++            "top10_holders_pct": card.top10_holders_pct,
++            "tracked_dev_status_raw": card.tracked_dev_status_raw,
++            "funding_time_raw": card.funding_time_raw,
++            "funding_time_minutes": card.funding_time_minutes,
++            "sniper_pct": card.sniper_pct,
++            "insider_pct": card.insider_pct,
++            "bundler_pct": card.bundler_pct,
++            "dex_paid": card.dex_paid,
++            "token_key": token_key,
++        }
++        field_confidence = {
++            key: 1.0
++            for key, value in values.items()
++            if value is not None and key != "token_key"
++        }
++        field_source = {
++            key: "clipboard_primary"
++            for key, value in values.items()
++            if value is not None
++        }
++        source = {
++            "data_origin": "clipboard_only",
++            "training_eligible": True,
++            "clipboard_only": {
++                "clipboard_card": ci,
++                "identity_method": "short_address",
++                "timing": "pre_screenshot_selection",
++                "age_raw": card.age_raw,
++                "age_precision_minutes": _age_precision_minutes(card.age_raw),
++            },
++        }
++        return {
++            **values,
++            "data_origin": "clipboard_only",
++            "training_eligible": True,
++            "field_confidence": field_confidence,
++            "field_source": field_source,
++            "ocr_diagnostics": {},
++            "source": source,
++        }
++
++    card_to_ri = {ci: ri for ri, (ci, _, _) in row_to_card.items()}
++    final_rows: list[dict[str, Any]] = []
++    clipboard_only_added: list[dict[str, Any]] = []
++
++    for ci, card in enumerate(cards):
++        ri = card_to_ri.get(ci)
++        if ri is not None:
++            final_rows.append(rows[ri])
++            continue
++
++        if standalone_usable(card):
++            promoted = card_to_row(card, ci)
++            final_rows.append(promoted)
++            clipboard_only_added.append(
++                {
++                    "clipboard_card": ci,
++                    "name": promoted.get("name"),
++                    "ticker": card.ticker,
++                    "token_key": promoted.get("token_key"),
++                    "market_cap_usd": promoted.get("market_cap_usd"),
++                }
++            )
++
++    ocr_only_kept: list[int] = []
++    ocr_rows_dropped_weak_identity: list[int] = []
++    for ri, row in enumerate(rows):
++        if ri in used_rows:
++            continue
++        if valid_ocr_identity(row):
++            row.setdefault("source", {})["data_origin"] = "ocr_only"
++            row["source"]["training_eligible"] = True
++            row["data_origin"] = "ocr_only"
++            row["training_eligible"] = True
++            final_rows.append(row)
++            ocr_only_kept.append(ri)
++        else:
++            ocr_rows_dropped_weak_identity.append(ri)
++
++    diag["rows_identity_matched"] = len(row_to_card)
++    diag["clipboard_cards_unmatched"] = len(cards) - len(used_cards)
++    diag["clipboard_cards_unmatched_to_ocr"] = len(cards) - len(used_cards)
++    diag["screenshot_rows_unmatched"] = len(rows) - len(used_rows)
++    diag["clipboard_only_rows_added"] = len(clipboard_only_added)
++    diag["clipboard_only_rows"] = clipboard_only_added
++    diag["ocr_only_rows_kept"] = ocr_only_kept
++    diag["ocr_rows_dropped_weak_identity"] = ocr_rows_dropped_weak_identity
++    diag["rows_after_clipboard_primary_merge"] = len(final_rows)
+ 
+     return (
+-        rows,
++        final_rows,
+         diag,
+     )
+ 
+ 
++
+ def diagnostics_json(
+     diag: dict[str, Any],
+ ) -> str:
+--- v18_clipboard_primary_patch_before/profit_taker/axiom_migrated_runner.py	2026-08-28 04:54:31.983575444 +0000
++++ v18_clipboard_primary_patch_work/profit_taker_rebuilt_v18/profit_taker/axiom_migrated_runner.py	2026-08-28 04:54:06.140332620 +0000
+@@ -36,32 +36,12 @@
+     (1.857, "mouse_down", (838, 164)),
+     (0.124, "mouse_up", (838, 164)),
+ 
+-    # Zoom out
+-    (0.500, "hotkey", ("ctrl", "-")),
+-    (0.500, "hotkey", ("ctrl", "-")),
+-    (0.500, "hotkey", ("ctrl", "-")),
+-    (0.500, "hotkey", ("ctrl", "-")),
+-    (0.500, "hotkey", ("ctrl", "-")),
+-    (0.500, "hotkey", ("ctrl", "-")),
+-    (0.500, "hotkey", ("ctrl", "-")),
+-
+-    # Select/copy Axiom page text.
++    # Select/copy Axiom page text while the page is stable.
+     (2.000, "hotkey", ("ctrl", "a")),
+     (2.000, "hotkey", ("ctrl", "c")),
+-
+-    # Read clipboard immediately after Ctrl+C.
+     (0.500, "read_clipboard", ()),
+ 
+-    # Zoom in
+-    (0.500, "hotkey", ("ctrl", "+")),
+-    (0.500, "hotkey", ("ctrl", "+")),
+-    (0.500, "hotkey", ("ctrl", "+")),
+-    (0.500, "hotkey", ("ctrl", "+")),
+-    (0.500, "hotkey", ("ctrl", "+")),
+-    (0.500, "hotkey", ("ctrl", "+")),
+-    (0.500, "hotkey", ("ctrl", "+")),
+-
+-    # Repeat the original first mouse click.
++    # Repeat the original first mouse click to clear selection/focus.
+     (2.500, "mouse_down", (838, 164)),
+     (0.124, "mouse_up", (838, 164)),
+ 
+@@ -80,6 +60,7 @@
+ ]
+ 
+ 
++
+ def downloads_dir() -> Path:
+     return Path.home() / "Downloads"
+ 
+@@ -202,10 +183,29 @@
+             if no_clipboard:
+                 continue
+ 
+-            try:
+-                clipboard_text = pyperclip.paste() or ""
+-            except Exception:
+-                clipboard_text = ""
++            # Ctrl+C can complete asynchronously on a heavy browser page.
++            # Wait for structurally valid Axiom text instead of taking one
++            # instantaneous clipboard sample.
++            deadline = time.time() + 5.0
++            last_candidate = ""
++            while time.time() < deadline:
++                try:
++                    candidate = pyperclip.paste() or ""
++                except Exception:
++                    candidate = ""
++
++                if candidate.strip():
++                    last_candidate = candidate
++
++                if clipboard_looks_like_axiom(candidate):
++                    clipboard_text = candidate
++                    break
++
++                time.sleep(0.25)
++            else:
++                # Keep the last non-empty value for diagnostics. The strict
++                # validator in run_once() will reject it if it is not Axiom.
++                clipboard_text = last_candidate
+ 
+         elif action == "capture_hotkey":
+             # Record the exact time immediately before starting export.
+@@ -300,6 +300,7 @@
+         args.debug,
+         args.allow_tesseract_only,
+     )
++    screenshot_rows_extracted = len(rows)
+ 
+     clip_valid = clipboard_looks_like_axiom(
+         clipboard_text
+@@ -365,6 +366,7 @@
+         rows,
+         clip_valid,
+         args.output_dir,
++        screenshot_rows_detected=screenshot_rows_extracted,
+     )
+ 
+     result["extract_report"] = extract_report
+--- v18_clipboard_primary_patch_before/profit_taker/axiom_migrated_process.py	2026-08-28 04:54:27.276243435 +0000
++++ v18_clipboard_primary_patch_work/profit_taker_rebuilt_v18/profit_taker/axiom_migrated_process.py	2026-08-28 04:54:06.149245572 +0000
+@@ -11,11 +11,21 @@
+ from .visibility import update_visibility
+ 
+ 
+-def process_rows(db_path:str, snapshot_at:str, screenshot_path:str|None, rows:list[dict[str,Any]], clipboard_valid:bool=False, output_dir:str|Path="data/axiom_migrated") -> dict[str,Any]:
++def process_rows(
++    db_path: str,
++    snapshot_at: str,
++    screenshot_path: str | None,
++    rows: list[dict[str, Any]],
++    clipboard_valid: bool = False,
++    output_dir: str | Path = "data/axiom_migrated",
++    *,
++    screenshot_rows_detected: int | None = None,
++) -> dict[str, Any]:
+     migrate(db_path); outdir=Path(output_dir); outdir.mkdir(parents=True,exist_ok=True)
+     con=connect(db_path)
+     try:
+-        cur=con.execute("INSERT INTO capture_cycles(captured_at,screenshot_path,clipboard_valid,rows_detected,completed) VALUES(?,?,?,?,1)",(snapshot_at,screenshot_path,1 if clipboard_valid else 0,len(rows)))
++        detected_count = len(rows) if screenshot_rows_detected is None else int(screenshot_rows_detected)
++        cur=con.execute("INSERT INTO capture_cycles(captured_at,screenshot_path,clipboard_valid,rows_detected,completed) VALUES(?,?,?,?,1)",(snapshot_at,screenshot_path,1 if clipboard_valid else 0,detected_count))
+         cycle_id=int(cur.lastrowid)
+         stored=[]
+         for row in rows:
+@@ -23,7 +33,13 @@
+             if not token_key: continue
+             row["token_key"]=token_key; row["snapshot_at"]=snapshot_at
+             cols=["cycle_id","token_key","token_address","name","short_address_hint","snapshot_at","age_minutes","image_reuse_count","market_cap_usd","volume_usd","fees_sol","txns","holders","pro_traders","kols","dev_migrations","dev_creations","recent_visitors","top10_holders_pct","tracked_dev_status_raw","funding_time_raw","funding_time_minutes","sniper_pct","insider_pct","bundler_pct","dex_paid","field_confidence_json","raw_ocr_json","source_json"]
+-            vals=[cycle_id,token_key,row.get("token_address"),row.get("name"),row.get("short_address_hint"),snapshot_at,row.get("age_minutes"),row.get("image_reuse_count"),row.get("market_cap_usd"),row.get("volume_usd"),row.get("fees_sol"),row.get("txns"),row.get("holders"),row.get("pro_traders"),row.get("kols"),row.get("dev_migrations"),row.get("dev_creations"),row.get("recent_visitors"),row.get("top10_holders_pct"),row.get("tracked_dev_status_raw"),row.get("funding_time_raw"),row.get("funding_time_minutes"),row.get("sniper_pct"),row.get("insider_pct"),row.get("bundler_pct"),None if row.get("dex_paid") is None else (1 if row.get("dex_paid") else 0),json_dumps(row.get("field_confidence",{})),json_dumps(row.get("ocr_diagnostics",{})),json_dumps(row.get("source",{}))]
++            source_payload=dict(row.get("source") or {})
++            if row.get("data_origin") is not None:
++                source_payload.setdefault("data_origin", row.get("data_origin"))
++            if row.get("training_eligible") is not None:
++                source_payload.setdefault("training_eligible", bool(row.get("training_eligible")))
++            row["source"] = source_payload
++            vals=[cycle_id,token_key,row.get("token_address"),row.get("name"),row.get("short_address_hint"),snapshot_at,row.get("age_minutes"),row.get("image_reuse_count"),row.get("market_cap_usd"),row.get("volume_usd"),row.get("fees_sol"),row.get("txns"),row.get("holders"),row.get("pro_traders"),row.get("kols"),row.get("dev_migrations"),row.get("dev_creations"),row.get("recent_visitors"),row.get("top10_holders_pct"),row.get("tracked_dev_status_raw"),row.get("funding_time_raw"),row.get("funding_time_minutes"),row.get("sniper_pct"),row.get("insider_pct"),row.get("bundler_pct"),None if row.get("dex_paid") is None else (1 if row.get("dex_paid") else 0),json_dumps(row.get("field_confidence",{})),json_dumps(row.get("ocr_diagnostics",{})),json_dumps(source_payload)]
+             sql=f"INSERT OR IGNORE INTO axiom_observations({','.join(cols)}) VALUES({','.join('?' for _ in cols)})"
+             con.execute(sql,vals)
+             obs=con.execute("SELECT * FROM axiom_observations WHERE token_key=? AND snapshot_at=?",(token_key,snapshot_at)).fetchone()
+@@ -39,7 +55,19 @@
+     stem=Path(screenshot_path).stem if screenshot_path else snapshot_at.replace(":","-")
+     json_path=outdir/f"{stem}.rows.json"; csv_path=outdir/f"{stem}.rows.csv"
+     json_path.write_text(json.dumps(rows,indent=2,ensure_ascii=False,default=str),encoding="utf-8")
+-    flat_fields=["token_key","name","short_address_hint","age_minutes","market_cap_usd","volume_usd","fees_sol","txns","holders","pro_traders","kols","dev_migrations","dev_creations","recent_visitors","top10_holders_pct","funding_time_minutes","sniper_pct","insider_pct","bundler_pct","dex_paid"]
++    flat_fields=["token_key","name","short_address_hint","data_origin","training_eligible","age_minutes","market_cap_usd","volume_usd","fees_sol","txns","holders","pro_traders","kols","dev_migrations","dev_creations","recent_visitors","top10_holders_pct","funding_time_minutes","sniper_pct","insider_pct","bundler_pct","dex_paid"]
+     with csv_path.open("w",newline="",encoding="utf-8-sig") as f:
+         w=csv.DictWriter(f,fieldnames=flat_fields); w.writeheader(); w.writerows([{k:r.get(k) for k in flat_fields} for r in rows])
+-    return {"cycle_id":cycle_id,"rows_input":len(rows),"rows_stored":len(stored),"json":str(json_path),"csv":str(csv_path)}
++    origin_counts: dict[str, int] = {}
++    for row in rows:
++        origin = str((row.get("source") or {}).get("data_origin") or "unknown")
++        origin_counts[origin] = origin_counts.get(origin, 0) + 1
++    return {
++        "cycle_id": cycle_id,
++        "rows_input": len(rows),
++        "screenshot_rows_detected": detected_count,
++        "rows_stored": len(stored),
++        "origin_counts": origin_counts,
++        "json": str(json_path),
++        "csv": str(csv_path),
++    }
