@@ -22,6 +22,7 @@ jobs:
           tests/test_collection_readiness.py::test_fresh_collection_session_is_idempotent_and_duration_agnostic
           tests/test_collection_readiness.py::test_fresh_collection_refuses_unmarked_existing_raw_data
           tests/test_collection_readiness.py::test_collection_status_detects_payload_coverage_gap
+          tests/test_final_collection_session.py
       - name: Collector atomic persistence integrity
         run: >-
           python -m pytest -q

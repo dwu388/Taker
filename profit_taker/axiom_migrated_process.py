@@ -2,8 +2,8 @@
 
 The previously validated implementation is preserved in
 :mod:`profit_taker.axiom_migrated_process_base`.  This facade makes silent
-``INSERT OR IGNORE`` loss impossible and requires an initialized collection
-session before a capture may be committed.
+``INSERT OR IGNORE`` loss impossible and requires an initialized, schema-compatible
+production collection session before a capture may be committed.
 """
 from __future__ import annotations
 
@@ -12,17 +12,20 @@ from pathlib import Path
 from typing import Any
 
 from . import axiom_migrated_process_base as _impl
+from .db import COLLECTOR_SCHEMA_VERSION
 
 for _name in dir(_impl):
     if not _name.startswith("__"):
         globals()[_name] = getattr(_impl, _name)
+
+PRODUCTION_COLLECTION_PURPOSE = "v24_production_raw_collection"
 
 
 class _StrictObservationConnection(sqlite3.Connection):
     """Convert the legacy observation INSERT OR IGNORE into a hard INSERT.
 
     A duplicate/canonicalization collision is evidence that the capture cannot be
-    represented one-row-per-card.  It must roll back instead of being counted as a
+    represented one-row-per-card. It must roll back instead of being counted as a
     successful production capture with silently missing observations.
     """
 
@@ -52,12 +55,23 @@ def _require_single_collection_session(db_path: str | Path) -> None:
     con = _strict_connect(db_path)
     try:
         rows = con.execute(
-            "SELECT session_id FROM collection_sessions ORDER BY started_at, created_at"
+            "SELECT session_id,purpose,collector_schema FROM collection_sessions ORDER BY started_at, created_at"
         ).fetchall()
         if len(rows) != 1:
             raise RuntimeError(
                 "Production capture requires exactly one initialized collection session; "
                 f"found {len(rows)}. Start through collection_admin/init or run_axiom_loop.bat."
+            )
+        row = rows[0]
+        if str(row["collector_schema"]) != COLLECTOR_SCHEMA_VERSION:
+            raise RuntimeError(
+                "Production capture refuses a collection session created by a different collector schema: "
+                f"stored={row['collector_schema']!r}, required={COLLECTOR_SCHEMA_VERSION!r}"
+            )
+        if str(row["purpose"]) != PRODUCTION_COLLECTION_PURPOSE:
+            raise RuntimeError(
+                "Production capture refuses a collection session with a non-production purpose: "
+                f"stored={row['purpose']!r}, required={PRODUCTION_COLLECTION_PURPOSE!r}"
             )
     finally:
         con.close()
@@ -96,7 +110,7 @@ def process_rows(
 
     _require_single_collection_session(db_path)
     # The preserved implementation performs one SQLite transaction for cycle,
-    # payload, observations and success-attempt.  Patch its connection factory so
+    # payload, observations and success-attempt. Patch its connection factory so
     # duplicate observation keys raise and roll the whole transaction back.
     _impl.connect = _strict_connect
     result = _impl.process_rows(
