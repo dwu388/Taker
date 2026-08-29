@@ -4,5 +4,12 @@
     "clipboard_read_timeout_seconds": 6.0,
     "clipboard_poll_seconds": 0.25,
     "cycle_seconds": 60
+  },
+  "performance_report": {
+    "enabled": true,
+    "interval_minutes": 60,
+    "output_path": "data/CURRENT_MODEL_PERFORMANCE.txt",
+    "benchmark_db": "data/axiom_v24_1000_benchmark.sqlite",
+    "recent_events": 8
   }
 }

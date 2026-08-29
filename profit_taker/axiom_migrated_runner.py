@@ -7,7 +7,9 @@ invariants without changing parsing/cadence behavior:
 1. every browser copy is preceded by a unique verified clipboard sentinel, so a
    failed clipboard clear/copy can never replay the previous valid Axiom snapshot;
 2. direct invocation initializes/resumes a session whose purpose matches capture
-   provenance, keeping replay files out of the authoritative production session.
+   provenance, keeping replay files out of the authoritative production session;
+3. after successful production cycles, a human-readable model-performance report
+   is regenerated only when its configured interval has elapsed.
 """
 from __future__ import annotations
 
@@ -17,13 +19,22 @@ from typing import Any
 
 from . import axiom_migrated_runner_base as _impl
 from .collection_admin import initialize_collection
+from .common import load_json
 from .db import RAW_DB_DEFAULT
+from .performance_report import (
+    BENCHMARK_DB_DEFAULT,
+    RECENT_EVENTS_DEFAULT,
+    REPORT_INTERVAL_MINUTES_DEFAULT,
+    REPORT_OUTPUT_DEFAULT,
+    maybe_generate_report,
+)
 
 for _name in dir(_impl):
     if not _name.startswith("__"):
         globals()[_name] = getattr(_impl, _name)
 
 _original_capture_clipboard = _impl._capture_clipboard
+_original_run_once = _impl.run_once
 
 
 def _prime_clipboard_with_sentinel(pyperclip: Any) -> str:
@@ -70,9 +81,55 @@ def _sync_test_and_extension_hooks() -> None:
     _impl._capture_clipboard = _capture_clipboard
 
 
+def _report_settings(args: Any) -> dict[str, Any]:
+    config_path = str(getattr(args, "config", "axiom_migrated_config.json"))
+    cfg = load_json(config_path, {}) or {}
+    raw = cfg.get("performance_report", {}) if isinstance(cfg, dict) else {}
+    section = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "interval_minutes": max(1, int(section.get("interval_minutes", REPORT_INTERVAL_MINUTES_DEFAULT))),
+        "output_path": str(section.get("output_path", REPORT_OUTPUT_DEFAULT)),
+        "benchmark_db": str(section.get("benchmark_db", BENCHMARK_DB_DEFAULT)),
+        "recent_events": max(1, int(section.get("recent_events", RECENT_EVENTS_DEFAULT))),
+    }
+
+
+def _maybe_refresh_performance_report(args: Any) -> dict[str, Any]:
+    settings = _report_settings(args)
+    if not settings["enabled"]:
+        return {"generated": False, "reason": "disabled"}
+    return maybe_generate_report(
+        str(getattr(args, "db", RAW_DB_DEFAULT)),
+        output_path=settings["output_path"],
+        benchmark_db=settings["benchmark_db"],
+        interval_minutes=settings["interval_minutes"],
+        recent_events=settings["recent_events"],
+    )
+
+
 def run_once(*args: Any, **kwargs: Any) -> dict:
     _sync_test_and_extension_hooks()
-    return _impl.run_once(*args, **kwargs)
+    result = _original_run_once(*args, **kwargs)
+    collector_args = args[0] if args else kwargs.get("args")
+    if collector_args is not None:
+        try:
+            result["performance_report"] = _maybe_refresh_performance_report(collector_args)
+        except Exception as exc:
+            # Reporting is diagnostic. It must never turn a durable successful raw
+            # capture into a failed collection cycle.
+            result["performance_report"] = {
+                "generated": False,
+                "reason": "report_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    return result
+
+
+# Base ``main`` resolves ``run_once`` in its own module globals. Bind the wrapper
+# there so the actual one-minute CLI loop receives the same scheduled reporting
+# behavior that direct callers/tests receive.
+_impl.run_once = run_once
 
 
 def _db_from_argv(argv: list[str]) -> str:
@@ -96,6 +153,7 @@ def main() -> None:
     # be mixed into an existing authoritative production raw database.
     initialize_collection(_db_from_argv(argv), purpose=purpose)
     _sync_test_and_extension_hooks()
+    _impl.run_once = run_once
     _impl.main()
 
 
