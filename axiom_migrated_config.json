@@ -1,9 +1,16 @@
 {
-  "layout_version": "v24-clipboard-only",
+  "layout_version": "v24-clipboard-only-25h-view",
   "capture": {
     "clipboard_read_timeout_seconds": 6.0,
     "clipboard_poll_seconds": 0.25,
     "cycle_seconds": 60
+  },
+  "model_lifecycle": {
+    "prediction_horizon_minutes": 1440,
+    "axiom_view_minutes": 1500,
+    "age_out_guard_minutes": 1440,
+    "view_buffer_minutes": 60,
+    "note": "Axiom must expose tokens through 25h. The model stops at 24h; the final visible hour is observation buffer only."
   },
   "performance_report": {
     "enabled": true,

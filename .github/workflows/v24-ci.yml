@@ -53,5 +53,7 @@ jobs:
         run: python -m pytest -q tests/test_v24_policy_cfg.py
       - name: Final production-readiness regressions
         run: python -m pytest -q tests/test_final_production_readiness.py
+      - name: 24-hour lifecycle contract regressions
+        run: python -m pytest -q tests/test_v24_24h_lifecycle.py
       - name: Performance report regressions
         run: python -m pytest -q tests/test_performance_report.py

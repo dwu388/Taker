@@ -3,10 +3,20 @@ V24 VALIDATION / RELEASE GATE
 Canonical research database:
   data\axiom_v24_raw.sqlite
 
+Active lifecycle contract:
+  prediction horizon = 1440 minutes / 24h
+  Axiom view         = 1500 minutes / 25h
+  age-out guard      = 1440 minutes / 24h
+  view buffer        = 60 minutes
+
 Repository regression gate:
   .venv\Scripts\python.exe -m pytest
 
+Dedicated lifecycle gate:
+  .venv\Scripts\python.exe -m pytest -q tests\test_v24_24h_lifecycle.py
+
 Fresh-collection smoke test:
+  Configure Axiom to show the 25-hour Migrated window.
   run_axiom_once.bat
   collection_status.bat
 
@@ -43,14 +53,22 @@ Review invariants:
   - canonical raw observation source is axiom_observations;
   - full-mint identity collisions are hard failures;
   - database/capture/provenance IDs and repair-version metadata are excluded from model features;
-  - peak_at and confirmed_at both remain in horizon-safe targets;
+  - active forecast, survival, sequence and promotion-required horizons never exceed 1440 minutes;
+  - the Axiom 25th hour is buffer-only and cannot become target truth;
+  - age >= 1440 minutes is natural model age-out, not operational death;
+  - peak_at and confirmed_at both remain horizon-safe targets;
+  - changing from the former 72h target forces a rebuild of derived finalized labels from raw observations;
+  - old 72h forecaster/policy target hashes are not warm-compatible with the 24h generation;
   - token role is permanently assigned at first seen;
+  - promotion maturity remains token-lifetime + outcome-horizon safe (approximately 24h + 24h after cohort end);
   - paper entries/exits fill only on a later observable snapshot;
   - long-history sequence cache invalidates from a late historical insertion forward;
   - sealed audit scoring uses audit-born token lifetime membership, confirmation-safe truth, and token-balanced metrics;
-  - policy cohort/token refresh helpers receive the active V24Config.
+  - policy cohort/token refresh helpers receive the active V24Config;
+  - collector/readiness, performance-reporting, liquidity/friction and benchmark isolation remain unchanged by the target conversion.
 
 Interpretation:
   Passing this gate means the repository is suitable to collect a fresh authoritative
-  research dataset and later conduct leakage-hardened paper evaluation. It does not
-  by itself demonstrate profitable alpha or authorize real-money autonomous trading.
+  25-hour-view dataset for a 24-hour V24 lifecycle and later conduct leakage-hardened
+  paper evaluation. It does not by itself demonstrate profitable alpha or authorize
+  real-money autonomous trading.
