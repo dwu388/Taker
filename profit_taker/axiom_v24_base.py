@@ -77,16 +77,12 @@ def train_distributional_policy(
         from . import axiom_self_teach as selfteach
 
         selfteach.migrate(conn)
-        cf_refresh = refresh_counterfactual_policy_targets(conn, cfg)
+        refresh_counterfactual_policy_targets(conn, cfg)
         refresh_policy_cohorts(conn, cfg)
         refresh_token_assignments(conn, cfg)
         cohort = next_one_use_policy_cohort(conn, cfg)
         if cohort is None:
-            return {
-                "trained": False,
-                "reason": "no mature unused policy-promotion cohort",
-                "counterfactual_refresh": cf_refresh,
-            }
+            return {"trained": False, "reason": "no mature unused policy-promotion cohort"}
 
         entry = _entry_policy_training_rows(conn, horizon=60)
         hold = _hold_policy_training_rows(conn, horizon=60)
@@ -217,7 +213,6 @@ def train_distributional_policy(
             "hold_rows": len(hold),
             "promotion": metrics,
             "dr_ope": ope,
-            "counterfactual_refresh": cf_refresh,
         }
 
 
