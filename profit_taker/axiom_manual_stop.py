@@ -208,10 +208,15 @@ def _stop_conn(
     stop_time = _utc(stopped_at or _now())
     last_cycle_id = int(row[1]) if row[1] is not None else None
     last_capture = _utc(row[2]) if row[2] else None
-    if last_capture is None:
-        latest = _latest_successful_cycle(conn, row[0])
-        if latest is not None:
-            last_cycle_id, last_capture = latest
+
+    # Always reconcile against durable SQLite truth. Ctrl+C can arrive after a
+    # capture transaction commits but before the runner records its convenience
+    # heartbeat; the committed cycle must still be the censor boundary.
+    latest = _latest_successful_cycle(conn, row[0])
+    if latest is not None:
+        latest_cycle_id, latest_capture = latest
+        if last_capture is None or latest_capture > last_capture:
+            last_cycle_id, last_capture = latest_cycle_id, latest_capture
 
     censor_at = last_capture or stop_time
     active = _active_tokens(conn, censor_at, active_lookback_minutes) if last_capture else {}

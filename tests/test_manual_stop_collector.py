@@ -54,6 +54,32 @@ def test_manual_stop_censors_only_still_unresolved_recent_tokens(tmp_path):
     assert tokens == {"present-token", "recent-missing"}
 
 
+def test_stop_reconciles_to_newer_durable_capture_even_if_runner_heartbeat_lags(tmp_path):
+    db = str(tmp_path / "durable.sqlite")
+    run_id = manual_stop.start_collection_session(
+        db, started_at="2026-08-29T11:55:00+00:00"
+    )
+    first = _capture(db, "2026-08-29T12:00:00+00:00", ["A"])
+    manual_stop.note_successful_capture(
+        db, run_id, capture_at="2026-08-29T12:00:00+00:00", cycle_id=first
+    )
+    # Simulate Ctrl+C after the next capture transaction committed but before the
+    # wrapper had time to update its convenience heartbeat.
+    second = _capture(db, "2026-08-29T12:01:00+00:00", ["B"])
+    out = manual_stop.stop_collection_session(
+        db, run_id, stopped_at="2026-08-29T12:01:02+00:00"
+    )
+
+    assert out["censor_at"].startswith("2026-08-29T12:01:00")
+    with sqlite3.connect(db) as conn:
+        stored = conn.execute(
+            f"SELECT last_cycle_id,last_capture_at FROM {manual_stop.RUN_TABLE} WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+    assert stored[0] == second
+    assert str(stored[1]).startswith("2026-08-29T12:01:00")
+
+
 def test_manual_stop_censors_open_paper_state_without_return_target(tmp_path):
     db = str(tmp_path / "paper.sqlite")
     run_id = manual_stop.start_collection_session(db)
