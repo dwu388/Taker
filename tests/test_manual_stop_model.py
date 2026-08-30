@@ -89,6 +89,38 @@ def test_confirmed_success_before_stop_is_preserved(tmp_path):
     assert row[3] == 0
 
 
+def test_repeated_refresh_keeps_censored_truth_and_learning_watermark_stable(tmp_path):
+    db = str(tmp_path / "stable.sqlite")
+    run_id = manual_stop.start_collection_session(
+        db, started_at="2026-08-29T11:59:00+00:00"
+    )
+    _capture(db, "2026-08-29T12:00:00+00:00", "C", 100.0)
+    cycle = _capture(db, "2026-08-29T12:01:00+00:00", "C", 110.0)
+    _manual_boundary(db, run_id, "2026-08-29T12:01:00+00:00", cycle)
+    _capture(db, "2026-08-29T13:00:00+00:00", "C", 160.0)
+    _capture(db, "2026-08-29T13:01:00+00:00", "C", 120.0)
+
+    first = peak.refresh_labels(db, peak.PeakStructureConfig())
+    with sqlite3.connect(db) as conn:
+        before = conn.execute(
+            f"""SELECT target_fingerprint,learning_updated_at,label_status_next_peak
+                FROM {peak.LABEL_TABLE}
+                WHERE token_key='C' AND decision_at LIKE '2026-08-29T12:00:%'"""
+        ).fetchone()
+    second = peak.refresh_labels(db, peak.PeakStructureConfig())
+    with sqlite3.connect(db) as conn:
+        after = conn.execute(
+            f"""SELECT target_fingerprint,learning_updated_at,label_status_next_peak
+                FROM {peak.LABEL_TABLE}
+                WHERE token_key='C' AND decision_at LIKE '2026-08-29T12:00:%'"""
+        ).fetchone()
+
+    assert first["labels_learning_updated"] >= 0
+    assert second["labels_learning_updated"] == 0
+    assert before == after
+    assert after[2] == "censored_collection_stop"
+
+
 def test_v24_counterfactual_refresh_prunes_windows_crossing_stop(tmp_path, monkeypatch):
     db = str(tmp_path / "counterfactual.sqlite")
     with sqlite3.connect(db) as conn:
