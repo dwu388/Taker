@@ -15,6 +15,7 @@ import joblib
 import sqlite3
 import uuid
 
+from . import axiom_manual_stop as manual_stop
 from . import axiom_v24_impl as _impl
 
 for _name in dir(_impl):
@@ -38,6 +39,23 @@ def _fit_blended_regression(data, features, target, n_estimators, *, quantile=No
 
 
 _impl._fit_blended_regression = _fit_blended_regression
+
+
+# Counterfactual ENTRY/HOLD targets must never bridge a manual collection stop.
+# The retained builder may see observations collected after a restart, so prune any
+# target whose required future window crosses a durable neutral-censor boundary.
+_original_refresh_counterfactual_policy_targets = _impl.refresh_counterfactual_policy_targets
+
+
+def refresh_counterfactual_policy_targets(conn, cfg):
+    result = _original_refresh_counterfactual_policy_targets(conn, cfg)
+    pruned = manual_stop.prune_counterfactual_targets(conn, COUNTERFACTUAL_TABLE)
+    if isinstance(result, dict):
+        result["manual_stop_censored_targets_pruned"] = int(pruned)
+    return result
+
+
+_impl.refresh_counterfactual_policy_targets = refresh_counterfactual_policy_targets
 
 
 def train_distributional_policy(
