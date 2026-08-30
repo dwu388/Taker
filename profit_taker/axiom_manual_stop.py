@@ -1,177 +1,413 @@
 from __future__ import annotations
 
-import argparse, json, sqlite3, uuid
-from datetime import datetime, timezone
+"""Durable neutral-censor boundaries for interrupted Axiom collection runs.
+
+This module intentionally uses only the Python standard library so the lightweight
+collector environment does not need the modeling stack (pandas/numpy/sklearn).
+"""
+
+import argparse
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-import pandas as pd
 
-SESSION_TABLE="axiom_v24_collection_run_sessions"
-CENSOR_TABLE="axiom_v24_collection_censors"
-PEAK_SNAPSHOT_TABLE="axiom_v24_collection_censor_peak_snapshots"
-DEFAULT_ACTIVE_LOOKBACK_MINUTES=50.0
+from .db import RAW_DB_DEFAULT, migrate as migrate_raw
 
-
-def _utc(v:Any)->pd.Timestamp:
-    t=pd.Timestamp(v); return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
-def _now_iso()->str: return datetime.now(timezone.utc).isoformat()
-def _exists(c:sqlite3.Connection,n:str)->bool: return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(n,)).fetchone() is not None
-def _cols(c:sqlite3.Connection,n:str)->set[str]: return {str(r[1]) for r in c.execute(f'PRAGMA table_info("{n}")')} if _exists(c,n) else set()
+RUN_TABLE = "axiom_v24_collection_run_sessions"
+CENSOR_TABLE = "axiom_v24_collection_censors"
+DEFAULT_ACTIVE_LOOKBACK_MINUTES = 50.0
 
 
-def migrate(c:sqlite3.Connection)->None:
-    c.executescript(f"""
-    CREATE TABLE IF NOT EXISTS {SESSION_TABLE}(session_id TEXT PRIMARY KEY,source TEXT NOT NULL,started_at TEXT NOT NULL,last_capture_at TEXT,stopped_at TEXT,censor_at TEXT,stop_reason TEXT,status TEXT NOT NULL,created_at TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS idx_{SESSION_TABLE}_status ON {SESSION_TABLE}(status,started_at);
-    CREATE TABLE IF NOT EXISTS {CENSOR_TABLE}(session_id TEXT NOT NULL,token_key TEXT NOT NULL,last_seen_at TEXT NOT NULL,censor_at TEXT NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(session_id,token_key));
-    CREATE INDEX IF NOT EXISTS idx_{CENSOR_TABLE}_token_time ON {CENSOR_TABLE}(token_key,censor_at);
-    CREATE TABLE IF NOT EXISTS {PEAK_SNAPSHOT_TABLE}(session_id TEXT NOT NULL,token_key TEXT NOT NULL,decision_at TEXT NOT NULL,row_json TEXT NOT NULL,censor_at TEXT NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(session_id,token_key,decision_at));
-    """); c.commit()
+def _utc(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def _obs(c:sqlite3.Connection)->pd.DataFrame:
-    from . import axiom_peak_structure as peak
-    x,_=peak.load_observations(c)
-    if x.empty:return x
-    x=x.copy(); x["token_key"]=x.token_key.astype(str); x["snapshot_at"]=pd.to_datetime(x.snapshot_at,utc=True,errors="coerce")
-    return x.dropna(subset=["snapshot_at"])
+def _iso(value: Any) -> str:
+    return _utc(value).isoformat(timespec="milliseconds")
 
 
-def _active(c:sqlite3.Connection,at:pd.Timestamp,lookback:float)->dict[str,pd.Timestamp]:
-    x=_obs(c)
-    if x.empty:return {}
-    x=x[(x.snapshot_at<=at)&(x.snapshot_at>=at-pd.Timedelta(minutes=float(lookback)))]
-    if x.empty:return {}
-    s=x.groupby("token_key",sort=False).snapshot_at.max(); return {str(k):_utc(v) for k,v in s.items()}
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _snapshot_labels(c:sqlite3.Connection,sid:str,active:dict[str,pd.Timestamp],at:pd.Timestamp,reason:str)->int:
-    table="axiom_peak_structure_labels_v21"
-    if not active or not _exists(c,table):return 0
-    cols=_cols(c,table)
-    if not {"token_key","decision_at"}.issubset(cols):return 0
-    names=[str(r[1]) for r in c.execute(f'PRAGMA table_info("{table}")')]; unfinished="AND COALESCE(label_finalized,0)=0" if "label_finalized" in cols else ""; n=0
-    for token in active:
-        for row in c.execute(f'SELECT * FROM "{table}" WHERE token_key=? AND decision_at<=? {unfinished}',(token,at.isoformat())):
-            rec=dict(zip(names,row)); c.execute(f"INSERT OR IGNORE INTO {PEAK_SNAPSHOT_TABLE}(session_id,token_key,decision_at,row_json,censor_at,reason,created_at) VALUES(?,?,?,?,?,?,?)",(sid,token,str(rec["decision_at"]),json.dumps(rec,sort_keys=True,default=str),at.isoformat(),reason,_now_iso())); n+=int(c.execute("SELECT changes()").fetchone()[0]>0)
-    return n
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
-def _censor_paper_state(c:sqlite3.Connection,at:pd.Timestamp,reason:str)->dict[str,int]:
-    out={"paper_positions_censored":0,"pending_entries_cancelled":0}
-    if _exists(c,"axiom_paper_positions_v20"):
-        cols=_cols(c,"axiom_paper_positions_v20"); sets=["status='censored'"]; vals:list[Any]=[]
-        if "closed_at" in cols:sets.append("closed_at=?");vals.append(at.isoformat())
-        if "close_reason" in cols:sets.append("close_reason=?");vals.append(reason)
-        if "exit_kind" in cols:sets.append("exit_kind='collection_censored'")
-        for name in ("reward","observed_reward","execution_reward","net_return_pct","observed_net_return_pct","execution_net_return_pct","exit_mc_observed","exit_mc_execution_proxy"):
-            if name in cols:sets.append(f'"{name}"=NULL')
-        c.execute(f"UPDATE axiom_paper_positions_v20 SET {','.join(sets)} WHERE status='open'",vals); out["paper_positions_censored"]=int(c.execute("SELECT changes()").fetchone()[0])
-    if _exists(c,"axiom_paper_pending_entries_v24"):
-        cols=_cols(c,"axiom_paper_pending_entries_v24"); sets=["status='cancelled'"]; vals=[]
-        if "cancelled_at" in cols:sets.append("cancelled_at=?");vals.append(at.isoformat())
-        if "cancel_reason" in cols:sets.append("cancel_reason=?");vals.append(reason)
-        c.execute(f"UPDATE axiom_paper_pending_entries_v24 SET {','.join(sets)} WHERE status='pending'",vals); out["pending_entries_cancelled"]=int(c.execute("SELECT changes()").fetchone()[0])
+def _columns(conn: sqlite3.Connection, name: str) -> set[str]:
+    if not _table_exists(conn, name):
+        return set()
+    return {str(r[1]) for r in conn.execute(f'PRAGMA table_info("{name}")').fetchall()}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        f"""
+        CREATE TABLE IF NOT EXISTS {RUN_TABLE} (
+            run_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            last_cycle_id INTEGER,
+            last_capture_at TEXT,
+            stopped_at TEXT,
+            censor_at TEXT,
+            stop_reason TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_{RUN_TABLE}_status
+            ON {RUN_TABLE}(status, started_at);
+
+        CREATE TABLE IF NOT EXISTS {CENSOR_TABLE} (
+            run_id TEXT NOT NULL,
+            token_key TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            censor_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, token_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_{CENSOR_TABLE}_token_time
+            ON {CENSOR_TABLE}(token_key, censor_at);
+        """
+    )
+    conn.commit()
+
+
+def _latest_successful_cycle(
+    conn: sqlite3.Connection, started_at: Any
+) -> tuple[int, datetime] | None:
+    if not _table_exists(conn, "capture_cycles"):
+        return None
+    row = conn.execute(
+        """
+        SELECT cycle_id, captured_at
+        FROM capture_cycles
+        WHERE completed=1 AND clipboard_valid=1
+          AND julianday(captured_at) >= julianday(?)
+        ORDER BY julianday(captured_at) DESC, cycle_id DESC
+        LIMIT 1
+        """,
+        (_iso(started_at),),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), _utc(row[1])
+
+
+def _active_tokens(
+    conn: sqlite3.Connection,
+    censor_at: datetime,
+    lookback_minutes: float,
+) -> dict[str, datetime]:
+    if not _table_exists(conn, "axiom_observations"):
+        return {}
+    rows = conn.execute(
+        """
+        SELECT token_key, MAX(snapshot_at) AS last_seen_at
+        FROM axiom_observations
+        WHERE julianday(snapshot_at) <= julianday(?)
+          AND julianday(snapshot_at) > julianday(?) - (? / 1440.0)
+        GROUP BY token_key
+        """,
+        (_iso(censor_at), _iso(censor_at), float(lookback_minutes)),
+    ).fetchall()
+    out: dict[str, datetime] = {}
+    for token, last_seen in rows:
+        if token is None or last_seen is None:
+            continue
+        out[str(token)] = _utc(last_seen)
     return out
 
 
-def _stop(c:sqlite3.Connection,sid:str,reason:str,stopped_at:Any|None=None,lookback:float=DEFAULT_ACTIVE_LOOKBACK_MINUTES)->dict[str,Any]:
-    migrate(c); row=c.execute(f"SELECT last_capture_at,status FROM {SESSION_TABLE} WHERE session_id=?",(sid,)).fetchone()
-    if not row:return {"stopped":False,"reason":"session_not_found","session_id":sid}
-    if str(row[1])!="active":return {"stopped":False,"reason":"already_stopped","session_id":sid}
-    stop_at=_utc(stopped_at or pd.Timestamp.now(tz="UTC")); censor_at=_utc(row[0]) if row[0] else stop_at; active=_active(c,censor_at,lookback)
-    for token,last_seen in active.items():c.execute(f"INSERT OR REPLACE INTO {CENSOR_TABLE}(session_id,token_key,last_seen_at,censor_at,reason,created_at) VALUES(?,?,?,?,?,?)",(sid,token,last_seen.isoformat(),censor_at.isoformat(),reason,_now_iso()))
-    snaps=_snapshot_labels(c,sid,active,censor_at,reason); paper=_censor_paper_state(c,censor_at,reason)
-    c.execute(f"UPDATE {SESSION_TABLE} SET stopped_at=?,censor_at=?,stop_reason=?,status='stopped' WHERE session_id=?",(stop_at.isoformat(),censor_at.isoformat(),reason,sid)); c.commit()
-    return {"stopped":True,"session_id":sid,"stopped_at":stop_at.isoformat(),"censor_at":censor_at.isoformat(),"reason":reason,"active_tokens_censored":len(active),"peak_rows_snapshotted":snaps,**paper}
+def _censor_paper_state(
+    conn: sqlite3.Connection, censor_at: datetime, reason: str
+) -> dict[str, int]:
+    result = {"paper_positions_censored": 0, "pending_entries_cancelled": 0}
+
+    if _table_exists(conn, "axiom_paper_positions_v20"):
+        cols = _columns(conn, "axiom_paper_positions_v20")
+        sets = ["status='censored'"]
+        params: list[Any] = []
+        if "closed_at" in cols:
+            sets.append("closed_at=?")
+            params.append(_iso(censor_at))
+        if "close_reason" in cols:
+            sets.append("close_reason=?")
+            params.append(reason)
+        if "exit_kind" in cols:
+            sets.append("exit_kind='collection_censored'")
+        if "pending_exit_at" in cols:
+            sets.append("pending_exit_at=NULL")
+        if "pending_exit_reason" in cols:
+            sets.append("pending_exit_reason=NULL")
+        for name in (
+            "exit_mc", "gross_return_pct", "net_return_pct", "peak_capture_ratio", "reward",
+            "exit_mc_observed", "exit_mc_execution_proxy", "observed_gross_return_pct",
+            "execution_gross_return_pct", "observed_net_return_pct", "execution_net_return_pct",
+            "observed_peak_capture_ratio", "execution_peak_capture_ratio",
+            "observed_reward", "execution_reward",
+        ):
+            if name in cols:
+                sets.append(f'"{name}"=NULL')
+        conn.execute(
+            f"UPDATE axiom_paper_positions_v20 SET {','.join(sets)} WHERE status='open'",
+            params,
+        )
+        result["paper_positions_censored"] = int(conn.execute("SELECT changes()").fetchone()[0])
+
+    if _table_exists(conn, "axiom_paper_pending_entries_v24"):
+        cols = _columns(conn, "axiom_paper_pending_entries_v24")
+        sets = ["status='cancelled'"]
+        params = []
+        if "cancelled_at" in cols:
+            sets.append("cancelled_at=?")
+            params.append(_iso(censor_at))
+        if "cancel_reason" in cols:
+            sets.append("cancel_reason=?")
+            params.append(reason)
+        conn.execute(
+            f"UPDATE axiom_paper_pending_entries_v24 SET {','.join(sets)} WHERE status='pending'",
+            params,
+        )
+        result["pending_entries_cancelled"] = int(conn.execute("SELECT changes()").fetchone()[0])
+
+    return result
 
 
-def start_collection_session(db:str,*,source:str="axiom_migrated_runner",started_at:Any|None=None)->str:
-    Path(db).parent.mkdir(parents=True,exist_ok=True)
-    with sqlite3.connect(db) as c:
-        migrate(c)
-        for (sid,) in c.execute(f"SELECT session_id FROM {SESSION_TABLE} WHERE status='active' ORDER BY started_at").fetchall():_stop(c,str(sid),"unclean_restart_censored")
-        sid=str(uuid.uuid4()); t=_utc(started_at or pd.Timestamp.now(tz="UTC")); c.execute(f"INSERT INTO {SESSION_TABLE}(session_id,source,started_at,status,created_at) VALUES(?,?,?,'active',?)",(sid,source,t.isoformat(),_now_iso())); c.commit(); return sid
+def _stop_conn(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    reason: str,
+    stopped_at: Any | None = None,
+    active_lookback_minutes: float = DEFAULT_ACTIVE_LOOKBACK_MINUTES,
+) -> dict[str, Any]:
+    migrate(conn)
+    row = conn.execute(
+        f"SELECT started_at,last_cycle_id,last_capture_at,status FROM {RUN_TABLE} WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return {"stopped": False, "reason": "run_not_found", "run_id": run_id}
+    if str(row[3]) != "active":
+        return {"stopped": False, "reason": "already_stopped", "run_id": run_id}
+
+    stop_time = _utc(stopped_at or _now())
+    last_cycle_id = int(row[1]) if row[1] is not None else None
+    last_capture = _utc(row[2]) if row[2] else None
+    if last_capture is None:
+        latest = _latest_successful_cycle(conn, row[0])
+        if latest is not None:
+            last_cycle_id, last_capture = latest
+
+    censor_at = last_capture or stop_time
+    active = _active_tokens(conn, censor_at, active_lookback_minutes) if last_capture else {}
+    created = _iso(_now())
+    for token, last_seen in active.items():
+        conn.execute(
+            f"""INSERT OR REPLACE INTO {CENSOR_TABLE}
+                (run_id,token_key,last_seen_at,censor_at,reason,created_at)
+                VALUES(?,?,?,?,?,?)""",
+            (run_id, token, _iso(last_seen), _iso(censor_at), reason, created),
+        )
+
+    paper = _censor_paper_state(conn, censor_at, reason)
+    conn.execute(
+        f"""UPDATE {RUN_TABLE}
+            SET last_cycle_id=?,last_capture_at=?,stopped_at=?,censor_at=?,stop_reason=?,status='stopped'
+            WHERE run_id=?""",
+        (
+            last_cycle_id,
+            _iso(last_capture) if last_capture else None,
+            _iso(stop_time),
+            _iso(censor_at),
+            reason,
+            run_id,
+        ),
+    )
+    conn.commit()
+    return {
+        "stopped": True,
+        "run_id": run_id,
+        "stopped_at": _iso(stop_time),
+        "censor_at": _iso(censor_at),
+        "reason": reason,
+        "active_tokens_censored": len(active),
+        **paper,
+    }
 
 
-def note_successful_capture(db:str,sid:str,capture_at:Any|None=None)->None:
-    with sqlite3.connect(db) as c:
-        migrate(c)
-        if capture_at is None:
-            r=c.execute("SELECT MAX(captured_at) FROM capture_cycles").fetchone(); capture_at=r[0] if r and r[0] else None
-        if capture_at is not None:c.execute(f"UPDATE {SESSION_TABLE} SET last_capture_at=? WHERE session_id=? AND status='active'",(_utc(capture_at).isoformat(),sid));c.commit()
+def start_collection_session(
+    db_path: str,
+    *,
+    source: str = "axiom_migrated_runner",
+    started_at: Any | None = None,
+) -> str:
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    migrate_raw(db_path)
+    with sqlite3.connect(db_path) as conn:
+        migrate(conn)
+        active = [
+            str(r[0])
+            for r in conn.execute(
+                f"SELECT run_id FROM {RUN_TABLE} WHERE status='active' ORDER BY started_at"
+            ).fetchall()
+        ]
+        for old_run in active:
+            _stop_conn(conn, old_run, reason="unclean_restart_censored")
+        run_id = str(uuid.uuid4())
+        start = _utc(started_at or _now())
+        conn.execute(
+            f"""INSERT INTO {RUN_TABLE}
+                (run_id,source,started_at,status,created_at) VALUES(?,?,?,'active',?)""",
+            (run_id, source, _iso(start), _iso(_now())),
+        )
+        conn.commit()
+        return run_id
 
 
-def stop_collection_session(db:str,sid:str|None=None,*,reason:str="manual_stop_censored",stopped_at:Any|None=None)->dict[str,Any]:
-    with sqlite3.connect(db) as c:
-        migrate(c)
-        if sid is None:
-            r=c.execute(f"SELECT session_id FROM {SESSION_TABLE} WHERE status='active' ORDER BY started_at DESC LIMIT 1").fetchone()
-            if not r:return {"stopped":False,"reason":"no_active_session"}
-            sid=str(r[0])
-        return _stop(c,sid,reason,stopped_at)
+def note_successful_capture(
+    db_path: str,
+    run_id: str,
+    *,
+    capture_at: Any | None = None,
+    cycle_id: int | None = None,
+) -> dict[str, Any]:
+    with sqlite3.connect(db_path) as conn:
+        migrate(conn)
+        row = conn.execute(
+            f"SELECT started_at,status FROM {RUN_TABLE} WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None or str(row[1]) != "active":
+            return {"updated": False, "reason": "run_not_active"}
+        if capture_at is None or cycle_id is None:
+            latest = _latest_successful_cycle(conn, row[0])
+            if latest is None:
+                return {"updated": False, "reason": "no_successful_capture"}
+            found_cycle, found_at = latest
+            if cycle_id is None:
+                cycle_id = found_cycle
+            if capture_at is None:
+                capture_at = found_at
+        conn.execute(
+            f"UPDATE {RUN_TABLE} SET last_cycle_id=?,last_capture_at=? WHERE run_id=? AND status='active'",
+            (int(cycle_id), _iso(capture_at), run_id),
+        )
+        conn.commit()
+        return {"updated": True, "run_id": run_id, "capture_at": _iso(capture_at), "cycle_id": int(cycle_id)}
 
 
-def first_collection_boundary_between(c:sqlite3.Connection,start:Any,end:Any)->pd.Timestamp|None:
-    if not _exists(c,SESSION_TABLE):return None
-    a,b=_utc(start),_utc(end); r=c.execute(f"SELECT censor_at FROM {SESSION_TABLE} WHERE status='stopped' AND censor_at IS NOT NULL AND censor_at>=? AND censor_at<=? ORDER BY censor_at LIMIT 1",(a.isoformat(),b.isoformat())).fetchone(); return _utc(r[0]) if r else None
+def stop_collection_session(
+    db_path: str,
+    run_id: str | None = None,
+    *,
+    reason: str = "manual_stop_censored",
+    stopped_at: Any | None = None,
+) -> dict[str, Any]:
+    migrate_raw(db_path)
+    with sqlite3.connect(db_path) as conn:
+        migrate(conn)
+        if run_id is None:
+            row = conn.execute(
+                f"SELECT run_id FROM {RUN_TABLE} WHERE status='active' ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return {"stopped": False, "reason": "no_active_run"}
+            run_id = str(row[0])
+        return _stop_conn(conn, run_id, reason=reason, stopped_at=stopped_at)
 
 
-def censors_by_token(c:sqlite3.Connection)->dict[str,list[dict[str,Any]]]:
-    if not _exists(c,CENSOR_TABLE):return {}
-    out:dict[str,list[dict[str,Any]]]={}
-    for token,at,reason,last,sid in c.execute(f"SELECT token_key,censor_at,reason,last_seen_at,session_id FROM {CENSOR_TABLE} ORDER BY token_key,censor_at"):out.setdefault(str(token),[]).append({"censor_at":_utc(at),"reason":str(reason),"last_seen_at":_utc(last),"session_id":str(sid)})
+def censors_by_token(conn: sqlite3.Connection) -> dict[str, list[dict[str, str]]]:
+    if not _table_exists(conn, CENSOR_TABLE):
+        return {}
+    out: dict[str, list[dict[str, str]]] = {}
+    for run_id, token, last_seen, censor_at, reason in conn.execute(
+        f"SELECT run_id,token_key,last_seen_at,censor_at,reason FROM {CENSOR_TABLE} ORDER BY token_key,censor_at"
+    ):
+        out.setdefault(str(token), []).append(
+            {
+                "run_id": str(run_id),
+                "last_seen_at": _iso(last_seen),
+                "censor_at": _iso(censor_at),
+                "reason": str(reason),
+            }
+        )
     return out
 
 
-def censor_from_map(m:dict[str,list[dict[str,Any]]],token:str,start:Any,end:Any)->dict[str,Any]|None:
-    a,b=_utc(start),_utc(end)
-    for rec in m.get(str(token),[]):
-        if a<=_utc(rec["censor_at"])<=b:return rec
-    return None
+def prune_counterfactual_targets(
+    conn: sqlite3.Connection,
+    table_name: str = "axiom_v24_counterfactual_policy_targets",
+) -> int:
+    """Remove policy targets whose required future window crosses a stop censor."""
+    if not _table_exists(conn, table_name) or not _table_exists(conn, CENSOR_TABLE):
+        return 0
+    cols = _columns(conn, table_name)
+    if not {"token_key", "decision_at", "horizon_minutes"}.issubset(cols):
+        return 0
+    censors = {
+        token: [_utc(r["censor_at"]) for r in rows]
+        for token, rows in censors_by_token(conn).items()
+    }
+    delete_ids: list[int] = []
+    for rowid, token, decision_at, horizon in conn.execute(
+        f'SELECT rowid,token_key,decision_at,horizon_minutes FROM "{table_name}"'
+    ).fetchall():
+        decision = _utc(decision_at)
+        deadline = decision + timedelta(minutes=float(horizon))
+        if any(decision <= c <= deadline for c in censors.get(str(token), [])):
+            delete_ids.append(int(rowid))
+    if delete_ids:
+        conn.executemany(
+            f'DELETE FROM "{table_name}" WHERE rowid=?', [(x,) for x in delete_ids]
+        )
+        conn.commit()
+    return len(delete_ids)
 
 
-def apply_peak_label_censors(c:sqlite3.Connection)->dict[str,int]:
-    migrate(c); table="axiom_peak_structure_labels_v21"
-    if not _exists(c,table):return {"restored":0,"neutralized":0}
-    cols=_cols(c,table); restored=neutralized=0; snap_keys:set[tuple[str,str]]=set()
-    for raw,at,reason in c.execute(f"SELECT row_json,censor_at,reason FROM {PEAK_SNAPSHOT_TABLE} ORDER BY censor_at"):
-        try:o=json.loads(raw)
-        except Exception:continue
-        token,decision=str(o.get("token_key") or ""),str(o.get("decision_at") or "")
-        if not token or not decision:continue
-        snap_keys.add((token,decision)); u={k:v for k,v in o.items() if k in cols and k not in {"token_key","decision_at","config_json","schema_version","target_fingerprint"}}
-        if "terminal_at" in cols:u["terminal_at"]=at
-        if "terminal_reason" in cols:u["terminal_reason"]=reason
-        if "path_end_at" in cols:u["path_end_at"]=at
-        if "label_finalized" in cols:u["label_finalized"]=0
-        if "label_status_next_peak" in cols and not o.get("has_next_substantial_peak_before_terminal_72h"):u["label_status_next_peak"]="censored_collection_stop"
-        if u:c.execute(f'UPDATE "{table}" SET '+",".join(f'"{k}"=?' for k in u)+" WHERE token_key=? AND decision_at=?",[*u.values(),token,decision]);restored+=int(c.execute("SELECT changes()").fetchone()[0]>0)
-    targets=[x for x in cols if x.startswith(("has_next_","next_substantial_peak_","later_higher_peak_","post_next_peak_","time_to_"))]
-    for token,recs in censors_by_token(c).items():
-        for rec in recs:
-            at=_utc(rec["censor_at"]); reason=str(rec["reason"])
-            for (decision,) in c.execute(f'SELECT decision_at FROM "{table}" WHERE token_key=? AND decision_at<=?',(token,at.isoformat())).fetchall():
-                if (token,str(decision)) in snap_keys:continue
-                d=_utc(decision)
-                if d+pd.Timedelta(hours=24)<=at:continue
-                sets=[f'"{x}"=NULL' for x in targets]; params:list[Any]=[]
-                if "label_finalized" in cols:sets.append('"label_finalized"=0')
-                if "label_status_next_peak" in cols:sets.append("\"label_status_next_peak\"='censored_collection_stop'")
-                if "terminal_at" in cols:sets.append('"terminal_at"=?');params.append(at.isoformat())
-                if "terminal_reason" in cols:sets.append('"terminal_reason"=?');params.append(reason)
-                if "path_end_at" in cols:sets.append('"path_end_at"=?');params.append(at.isoformat())
-                if sets:c.execute(f'UPDATE "{table}" SET '+",".join(sets)+" WHERE token_key=? AND decision_at=?",[*params,token,decision]);neutralized+=int(c.execute("SELECT changes()").fetchone()[0]>0)
-    c.commit(); return {"restored":restored,"neutralized":neutralized}
+def status(db_path: str) -> dict[str, Any]:
+    migrate_raw(db_path)
+    with sqlite3.connect(db_path) as conn:
+        migrate(conn)
+        active = int(conn.execute(f"SELECT COUNT(*) FROM {RUN_TABLE} WHERE status='active'").fetchone()[0])
+        stopped = int(conn.execute(f"SELECT COUNT(*) FROM {RUN_TABLE} WHERE status='stopped'").fetchone()[0])
+        censored = int(conn.execute(f"SELECT COUNT(*) FROM {CENSOR_TABLE}").fetchone()[0])
+        last = conn.execute(
+            f"SELECT run_id,censor_at,stop_reason FROM {RUN_TABLE} WHERE status='stopped' ORDER BY stopped_at DESC LIMIT 1"
+        ).fetchone()
+        return {
+            "active_runs": active,
+            "stopped_runs": stopped,
+            "token_censors": censored,
+            "last_stop": {"run_id": last[0], "censor_at": last[1], "reason": last[2]} if last else None,
+        }
 
 
-def status(db:str)->dict[str,Any]:
-    with sqlite3.connect(db) as c:
-        migrate(c); a=c.execute(f"SELECT COUNT(*) FROM {SESSION_TABLE} WHERE status='active'").fetchone()[0];s=c.execute(f"SELECT COUNT(*) FROM {SESSION_TABLE} WHERE status='stopped'").fetchone()[0];n=c.execute(f"SELECT COUNT(*) FROM {CENSOR_TABLE}").fetchone()[0];r=c.execute(f"SELECT session_id,source,started_at,last_capture_at,stopped_at,censor_at,stop_reason,status FROM {SESSION_TABLE} ORDER BY started_at DESC LIMIT 1").fetchone();keys=["session_id","source","started_at","last_capture_at","stopped_at","censor_at","stop_reason","status"];return {"active_sessions":int(a),"stopped_sessions":int(s),"neutral_token_censors":int(n),"latest_session":dict(zip(keys,r)) if r else None}
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Record or inspect neutral V24 collection-stop censors")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    stop = sub.add_parser("stop")
+    stop.add_argument("--db", default=RAW_DB_DEFAULT)
+    stat = sub.add_parser("status")
+    stat.add_argument("--db", default=RAW_DB_DEFAULT)
+    args = parser.parse_args(argv)
+    out = stop_collection_session(args.db) if args.cmd == "stop" else status(args.db)
+    print(json.dumps(out, indent=2, default=str))
+    return 0
 
 
-def main()->None:
-    ap=argparse.ArgumentParser();sub=ap.add_subparsers(dest="cmd",required=True)
-    for name in ("stop","status"):p=sub.add_parser(name);p.add_argument("--db",default="data/live.sqlite")
-    x=ap.parse_args();print(json.dumps(stop_collection_session(x.db) if x.cmd=="stop" else status(x.db),indent=2,default=str))
-if __name__=="__main__":main()
+if __name__ == "__main__":
+    raise SystemExit(main())
