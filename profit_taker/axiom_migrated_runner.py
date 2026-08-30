@@ -9,14 +9,18 @@ invariants without changing parsing/cadence behavior:
 2. direct invocation initializes/resumes a session whose purpose matches capture
    provenance, keeping replay files out of the authoritative production session;
 3. after successful production cycles, a human-readable model-performance report
-   is regenerated only when its configured interval has elapsed.
+   is regenerated only when its configured interval has elapsed;
+4. Ctrl+C closes the current collector run at its last durable successful capture,
+   creating a neutral censor boundary rather than manufacturing token deaths.
 """
 from __future__ import annotations
 
+import json
 import sys
 import uuid
 from typing import Any
 
+from . import axiom_manual_stop as manual_stop
 from . import axiom_migrated_runner_base as _impl
 from .collection_admin import initialize_collection
 from .common import load_json
@@ -35,6 +39,8 @@ for _name in dir(_impl):
 
 _original_capture_clipboard = _impl._capture_clipboard
 _original_run_once = _impl.run_once
+_active_manual_run_id: str | None = None
+_active_manual_db: str | None = None
 
 
 def _prime_clipboard_with_sentinel(pyperclip: Any) -> str:
@@ -123,6 +129,10 @@ def run_once(*args: Any, **kwargs: Any) -> dict:
                 "reason": "report_error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
+    if _active_manual_run_id and _active_manual_db:
+        # This executes only after process_rows has durably committed the capture.
+        # The stop boundary therefore cannot advance past uncommitted/failed data.
+        manual_stop.note_successful_capture(_active_manual_db, _active_manual_run_id)
     return result
 
 
@@ -145,16 +155,42 @@ def _has_clipboard_file(argv: list[str]) -> bool:
     return any(arg == "--clipboard-file" or arg.startswith("--clipboard-file=") for arg in argv)
 
 
+def _has_once(argv: list[str]) -> bool:
+    return any(arg == "--once" or arg.startswith("--once=") for arg in argv)
+
+
 def main() -> None:
+    global _active_manual_run_id, _active_manual_db
     argv = list(sys.argv[1:])
     replay = _has_clipboard_file(argv)
+    once = _has_once(argv)
+    db = _db_from_argv(argv)
     purpose = "v24_replay_experiment" if replay else "v24_production_raw_collection"
     # Replays get their own explicitly non-production session and therefore cannot
     # be mixed into an existing authoritative production raw database.
-    initialize_collection(_db_from_argv(argv), purpose=purpose)
+    initialize_collection(db, purpose=purpose)
     _sync_test_and_extension_hooks()
     _impl.run_once = run_once
-    _impl.main()
+
+    run_id: str | None = None
+    if not replay and not once:
+        run_id = manual_stop.start_collection_session(db)
+        _active_manual_run_id = run_id
+        _active_manual_db = db
+
+    try:
+        _impl.main()
+    except KeyboardInterrupt:
+        if run_id is not None:
+            outcome = manual_stop.stop_collection_session(
+                db, run_id, reason="manual_stop_censored"
+            )
+            print(json.dumps({"collection_stop": outcome}, indent=2, default=str), flush=True)
+        # Ctrl+C is a requested clean stop, so do not convert it into an error exit.
+        return
+    finally:
+        _active_manual_run_id = None
+        _active_manual_db = None
 
 
 if __name__ == "__main__":
