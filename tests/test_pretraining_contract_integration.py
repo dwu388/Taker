@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from profit_taker import axiom_v24 as v24
 from profit_taker.db import migrate as migrate_raw
-from profit_taker import pretraining_contract_v2 as contract
+from profit_taker import pretraining_contract_v3 as contract
 from profit_taker import v24_contract_runtime as shared_runtime
 from profit_taker import v24_contract_runtime_v3 as runtime
 
@@ -31,7 +31,7 @@ def test_economic_collapse_materialization_is_idempotent(tmp_path):
     assert n == 3
 
 
-def test_policy_compatibility_aliases_are_net_and_gross_is_retained(tmp_path):
+def test_policy_compatibility_aliases_are_net_and_provenance_is_stable(tmp_path):
     db = tmp_path / "policy.sqlite"
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -46,19 +46,22 @@ def test_policy_compatibility_aliases_are_net_and_gross_is_retained(tmp_path):
         )
         conn.commit()
         out = contract.enrich_counterfactual_friction(conn, contract.PretrainingConfig(default_round_trip_bps=100.0))
-        row = conn.execute(
+        row1 = conn.execute(
             """SELECT entry_return_gross,entry_return_net,entry_execution_return,
                       hold_advantage_gross,hold_advantage_net,hold_advantage_return,
                       friction_definition_hash,source_fingerprint
                FROM axiom_v24_counterfactual_policy_targets"""
         ).fetchone()
-    assert out["policy_aliases_updated_to_net"] == 1
-    assert row[0] == 0.20
-    assert abs(row[1] - 0.19) < 1e-12
-    assert abs(row[2] - 0.19) < 1e-12
-    assert row[3] == row[4] == row[5] == 0.04
-    assert row[6]
-    assert row[7] != "old"
+        contract.enrich_counterfactual_friction(conn, contract.PretrainingConfig(default_round_trip_bps=100.0))
+        row2 = conn.execute("SELECT source_fingerprint FROM axiom_v24_counterfactual_policy_targets").fetchone()
+    assert out["stable_friction_provenance_rows"] == 1
+    assert row1[0] == 0.20
+    assert abs(row1[1] - 0.19) < 1e-12
+    assert abs(row1[2] - 0.19) < 1e-12
+    assert row1[3] == row1[4] == row1[5] == 0.04
+    assert row1[6]
+    assert row1[7] != "old"
+    assert row2[0] == row1[7]
 
 
 def test_combined_target_hash_includes_pretraining_contract():
