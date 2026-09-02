@@ -48,20 +48,37 @@ def test_policy_compatibility_aliases_are_net_and_provenance_is_stable(tmp_path)
         out = contract.enrich_counterfactual_friction(conn, contract.PretrainingConfig(default_round_trip_bps=100.0))
         row1 = conn.execute(
             """SELECT entry_return_gross,entry_return_net,entry_execution_return,
+                      exit_now_return_gross,exit_now_return_net,exit_now_return,
+                      hold_terminal_return_gross,hold_terminal_return_net,hold_terminal_return,
                       hold_advantage_gross,hold_advantage_net,hold_advantage_return,
-                      friction_definition_hash,source_fingerprint
+                      friction_definition_hash,source_fingerprint,pre_friction_source_fingerprint
                FROM axiom_v24_counterfactual_policy_targets"""
         ).fetchone()
         contract.enrich_counterfactual_friction(conn, contract.PretrainingConfig(default_round_trip_bps=100.0))
-        row2 = conn.execute("SELECT source_fingerprint FROM axiom_v24_counterfactual_policy_targets").fetchone()
+        row2 = conn.execute(
+            """SELECT entry_return_gross,entry_return_net,entry_execution_return,
+                      exit_now_return_gross,exit_now_return_net,exit_now_return,
+                      hold_terminal_return_gross,hold_terminal_return_net,hold_terminal_return,
+                      hold_advantage_gross,hold_advantage_net,hold_advantage_return,
+                      friction_definition_hash,source_fingerprint,pre_friction_source_fingerprint
+               FROM axiom_v24_counterfactual_policy_targets"""
+        ).fetchone()
     assert out["stable_friction_provenance_rows"] == 1
     assert row1[0] == 0.20
     assert abs(row1[1] - 0.19) < 1e-12
     assert abs(row1[2] - 0.19) < 1e-12
-    assert row1[3] == row1[4] == row1[5] == 0.04
-    assert row1[6]
-    assert row1[7] != "old"
-    assert row2[0] == row1[7]
+    assert row1[3] == 0.05
+    assert abs(row1[4] - 0.045) < 1e-12
+    assert abs(row1[5] - 0.045) < 1e-12
+    assert row1[6] == 0.10
+    assert abs(row1[7] - 0.095) < 1e-12
+    assert abs(row1[8] - 0.095) < 1e-12
+    assert row1[9] == row1[10] == row1[11] == 0.04
+    assert row1[12]
+    assert row1[13] != "old"
+    assert row1[14] == "old"
+    # Repeated enrichment must be mathematically and provenance-idempotent.
+    assert row2 == row1
 
 
 def test_combined_target_hash_includes_pretraining_contract():
@@ -71,6 +88,10 @@ def test_combined_target_hash_includes_pretraining_contract():
     combined = v24.target_definition_hash(cfg)
     assert combined != base
     assert len(combined) == 64
+
+
+def test_runtime_uses_latest_contract_layer():
+    assert runtime.contract is contract
 
 
 def test_first_model_runtime_reduces_capacity_without_allow_small():

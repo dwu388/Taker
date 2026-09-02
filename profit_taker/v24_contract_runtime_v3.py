@@ -6,7 +6,7 @@ import sqlite3
 from typing import Sequence
 
 from . import axiom_v24 as v24
-from . import pretraining_contract_v2 as contract
+from . import pretraining_contract_v3 as contract
 from . import v24_contract_runtime as shared
 from .db import RAW_DB_DEFAULT
 
