@@ -51,6 +51,15 @@ jobs:
         run: python -m pytest -q tests/test_v24_hardening.py
       - name: Pretraining target contract unit regressions
         run: python -m pytest -q tests/test_pretraining_contract.py
+      - name: Import latest pretraining contract
+        if: always()
+        run: python -c "from profit_taker import pretraining_contract_v3 as c; print(c.PRETRAINING_SCHEMA_VERSION)"
+      - name: Import latest V24 contract runtime
+        if: always()
+        run: python -c "from profit_taker import v24_contract_runtime_v3 as r; print(r.contract.__name__)"
+      - name: Collect pretraining integration module
+        if: always()
+        run: python -m pytest --collect-only -q tests/test_pretraining_contract_integration.py
       - name: Pretraining collapse materialization idempotence
         if: always()
         run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_economic_collapse_materialization_is_idempotent
@@ -60,16 +69,24 @@ jobs:
       - name: Pretraining combined target hash integration
         if: always()
         run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_combined_target_hash_includes_pretraining_contract
+      - name: Pretraining runtime contract layer integration
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_runtime_uses_latest_contract_layer
       - name: Pretraining reduced first-model profile integration
         if: always()
         run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_first_model_runtime_reduces_capacity_without_allow_small
       - name: Policy cfg forwarding regression
+        if: always()
         run: python -m pytest -q tests/test_v24_policy_cfg.py
       - name: Final production-readiness regressions
+        if: always()
         run: python -m pytest -q tests/test_final_production_readiness.py
       - name: 24-hour lifecycle contract regressions
+        if: always()
         run: python -m pytest -q tests/test_v24_24h_lifecycle.py
       - name: Manual-stop neutral censor model regressions
+        if: always()
         run: python -m pytest -q tests/test_manual_stop_model.py
       - name: Performance report regressions
+        if: always()
         run: python -m pytest -q tests/test_performance_report.py
