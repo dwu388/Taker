@@ -49,8 +49,20 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - name: Existing V24 hardening regressions
         run: python -m pytest -q tests/test_v24_hardening.py
-      - name: Pretraining target and readiness contract regressions
-        run: python -m pytest -q tests/test_pretraining_contract.py tests/test_pretraining_contract_integration.py
+      - name: Pretraining target contract unit regressions
+        run: python -m pytest -q tests/test_pretraining_contract.py
+      - name: Pretraining collapse materialization idempotence
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_economic_collapse_materialization_is_idempotent
+      - name: Pretraining friction alias and provenance idempotence
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_policy_compatibility_aliases_are_net_and_provenance_is_stable
+      - name: Pretraining combined target hash integration
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_combined_target_hash_includes_pretraining_contract
+      - name: Pretraining reduced first-model profile integration
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_first_model_runtime_reduces_capacity_without_allow_small
       - name: Policy cfg forwarding regression
         run: python -m pytest -q tests/test_v24_policy_cfg.py
       - name: Final production-readiness regressions
