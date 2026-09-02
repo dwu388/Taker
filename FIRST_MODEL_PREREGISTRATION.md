@@ -6,7 +6,7 @@ This note is part of the target/training contract and must be committed before t
 
 The predictive facade remains the production V24 24-hour lifecycle over the 25-hour Axiom view. The first fitted profile is intentionally reduced; this does not change the raw collection horizon or the durable V24 lifecycle contract.
 
-The first production model must use `profit_taker.v24_pretraining_bootstrap` / `v24_bootstrap.bat`. `--allow-small` is not an approved production-first-model path.
+The first production model must use `profit_taker.v24_pretraining_bootstrap` / `v24_bootstrap.bat`. The historical Python entrypoint is a thin alias to the same official `v24_contract_runtime_v4` path, so there is no alternate first-model implementation. `--allow-small` is not an approved production-first-model path.
 
 ## Primary first-model targets
 
@@ -18,28 +18,31 @@ The reduced profile prioritizes short-horizon momentum/economic decisions:
 - ordered outcome is `up_first`, `down_first`, `neither`, or `censored`;
 - the executable reference is the first observation strictly after the decision;
 - same-snapshot opposing touches are censored because within-minute ordering is unknowable;
-- operational disappearance is not silently converted into a downside price barrier;
-- economic collapse is a separate observed event: >=85% drawdown from trailing observed peak sustained >=10 valid minutes;
+- price-dependent labels require a contiguous valid observed path: a token-observation gap or collector-heartbeat gap greater than 5 minutes censors the unresolved target rather than assuming an unseen price path;
+- operational disappearance is not silently converted into a downside price barrier or a `neither` outcome;
+- economic collapse is a separate observed event: >=85% drawdown from trailing observed peak sustained >=10 valid, contiguous minutes;
+- economic collapse persistence cannot bridge an observation/collector gap;
 - economic collapse keeps the observed market return. A -100% settlement is stress analysis only.
 
 ## Counterfactual friction
 
 Default round-trip friction is 100 bps. Stress reports are required at 1%, 3%, 5%, and 10% round trip.
 
-ENTRY targets include future entry plus exit cost. HOLD-versus-EXIT comparisons do not recharge already-sunk entry friction; they compare future exit costs. Gross and net returns are both retained, and policy learning is intended to use net targets.
+ENTRY targets include future entry plus exit cost. HOLD-versus-EXIT comparisons do not recharge already-sunk entry friction; they compare future exit costs. Gross and net returns are both retained, and policy learning uses the net compatibility targets. Every retained V24 counterfactual refresh is followed immediately by friction enrichment before policy training can read the rows.
 
 ## Readiness gates
 
 The production bootstrap refuses until the core gates pass:
 
 - >=14 calendar days of observed collection span;
-- >=300 distinct usable tokens;
+- >=300 distinct usable development-role tokens;
 - >=50 distinct tokens with confirmed substantial peaks;
+- >=6 mature development calendar blocks;
 - >=1 retained triple-barrier cell with >=30 distinct tokens in each resolved class (`up_first`, `down_first`, `neither`).
 
 Operational-death modeling is modular and remains disabled until >=50 distinct operational-death tokens exist. TS2Vec remains disabled for the first-model profile and is not eligible below 120 distinct training tokens.
 
-Counts are always independent token counts, never one-minute row counts.
+Counts are always independent token counts, never one-minute row counts. Promotion/audit tokens do not count as development support for the first model.
 
 ## Baselines
 
