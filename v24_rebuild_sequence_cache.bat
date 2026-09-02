@@ -1,4 +1,4 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-.venv\Scripts\python.exe -m profit_taker.v24_contract_runtime_v3 rebuild-sequence-cache --db data\axiom_v24_raw.sqlite %*
+.venv\Scripts\python.exe -m profit_taker.v24_contract_runtime_v4 rebuild-sequence-cache --db data\axiom_v24_raw.sqlite %*
