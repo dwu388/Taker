@@ -2,4 +2,4 @@
 setlocal
 cd /d "%~dp0"
 call run_axiom_once.bat || exit /b 1
-.venv\Scripts\python.exe -m profit_taker.v24_contract_runtime predict --db data\axiom_v24_raw.sqlite %*
+.venv\Scripts\python.exe -m profit_taker.v24_contract_runtime_v2 predict --db data\axiom_v24_raw.sqlite %*
