@@ -4,11 +4,15 @@ import hashlib
 import sqlite3
 from typing import Any
 
-from . import pretraining_contract_v2 as _base
+from . import pretraining_contract_v2 as _compat
 
-for _name in dir(_base):
-    if not _name.startswith("__"):
-        globals()[_name] = getattr(_base, _name)
+# Freeze the compatibility source for the entire export loop. V2 itself exposes a
+# private ``_base`` pointer to V1; copying that pointer into this module while still
+# evaluating getattr(_base, ...) changes the lookup module mid-loop and makes the
+# import fail partway through. Never re-export forwarding sentinels.
+for _export_name in dir(_compat):
+    if not _export_name.startswith("__") and _export_name not in {"_base", "_name", "_compat", "_export_name"}:
+        globals()[_export_name] = getattr(_compat, _export_name)
 
 
 def _dedupe_economic_collapse(db: str) -> int:
@@ -30,13 +34,17 @@ def _dedupe_economic_collapse(db: str) -> int:
 
 
 def refresh_pretraining_targets(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
-    out = _base.refresh_pretraining_targets(db, cfg)
+    # Normalize pre-existing NULL-key duplicates before and after retained
+    # materialization. This gives repeated refreshes one logical collapse row per
+    # token/decision despite SQLite treating NULLs as distinct in composite keys.
+    _dedupe_economic_collapse(db)
+    out = _compat.refresh_pretraining_targets(db, cfg)
     out["economic_collapse_rows"] = _dedupe_economic_collapse(db)
     return out
 
 
 def training_readiness(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
-    out = _base.training_readiness(db, cfg)
+    out = _compat.training_readiness(db, cfg)
     # V1 helpers called inside the retained readiness implementation also refresh
     # targets. Compact after the complete operation, not only before it.
     _dedupe_economic_collapse(db)
@@ -57,7 +65,7 @@ def assert_training_ready(db: str, cfg: PretrainingConfig | None = None) -> dict
 
 
 def evaluate_baselines(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
-    out = _base.evaluate_baselines(db, cfg)
+    out = _compat.evaluate_baselines(db, cfg)
     _dedupe_economic_collapse(db)
     return out
 
@@ -66,11 +74,10 @@ def enrich_counterfactual_friction(conn: sqlite3.Connection, cfg: PretrainingCon
     """Materialize friction exactly once from immutable gross economics.
 
     The retained policy learner consumes compatibility aliases such as
-    ``entry_execution_return``.  Those aliases become net values after enrichment,
-    so a repeated refresh must never use them as the next gross input.  Explicit
-    ``*_gross`` columns are therefore the canonical economic source after the first
-    pass, while ``pre_friction_source_fingerprint`` permanently records provenance
-    before friction was attached.
+    ``entry_execution_return``. Those aliases become net values after enrichment,
+    so a repeated refresh must never use them as the next gross input. Explicit
+    ``*_gross`` columns are therefore canonical after the first pass, while
+    ``pre_friction_source_fingerprint`` permanently records pre-friction provenance.
     """
     cfg = cfg or PretrainingConfig()
     table = "axiom_v24_counterfactual_policy_targets"
@@ -110,7 +117,7 @@ def enrich_counterfactual_friction(conn: sqlite3.Connection, cfg: PretrainingCon
          entry_g_saved, exit_g_saved, hold_g_saved, adv_g_saved, raw_fp) = row
 
         # First enrichment reads retained gross aliases; every later enrichment
-        # reads the immutable explicit gross columns instead of already-net aliases.
+        # reads immutable explicit gross columns instead of already-net aliases.
         entry_g = float(entry_g_saved) if entry_g_saved is not None else (float(entry_alias) if entry_alias is not None else None)
         exit_g = float(exit_g_saved) if exit_g_saved is not None else (float(exit_alias) if exit_alias is not None else None)
         hold_g = float(hold_g_saved) if hold_g_saved is not None else (float(hold_alias) if hold_alias is not None else None)
