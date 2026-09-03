@@ -33,9 +33,7 @@ jobs:
           tests/test_collection_readiness.py::test_post_commit_artifact_failure_is_nonfatal
           tests/test_collection_readiness.py::test_failed_attempt_keeps_debug_payload_out_of_observations
       - name: Collector partial-parse rejection
-        run: >-
-          python -m pytest -q
-          tests/test_collection_readiness.py::test_runner_rejects_partial_clipboard_parse_before_persistence
+        run: python -m pytest -q tests/test_collection_readiness.py::test_runner_rejects_partial_clipboard_parse_before_persistence
       - name: Performance report generation and cadence
         run: python -m pytest -q tests/test_performance_report.py
 
@@ -51,13 +49,50 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - name: Existing V24 hardening regressions
         run: python -m pytest -q tests/test_v24_hardening.py
+      - name: Pretraining continuity-safe target contract regressions
+        run: python -m pytest -q tests/test_pretraining_contract.py
+      - name: Import latest pretraining contract
+        if: always()
+        run: python -c "from profit_taker import pretraining_contract_v4 as c; print(c.PRETRAINING_SCHEMA_VERSION)"
+      - name: Import official V24 contract runtime
+        if: always()
+        run: python -c "from profit_taker import v24_contract_runtime_v4 as r; print(r.contract.__name__)"
+      - name: Collect pretraining integration module
+        if: always()
+        run: python -m pytest --collect-only -q tests/test_pretraining_contract_integration.py
+      - name: Pretraining collapse materialization idempotence
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_economic_collapse_materialization_is_idempotent
+      - name: Pretraining friction alias and provenance idempotence
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_policy_compatibility_aliases_are_net_and_provenance_is_stable
+      - name: Policy refresh preserves net friction contract
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_counterfactual_refresh_reapplies_net_friction_before_policy_reads
+      - name: Pretraining combined target hash integration
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_combined_target_hash_includes_latest_pretraining_contract
+      - name: Latest runtime contract layer integration
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_runtime_uses_latest_contract_layer
+      - name: Legacy bootstrap cannot bypass latest runtime
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_legacy_bootstrap_alias_cannot_bypass_latest_runtime
+      - name: Pretraining reduced first-model profile integration
+        if: always()
+        run: python -m pytest -q tests/test_pretraining_contract_integration.py::test_first_model_runtime_reduces_capacity_without_allow_small
       - name: Policy cfg forwarding regression
+        if: always()
         run: python -m pytest -q tests/test_v24_policy_cfg.py
       - name: Final production-readiness regressions
+        if: always()
         run: python -m pytest -q tests/test_final_production_readiness.py
       - name: 24-hour lifecycle contract regressions
+        if: always()
         run: python -m pytest -q tests/test_v24_24h_lifecycle.py
       - name: Manual-stop neutral censor model regressions
+        if: always()
         run: python -m pytest -q tests/test_manual_stop_model.py
       - name: Performance report regressions
+        if: always()
         run: python -m pytest -q tests/test_performance_report.py
