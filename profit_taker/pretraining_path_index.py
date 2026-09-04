@@ -122,14 +122,24 @@ def barrier_outcome(contract, g, decision, horizon, up, down, censors,
                     break_idx = idx
                     break_reason = "token_observation_gap"
 
-            path_end_at = _timestamp(times_ns[end_idx])
-            capture_break = contract._capture_gap_break(ref_at, path_end_at, captures, max_gap)
-            if capture_break is not None:
-                idx = int(np.searchsorted(times_ns, int(contract._utc(capture_break).value), side="right"))
-                idx = max(ref_idx + 1, min(idx, end_idx))
-                if break_idx is None or idx < break_idx:
+            # Preserve V4's exact heartbeat semantics: the legacy evaluator checks
+            # collector continuity separately for each adjacent observed-price
+            # interval, after the token-gap check and before evaluating that row's
+            # barrier touches.  Checking the entire ref->path_end interval at once
+            # is stronger and can invent a heartbeat censor in synthetic/inconsistent
+            # data where observed prices remain continuous.  The indexed heartbeat
+            # helper keeps each adjacency check O(log N + K), and this window is
+            # cached once per (decision, horizon), so we retain the speedup without
+            # changing target labels.
+            for idx in range(ref_idx + 1, end_idx + 1):
+                if break_idx is not None and idx >= break_idx:
+                    break
+                prev_at = _timestamp(times_ns[idx - 1])
+                current_at = _timestamp(times_ns[idx])
+                if contract._capture_gap_break(prev_at, current_at, captures, max_gap) is not None:
                     break_idx = idx
                     break_reason = "capture_heartbeat_gap"
+                    break
 
         valid_end_idx = end_idx if break_idx is None else break_idx - 1
         window = {
