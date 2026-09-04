@@ -211,8 +211,8 @@ def _balanced_cpcv_subset(splits, limit):
                 blocks,
             )
 
-        chosen = min(remaining, key=score)
-        remaining.remove(chosen)
+        chosen_index = min(range(len(remaining)), key=lambda i: score(remaining[i]))
+        chosen = remaining.pop(chosen_index)
         blocks = tuple(int(b) for b in chosen.get("test_blocks", ()))
         for b in blocks:
             block_counts[b] = block_counts.get(b, 0) + 1
