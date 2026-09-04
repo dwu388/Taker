@@ -10,7 +10,13 @@ recreated gross compatibility aliases.
 
 from . import axiom_v24 as v24
 from . import pretraining_contract_v4 as contract
+from . import pretraining_capture_index
 from . import v24_contract_runtime_v3 as runtime
+
+# Keep V4 target semantics unchanged while replacing the pathological collector-
+# heartbeat prefix scan with an indexed interval lookup.  This patch is in-place
+# so every retained V4 barrier/collapse function resolves the optimized helper.
+pretraining_capture_index.install(contract)
 
 runtime.contract = contract
 runtime.shared.target_contract_hash = contract.target_contract_hash

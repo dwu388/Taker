@@ -3,6 +3,10 @@ from __future__ import annotations
 import pandas as pd
 
 from profit_taker import pretraining_contract_v4 as contract
+from profit_taker import pretraining_capture_index
+
+# Exercise the exact helper installed by the official V24 runtime.
+pretraining_capture_index.install(contract)
 
 PretrainingConfig = contract.PretrainingConfig
 _barrier_outcome = contract._barrier_outcome
@@ -50,6 +54,41 @@ def test_triple_barrier_censors_missing_price_path_instead_of_resolving_neither(
     out = _barrier_outcome(g, t0, 15, 0.30, -0.20, [], max_gap_minutes=5.0)
     assert out["outcome"] == "censored"
     assert "gap" in out["censor_reason"]
+
+
+def test_indexed_capture_gap_lookup_preserves_v4_gap_semantics():
+    t0 = pd.Timestamp("2026-09-01T00:00:00Z")
+    captures = (
+        t0,
+        t0 + pd.Timedelta(minutes=1),
+        t0 + pd.Timedelta(minutes=10),
+        t0 + pd.Timedelta(minutes=11),
+    )
+    # The first gap wholly inside the query is still detected at its last-valid
+    # capture, exactly like the original linear V4 implementation.
+    assert contract._capture_gap_break(t0, t0 + pd.Timedelta(minutes=11), captures, 5.0) == t0 + pd.Timedelta(minutes=1)
+    # A query that begins inside an older gap does not retroactively inspect time
+    # before its decision boundary; this also matches the original semantics.
+    assert contract._capture_gap_break(t0 + pd.Timedelta(minutes=8), t0 + pd.Timedelta(minutes=11), captures, 5.0) is None
+
+
+def test_indexed_capture_gap_lookup_does_not_rescan_history(monkeypatch):
+    t0 = pd.Timestamp("2026-09-01T00:00:00Z")
+    captures = tuple(pd.date_range(t0, periods=20_000, freq="min"))
+    original_utc = contract._utc
+    calls = {"n": 0}
+
+    def counting_utc(value):
+        calls["n"] += 1
+        return original_utc(value)
+
+    monkeypatch.setattr(contract, "_utc", counting_utc)
+    start = captures[-3]
+    end = captures[-1]
+    assert contract._capture_gap_break(start, end, captures, 5.0) is None
+    # Only the query boundaries need normalization.  The old implementation
+    # reconverted almost all 20k historical captures before reaching this window.
+    assert calls["n"] <= 2
 
 
 def test_economic_collapse_is_separate_observed_event_not_minus_100_settlement():
