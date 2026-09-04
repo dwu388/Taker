@@ -3,9 +3,9 @@ from __future__ import annotations
 """Official V24 runtime bound to the latest pretraining contract.
 
 V3 retains the training/maintenance CLI.  V4 installs continuity-safe target
-semantics, indexed heartbeat and barrier lookup, friction-safe policy refreshes,
-and a fast read-only status path.  Ordinary status must never rebuild every
-historical price-path target merely to display operational state.
+semantics, indexed heartbeat lookup, friction-safe policy refreshes, and a fast
+read-only status path.  Ordinary status must never rebuild every historical
+price-path target merely to display operational state.
 """
 
 import argparse
@@ -16,16 +16,13 @@ from typing import Sequence
 from . import axiom_v24 as v24
 from . import pretraining_contract_v4 as contract
 from . import pretraining_capture_index
-from . import pretraining_path_index
 from . import pretraining_status
 from . import v24_contract_runtime_v3 as runtime
 
-# Preserve V4 target semantics while replacing two pathological hot paths:
-# collector-heartbeat prefix rescans and repeated pandas row iteration for each
-# triple-barrier cell.  Both patches operate in-place on the retained V1
-# materializer that V4 delegates to.
+# Keep V4 target semantics unchanged while replacing the pathological collector-
+# heartbeat prefix scan with an indexed interval lookup.  This patch is in-place
+# so every retained V4 barrier/collapse function resolves the optimized helper.
 pretraining_capture_index.install(contract)
-pretraining_path_index.install(contract)
 
 runtime.contract = contract
 runtime.shared.target_contract_hash = contract.target_contract_hash
