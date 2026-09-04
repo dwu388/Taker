@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Official V24 runtime bound to the latest pretraining contract.
 
-V3 retains the training/maintenance CLI.  V4 installs continuity-safe target
+V3 retains the training/maintenance CLI. V4 installs continuity-safe target
 semantics, indexed heartbeat lookup, friction-safe policy refreshes, and a fast
-read-only status path.  Ordinary status must never rebuild every historical
+read-only status path. Ordinary status must never rebuild every historical
 price-path target merely to display operational state.
 """
 
@@ -20,7 +20,7 @@ from . import pretraining_status
 from . import v24_contract_runtime_v3 as runtime
 
 # Keep V4 target semantics unchanged while replacing the pathological collector-
-# heartbeat prefix scan with an indexed interval lookup.  This patch is in-place
+# heartbeat prefix scan with an indexed interval lookup. This patch is in-place
 # so every retained V4 barrier/collapse function resolves the optimized helper.
 pretraining_capture_index.install(contract)
 
@@ -40,7 +40,7 @@ def _refresh_counterfactual_policy_targets_net(conn, cfg):
 
 
 # train_distributional_policy resolves this name from axiom_v24_impl globals at
-# call time.  Patch every facade reference too so explicit refreshes share exactly
+# call time. Patch every facade reference too so explicit refreshes share exactly
 # the same economics.
 v24._impl.refresh_counterfactual_policy_targets = _refresh_counterfactual_policy_targets_net
 v24._base.refresh_counterfactual_policy_targets = _refresh_counterfactual_policy_targets_net
@@ -65,9 +65,10 @@ def _status_main(argv: Sequence[str]) -> int:
     args = p.parse_args(list(argv)[1:])
 
     pcfg = contract.PretrainingConfig()
+    runtime._install_recurrent_target_hash()
     runtime.shared.target_contract_hash = contract.target_contract_hash
     runtime.shared.install_target_hash_contract(pcfg)
-    cfg = runtime._cfg(args)
+    cfg, cfg_source = runtime._runtime_cfg(args, "status")
 
     if args.refresh_pretraining:
         pretraining = runtime._refresh(args.db, pcfg)
@@ -86,6 +87,8 @@ def _status_main(argv: Sequence[str]) -> int:
     out.setdefault("pretraining_contract", pretraining)
     out.setdefault("pretraining_target_definition_hash", contract.target_contract_hash(pcfg))
     out.setdefault("combined_v24_target_definition_hash", v24.target_definition_hash(cfg))
+    out.setdefault("runtime_config_source", cfg_source)
+    out.setdefault("recurrent_horizons_minutes", list(runtime._recurrent_grid_for_cfg(cfg)))
     print(json.dumps(out, indent=2, default=str))
     return 0
 
