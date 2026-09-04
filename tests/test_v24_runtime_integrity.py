@@ -94,7 +94,7 @@ def test_benchmark_default_matches_performance_report_default():
     assert benchmark.DEFAULT_BENCHMARK_DB == "data/axiom_v24_1000_benchmark.sqlite"
 
 
-def test_monotonic_projection_is_idempotent_and_preserves_missing_cells():
+def test_monotonic_projection_converges_preserves_missing_cells_and_is_idempotent():
     raw = np.asarray(
         [
             [0.75, np.nan, 0.40, 0.55],
@@ -103,7 +103,26 @@ def test_monotonic_projection_is_idempotent_and_preserves_missing_cells():
         ],
         dtype=float,
     )
+    missing = np.isnan(raw)
     once = v24.monotonic_probability_projection(raw)
     twice = v24.monotonic_probability_projection(once)
-    np.testing.assert_allclose(once, twice, rtol=0.0, atol=1e-12, equal_nan=True)
-    assert np.isnan(once[0, 1])
+
+    np.testing.assert_array_equal(np.isnan(once), missing)
+    np.testing.assert_allclose(once, twice, rtol=0.0, atol=1e-10, equal_nan=True)
+
+    finite = once[np.isfinite(once)]
+    assert np.all(finite >= 0.0)
+    assert np.all(finite <= 1.0)
+
+    # Across time horizons a fixed threshold cannot become less likely.
+    for row in once:
+        observed = row[np.isfinite(row)]
+        if observed.size > 1:
+            assert np.all(np.diff(observed) >= -1e-10)
+
+    # Across increasingly difficult gain thresholds a fixed horizon cannot become
+    # more likely.
+    for col in once.T:
+        observed = col[np.isfinite(col)]
+        if observed.size > 1:
+            assert np.all(np.diff(observed) <= 1e-10)

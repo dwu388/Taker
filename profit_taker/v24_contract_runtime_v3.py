@@ -8,11 +8,55 @@ from pathlib import Path
 from typing import Sequence
 
 import joblib
+import numpy as np
 
 from . import axiom_v24 as v24
 from . import pretraining_contract_v3 as contract
 from . import v24_contract_runtime as shared
 from .db import RAW_DB_DEFAULT
+
+
+def _converged_monotonic_probability_projection(
+    matrix: np.ndarray,
+    *,
+    max_iterations: int = 256,
+    tolerance: float = 1e-12,
+) -> np.ndarray:
+    """Project a partially observed probability grid to both monotonic axes.
+
+    Rows represent increasing time horizons and therefore must be nondecreasing.
+    Columns represent increasing gain thresholds and therefore must be
+    nonincreasing. Alternating isotonic projections are repeated to convergence
+    instead of using a fixed pass count, which can leave a small constraint
+    violation and make a second projection change the result.
+    """
+    x = np.asarray(matrix, dtype=float).copy()
+    if x.ndim != 2:
+        raise ValueError("probability matrix must be 2-dimensional")
+
+    for _ in range(max(1, int(max_iterations))):
+        previous = x.copy()
+        for r in range(x.shape[0]):
+            x[r, :] = v24._impl._isotonic_1d_observed(x[r, :], True)
+        for c in range(x.shape[1]):
+            x[:, c] = v24._impl._isotonic_1d_observed(x[:, c], False)
+
+        delta = np.abs(x - previous)
+        finite_delta = delta[np.isfinite(delta)]
+        if finite_delta.size == 0 or float(np.max(finite_delta)) <= float(tolerance):
+            break
+
+    finite = np.isfinite(x)
+    x[finite] = np.clip(x[finite], 0.0, 1.0)
+    return x
+
+
+# The retained implementation resolves this function from its own globals at
+# prediction time. Patch all public facade layers so direct V24 callers and the
+# official contract runtime use exactly the same converged projection semantics.
+v24.monotonic_probability_projection = _converged_monotonic_probability_projection
+v24._base.monotonic_probability_projection = _converged_monotonic_probability_projection
+v24._impl.monotonic_probability_projection = _converged_monotonic_probability_projection
 
 
 def _cfg(args: argparse.Namespace) -> v24.V24Config:
