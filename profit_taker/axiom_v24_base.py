@@ -8,10 +8,12 @@ policy champions from crossing that target-definition boundary.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 import datetime as _datetime
 import joblib
+import math
 import sqlite3
 import uuid
 
@@ -39,6 +41,210 @@ def _fit_blended_regression(data, features, target, n_estimators, *, quantile=No
 
 
 _impl._fit_blended_regression = _fit_blended_regression
+
+
+# ---------------------------------------------------------------------------
+# Prediction-quality hardening.
+# ---------------------------------------------------------------------------
+# The retained implementation still contains historical recurrent-count horizon
+# literals and uses ordinary squared-error regression for non-negative event counts.
+# Keep those details out of the active contract: derive count horizons from the
+# configured probability grid, refit every available count head with a Poisson
+# objective, and preserve the other recurrent quantile heads unchanged.
+def _active_recurrent_count_horizons(cfg) -> tuple[int, ...]:
+    return tuple(
+        int(h) for h in cfg.probability_horizons_minutes
+        if 240 <= int(h) <= int(cfg.horizon_minutes)
+    )
+
+
+def _refit_recurrent_count_heads(model_frame, features, recurrent, n_estimators, cfg):
+    out = {
+        str(name): head
+        for name, head in (recurrent or {}).items()
+        if not str(name).startswith("recurrent_peak_count_")
+    }
+    for h in _active_recurrent_count_horizons(cfg):
+        target = f"recurrent_peak_count_{h}m"
+        fit = _impl._fit_blended_regression(
+            model_frame, features, target, n_estimators, poisson=True
+        )
+        if fit:
+            out[target] = fit
+    return out
+
+
+_original_fit_batch_bundle = _impl.fit_batch_bundle
+
+
+def fit_batch_bundle(
+    conn,
+    frame,
+    seqraw,
+    cutoff,
+    cfg,
+    *,
+    allow_small=False,
+    generation=1,
+    exclude_tokens=None,
+):
+    bundle = _original_fit_batch_bundle(
+        conn,
+        frame,
+        seqraw,
+        cutoff,
+        cfg,
+        allow_small=allow_small,
+        generation=generation,
+        exclude_tokens=exclude_tokens,
+    )
+    train = _impl.training_history_before(
+        conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens
+    )
+    model_frame, _ = _impl._prepare_model_frame(
+        conn,
+        train,
+        seqraw,
+        cfg,
+        encoder=bundle["sequence_encoder"],
+        sequence_challenger=bundle.get("sequence_challenger"),
+        as_of=cutoff,
+    )
+    n_estimators = cfg.small_estimators if allow_small else cfg.stable_estimators
+    bundle["recurrent"] = _refit_recurrent_count_heads(
+        model_frame,
+        bundle["features"],
+        bundle.get("recurrent"),
+        n_estimators,
+        cfg,
+    )
+    return bundle
+
+
+_impl.fit_batch_bundle = fit_batch_bundle
+
+
+_original_fit_online_adapter = _impl.fit_online_adapter
+
+
+def fit_online_adapter(
+    conn,
+    champion,
+    frame,
+    seqraw,
+    cutoff,
+    cfg,
+    *,
+    allow_small=False,
+    exclude_tokens=None,
+):
+    adapter = _original_fit_online_adapter(
+        conn,
+        champion,
+        frame,
+        seqraw,
+        cutoff,
+        cfg,
+        allow_small=allow_small,
+        exclude_tokens=exclude_tokens,
+    )
+    stable_cutoff = _impl._utc(champion["stable_training_cutoff"])
+    recent = _impl.adapter_history_before(
+        conn,
+        frame,
+        cutoff,
+        stable_cutoff,
+        cfg,
+        exclude_tokens=exclude_tokens,
+    )
+    model_frame, _ = _impl._prepare_model_frame(
+        conn,
+        recent,
+        seqraw,
+        cfg,
+        encoder=champion["sequence_encoder"],
+        sequence_challenger=champion.get("sequence_challenger"),
+        as_of=cutoff,
+    )
+    n_estimators = max(30, cfg.adapter_estimators // (2 if allow_small else 1))
+    adapter["recurrent"] = _refit_recurrent_count_heads(
+        model_frame,
+        champion["features"],
+        adapter.get("recurrent"),
+        n_estimators,
+        cfg,
+    )
+    # The active outer 24h facade supplies horizon-aware head weights at call time.
+    adapter["head_weights"] = _impl._derive_adapter_head_weights(adapter, cfg)
+    return adapter
+
+
+_impl.fit_online_adapter = fit_online_adapter
+
+
+# CPCV previously truncated lexicographically ordered combinations. When the full
+# combination set exceeds the configured cap, construct all valid purged folds and
+# select a deterministic balanced subset so no early calendar blocks dominate model
+# diagnostics/calibration simply because their tuples sort first.
+_original_purged_cpcv_splits = _impl.purged_cpcv_splits
+
+
+def _balanced_cpcv_subset(splits, limit):
+    if limit <= 0 or len(splits) <= limit:
+        return list(splits)
+    remaining = list(splits)
+    selected = []
+    block_counts: dict[int, int] = {}
+    span_counts: dict[int, int] = {}
+    while remaining and len(selected) < int(limit):
+        def score(split):
+            blocks = tuple(int(b) for b in split.get("test_blocks", ()))
+            if not blocks:
+                return (10**9, 10**9, 10**9, 0, ())
+            loads = [block_counts.get(b, 0) for b in blocks]
+            span = max(blocks) - min(blocks)
+            return (
+                max(loads),
+                sum(loads),
+                span_counts.get(span, 0),
+                -span,
+                blocks,
+            )
+
+        chosen_index = min(range(len(remaining)), key=lambda i: score(remaining[i]))
+        chosen = remaining.pop(chosen_index)
+        blocks = tuple(int(b) for b in chosen.get("test_blocks", ()))
+        for b in blocks:
+            block_counts[b] = block_counts.get(b, 0) + 1
+        if blocks:
+            span = max(blocks) - min(blocks)
+            span_counts[span] = span_counts.get(span, 0) + 1
+        selected.append(chosen)
+
+    out = []
+    for i, split in enumerate(selected):
+        rec = dict(split)
+        rec["source_fold_id"] = split.get("fold_id")
+        rec["fold_id"] = f"cpcv_balanced_{i:03d}"
+        rec["balanced_subset"] = True
+        out.append(rec)
+    return out
+
+
+def purged_cpcv_splits(frame, cfg):
+    blocks = _impl._calendar_blocks_from_frame(frame, cfg.cpcv_blocks)
+    if len(blocks) < 3:
+        return []
+    k = min(cfg.cpcv_test_blocks, max(1, len(blocks) - 2))
+    total = math.comb(len(blocks), k)
+    if total <= int(cfg.cpcv_max_splits):
+        return _original_purged_cpcv_splits(frame, cfg)
+    expanded = replace(cfg, cpcv_max_splits=total)
+    all_splits = _original_purged_cpcv_splits(frame, expanded)
+    return _balanced_cpcv_subset(all_splits, int(cfg.cpcv_max_splits))
+
+
+_impl.purged_cpcv_splits = purged_cpcv_splits
 
 
 # Counterfactual ENTRY/HOLD targets must never bridge a manual collection stop.
