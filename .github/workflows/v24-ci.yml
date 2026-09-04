@@ -53,6 +53,9 @@ jobs:
         run: python -m pytest -q tests/test_pretraining_contract.py
       - name: Fast V24 status must not rebuild historical targets
         run: python -m pytest -q tests/test_v24_status_fast.py
+      - name: V24 runtime contract integrity
+        if: always()
+        run: python -m pytest -q tests/test_v24_runtime_integrity.py
       - name: Import latest pretraining contract
         if: always()
         run: python -c "from profit_taker import pretraining_contract_v4 as c; print(c.PRETRAINING_SCHEMA_VERSION)"
