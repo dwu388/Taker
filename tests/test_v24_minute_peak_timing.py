@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from profit_taker import axiom_v24 as v24
 
@@ -13,6 +14,15 @@ def test_minute_contract_keeps_primary_grid_and_adds_10m_confirmation_hazard():
     contract = v24.lifecycle_contract()
     assert contract["first_peak_confirmation_horizons_minutes"] == [5, 10, 15, 30, 60]
     assert contract["peak_timing_semantics"]["occurrence"] == "peak_at - decision_at"
+
+
+def test_legacy_survival_grid_is_readable_but_cannot_train_minute_contract():
+    cfg = v24.V24Config(
+        survival_bins_minutes=(5, 15, 30, 60, 120, 240, 480, 720, 1440)
+    )
+    assert 10 not in cfg.survival_bins_minutes
+    with pytest.raises(RuntimeError, match="Minute-sensitive V24 training requires"):
+        v24._require_minute_timing_training_contract(cfg)
 
 
 def test_recurrent_targets_separate_occurrence_from_confirmation(monkeypatch):
