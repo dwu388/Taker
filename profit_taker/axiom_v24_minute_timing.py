@@ -21,7 +21,10 @@ MINUTE_PEAK_CONFIRMATION_HORIZONS_MINUTES = (5, 10, 15, 30, 60)
 NEXT_PEAK_OCCURRENCE_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
 PEAK_CONFIRMATION_LAG_QUANTILES = (0.25, 0.50, 0.75)
 SECOND_PEAK_OCCURRENCE_QUANTILES = (0.25, 0.50, 0.75)
-MINUTE_TIMING_SCHEMA_VERSION = "v24_lifetime_purged_adaptive_event_policy_24h_v3_minute_timing"
+# Preserve the durable 24h-v2 schema family. Minute timing is a model-target
+# generation change carried by target_definition_hash, not a storage-layout
+# rename that would unnecessarily invalidate compatible durable label tables.
+MINUTE_TIMING_SCHEMA_VERSION = "v24_lifetime_purged_adaptive_event_policy_minute_timing_24h_v2"
 
 
 def _qtag(q: float) -> str:
@@ -75,8 +78,6 @@ def _fit_minute_timing_heads(
         ("next_confirmation_lag", "recurrent_next_confirmation_lag_minutes", PEAK_CONFIRMATION_LAG_QUANTILES),
         ("second_occurrence_gap", "recurrent_second_occurrence_gap_minutes", SECOND_PEAK_OCCURRENCE_QUANTILES),
         ("second_confirmation_lag", "recurrent_second_confirmation_lag_minutes", SECOND_PEAK_OCCURRENCE_QUANTILES),
-        # Extend the retained confirmation-time and relative-height families from
-        # a single median to a useful uncertainty band without changing aliases.
         ("next_gap", "recurrent_next_gap_minutes", (0.10, 0.90)),
         ("second_gap", "recurrent_second_gap_minutes", (0.25, 0.75)),
         ("second_peak_relative", "recurrent_second_peak_relative_to_first", (0.25, 0.75)),
@@ -88,16 +89,13 @@ def _fit_minute_timing_heads(
         if d.empty:
             continue
         for q in quantiles:
-            fit = impl._fit_blended_regression(
-                d, features, target, n_estimators, quantile=float(q)
-            )
+            fit = impl._fit_blended_regression(d, features, target, n_estimators, quantile=float(q))
             if fit:
                 out[f"{prefix}_q{_qtag(q)}"] = fit
     return out
 
 
 def install(public, core, base, impl) -> None:
-    """Install the minute-sensitive contract across all V24 facade layers."""
     if getattr(public, "_minute_peak_timing_installed", False):
         return
 
@@ -105,8 +103,6 @@ def install(public, core, base, impl) -> None:
 
     @dataclass
     class MinuteSensitiveV24Config(BaseConfig):
-        # Add the missing 10-minute checkpoint while retaining the established
-        # sparse long-horizon survival grid.
         survival_bins_minutes: tuple[int, ...] = (
             5, 10, 15, 30, 60, 120, 240, 480, 720, 1440
         )
@@ -144,9 +140,7 @@ def install(public, core, base, impl) -> None:
             "base_target_definition_hash": str(original_target_definition_hash(cfg)),
             "minute_peak_timing": _minute_contract_payload(),
         }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     for module in modules:
         setattr(module, "target_definition_hash", target_definition_hash)
@@ -176,18 +170,15 @@ def install(public, core, base, impl) -> None:
             if eligible:
                 first = eligible[0]
                 out.at[i, "recurrent_next_confirmation_lag_minutes"] = max(
-                    0.0,
-                    (first["confirmed_at"] - first["peak_at"]).total_seconds() / 60.0,
+                    0.0, (first["confirmed_at"] - first["peak_at"]).total_seconds() / 60.0
                 )
             if len(eligible) >= 2:
                 first, second = eligible[0], eligible[1]
                 out.at[i, "recurrent_second_occurrence_gap_minutes"] = max(
-                    0.0,
-                    (second["peak_at"] - first["peak_at"]).total_seconds() / 60.0,
+                    0.0, (second["peak_at"] - first["peak_at"]).total_seconds() / 60.0
                 )
                 out.at[i, "recurrent_second_confirmation_lag_minutes"] = max(
-                    0.0,
-                    (second["confirmed_at"] - second["peak_at"]).total_seconds() / 60.0,
+                    0.0, (second["confirmed_at"] - second["peak_at"]).total_seconds() / 60.0
                 )
         return out
 
@@ -227,52 +218,18 @@ def install(public, core, base, impl) -> None:
 
     def project_recurrent_outputs(pred: dict[str, np.ndarray]) -> None:
         original_project_recurrent_outputs(pred)
-        _project_quantile_family(
-            pred,
-            tuple(f"next_occurrence_q{_qtag(q)}" for q in NEXT_PEAK_OCCURRENCE_QUANTILES),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            ("next_gap_q10", "next_gap_q25", "next_gap_q50", "next_gap_q75", "next_gap_q90"),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            tuple(f"next_confirmation_lag_q{_qtag(q)}" for q in PEAK_CONFIRMATION_LAG_QUANTILES),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            ("next_peak_multiple_q25", "next_peak_multiple_q50", "next_peak_multiple_q75"),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            tuple(f"second_occurrence_gap_q{_qtag(q)}" for q in SECOND_PEAK_OCCURRENCE_QUANTILES),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            tuple(f"second_confirmation_lag_q{_qtag(q)}" for q in SECOND_PEAK_OCCURRENCE_QUANTILES),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            ("second_gap_q25", "second_gap_q50", "second_gap_q75"),
-            floor=0.0,
-        )
-        _project_quantile_family(
-            pred,
-            ("second_peak_relative_q25", "second_peak_relative_q50", "second_peak_relative_q75"),
-        )
+        _project_quantile_family(pred, tuple(f"next_occurrence_q{_qtag(q)}" for q in NEXT_PEAK_OCCURRENCE_QUANTILES), floor=0.0)
+        _project_quantile_family(pred, ("next_gap_q10", "next_gap_q25", "next_gap_q50", "next_gap_q75", "next_gap_q90"), floor=0.0)
+        _project_quantile_family(pred, tuple(f"next_confirmation_lag_q{_qtag(q)}" for q in PEAK_CONFIRMATION_LAG_QUANTILES), floor=0.0)
+        _project_quantile_family(pred, ("next_peak_multiple_q25", "next_peak_multiple_q50", "next_peak_multiple_q75"), floor=0.0)
+        _project_quantile_family(pred, tuple(f"second_occurrence_gap_q{_qtag(q)}" for q in SECOND_PEAK_OCCURRENCE_QUANTILES), floor=0.0)
+        _project_quantile_family(pred, tuple(f"second_confirmation_lag_q{_qtag(q)}" for q in SECOND_PEAK_OCCURRENCE_QUANTILES), floor=0.0)
+        _project_quantile_family(pred, ("second_gap_q25", "second_gap_q50", "second_gap_q75"), floor=0.0)
+        _project_quantile_family(pred, ("second_peak_relative_q25", "second_peak_relative_q50", "second_peak_relative_q75"))
 
     for module in modules:
         setattr(module, "project_recurrent_outputs", project_recurrent_outputs)
 
-    # Calibrate the sub-hour confirmation hazards on the same purged OOF process
-    # used by the longer-horizon probabilities. This does not add sub-hour upside
-    # barriers to the primary 1h/4h/8h/12h/24h probability grid.
     original_fit_cpcv_calibrators = impl.fit_cpcv_calibrators
 
     def fit_cpcv_calibrators(conn, train, seqraw, cfg, allow_small):
@@ -285,47 +242,12 @@ def install(public, core, base, impl) -> None:
 
     original_fit_batch_bundle = core.fit_batch_bundle
 
-    def fit_batch_bundle(
-        conn,
-        frame,
-        seqraw,
-        cutoff,
-        cfg,
-        *,
-        allow_small=False,
-        generation=1,
-        exclude_tokens=None,
-    ):
-        bundle = original_fit_batch_bundle(
-            conn,
-            frame,
-            seqraw,
-            cutoff,
-            cfg,
-            allow_small=allow_small,
-            generation=generation,
-            exclude_tokens=exclude_tokens,
-        )
-        train = impl.training_history_before(
-            conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens
-        )
-        model_frame, _ = impl._prepare_model_frame(
-            conn,
-            train,
-            seqraw,
-            cfg,
-            encoder=bundle["sequence_encoder"],
-            sequence_challenger=bundle.get("sequence_challenger"),
-            as_of=cutoff,
-        )
+    def fit_batch_bundle(conn, frame, seqraw, cutoff, cfg, *, allow_small=False, generation=1, exclude_tokens=None):
+        bundle = original_fit_batch_bundle(conn, frame, seqraw, cutoff, cfg, allow_small=allow_small, generation=generation, exclude_tokens=exclude_tokens)
+        train = impl.training_history_before(conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens)
+        model_frame, _ = impl._prepare_model_frame(conn, train, seqraw, cfg, encoder=bundle["sequence_encoder"], sequence_challenger=bundle.get("sequence_challenger"), as_of=cutoff)
         n_estimators = cfg.small_estimators if allow_small else cfg.stable_estimators
-        bundle["recurrent"] = _fit_minute_timing_heads(
-            impl,
-            model_frame,
-            bundle["features"],
-            bundle.get("recurrent"),
-            n_estimators,
-        )
+        bundle["recurrent"] = _fit_minute_timing_heads(impl, model_frame, bundle["features"], bundle.get("recurrent"), n_estimators)
         bundle["minute_peak_timing_contract"] = _minute_contract_payload()
         return bundle
 
@@ -334,53 +256,13 @@ def install(public, core, base, impl) -> None:
 
     original_fit_online_adapter = core.fit_online_adapter
 
-    def fit_online_adapter(
-        conn,
-        champion,
-        frame,
-        seqraw,
-        cutoff,
-        cfg,
-        *,
-        allow_small=False,
-        exclude_tokens=None,
-    ):
-        adapter = original_fit_online_adapter(
-            conn,
-            champion,
-            frame,
-            seqraw,
-            cutoff,
-            cfg,
-            allow_small=allow_small,
-            exclude_tokens=exclude_tokens,
-        )
+    def fit_online_adapter(conn, champion, frame, seqraw, cutoff, cfg, *, allow_small=False, exclude_tokens=None):
+        adapter = original_fit_online_adapter(conn, champion, frame, seqraw, cutoff, cfg, allow_small=allow_small, exclude_tokens=exclude_tokens)
         stable_cutoff = impl._utc(champion["stable_training_cutoff"])
-        recent = impl.adapter_history_before(
-            conn,
-            frame,
-            cutoff,
-            stable_cutoff,
-            cfg,
-            exclude_tokens=exclude_tokens,
-        )
-        model_frame, _ = impl._prepare_model_frame(
-            conn,
-            recent,
-            seqraw,
-            cfg,
-            encoder=champion["sequence_encoder"],
-            sequence_challenger=champion.get("sequence_challenger"),
-            as_of=cutoff,
-        )
+        recent = impl.adapter_history_before(conn, frame, cutoff, stable_cutoff, cfg, exclude_tokens=exclude_tokens)
+        model_frame, _ = impl._prepare_model_frame(conn, recent, seqraw, cfg, encoder=champion["sequence_encoder"], sequence_challenger=champion.get("sequence_challenger"), as_of=cutoff)
         n_estimators = max(30, cfg.adapter_estimators // (2 if allow_small else 1))
-        adapter["recurrent"] = _fit_minute_timing_heads(
-            impl,
-            model_frame,
-            champion["features"],
-            adapter.get("recurrent"),
-            n_estimators,
-        )
+        adapter["recurrent"] = _fit_minute_timing_heads(impl, model_frame, champion["features"], adapter.get("recurrent"), n_estimators)
         adapter["head_weights"] = _derive_adapter_head_weights(adapter, cfg)
         adapter["minute_peak_timing_contract"] = _minute_contract_payload()
         return adapter
