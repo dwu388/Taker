@@ -97,5 +97,26 @@ class _LayerProxy:
 # layers while ensuring those patches also update the moved facade globals.
 _base = _LayerProxy(_actual_base, _core)
 
+
+# Preserve the original outer-facade policy-helper forwarding contract. Tests and
+# runtime patches intentionally monkey-patch helpers on ``profit_taker.axiom_v24``;
+# the moved core function has its own global namespace, so copy those public helper
+# bindings into the core immediately before delegating.
+def train_distributional_policy(db, policy_root, cfg, *, allow_small=False):
+    for name in (
+        "migrate", "refresh_counterfactual_policy_targets", "refresh_policy_cohorts",
+        "refresh_token_assignments", "next_one_use_policy_cohort",
+    ):
+        helper = globals()[name]
+        setattr(_core, name, helper)
+        setattr(_actual_base, name, helper)
+    return _core.train_distributional_policy(
+        db, policy_root, cfg, allow_small=allow_small
+    )
+
+
+_impl.train_distributional_policy = train_distributional_policy
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
