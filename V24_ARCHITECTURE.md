@@ -53,12 +53,16 @@ controls, late-insert invalidation and PCA/stable representation machinery remai
 - Forecast and policy promotion use paired token-level bootstrap evidence.
 - A policy champion whose target/execution/schema hashes do not match the active 24h generation is excluded rather than compared as if equivalent.
 
-## Adaptation and calibration
+## Adaptation, calibration and full-model graduation
 
 - Probability calibration is based on out-of-fold/online-safe predictions.
 - Stable and adapter families use separate clocks, weights, and drift handling.
 - Shorter-horizon heads may adapt faster while longer 24h heads remain more strongly anchored to the stable model.
 - The sequence challenger is causal/TS2Vec-style and requires PyTorch.
+- The default first production bootstrap remains deliberately reduced to the 1h/4h forecast and sequence contract. Its fixed promotion requirements are restricted to heads it actually produces.
+- `v24_maintain.bat` recognizes that reduced champion and does not keep warm-adapting it indefinitely. Once a fresh one-use forecast-promotion cohort is fully mature, maintenance trains a clean full-contract challenger using the current 1h/4h/8h/12h/24h defaults while preserving the champion's holdout cadence, execution assumptions and other non-profile settings.
+- A reduced champion cannot be scored on heads it never produced. Graduation therefore applies the ordinary paired token-level promotion rule only to fixed components shared by both models. The full challenger must also have complete fixed coverage for every newly introduced required component, at least the configured independent-token minimum, and each new binary Brier component must beat the 0.25 error of an uninformative `p=0.5` predictor.
+- The graduation cohort is consumed whether the full challenger wins or loses. A rejected challenger leaves the reduced champion untouched and a later attempt must use a genuinely new promotion cohort. A promoted full challenger persists the full configuration in `champion.joblib`, after which ordinary adapter/compaction maintenance proceeds under that full contract.
 
 ## Friction and audit
 
