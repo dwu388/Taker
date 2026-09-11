@@ -2,7 +2,7 @@ name: V24 CI
 
 on:
   push:
-    branches: [main, "hardening/**", "fix/**", "feature/**"]
+    branches: [main, "hardening/**", "fix/**", "feature/**", "optimize/**"]
   pull_request:
 
 jobs:
@@ -24,6 +24,8 @@ jobs:
           tests/test_collection_readiness.py::test_collection_status_detects_payload_coverage_gap
           tests/test_final_collection_session.py
           tests/test_capture_provenance.py
+      - name: Clipboard fast-path accuracy and latency regressions
+        run: python -m pytest -q tests/test_clipboard_fast_path.py
       - name: Manual-stop neutral censor collector regressions
         run: python -m pytest -q tests/test_manual_stop_collector.py
       - name: Collector atomic persistence integrity
