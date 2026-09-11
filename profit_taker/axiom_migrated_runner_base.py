@@ -4,6 +4,7 @@ import argparse
 import inspect
 import json
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,14 +18,20 @@ from .axiom_migrated_process import process_rows, record_failed_capture_attempt
 from .common import load_json
 from .db import RAW_DB_DEFAULT
 
+CAPTURE_CLICK = (662, 114)
+REFRESH_EVERY_CYCLES = 601
+
+# Kept as a public diagnostic/compatibility description of the normal capture
+# sequence. Runtime timing is configurable below and no longer burns seconds in
+# fixed waits when the clipboard is already ready.
 MACRO_EVENTS = [
-    (1.857, "mouse_down", (662, 114)),
-    (0.124, "mouse_up", (662, 114)),
-    (2.000, "hotkey", ("ctrl", "a")),
-    (2.000, "hotkey", ("ctrl", "c")),
-    (2.500, "read_clipboard", ()),
-    (1.857, "mouse_down", (662, 114)),
-    (0.124, "mouse_up", (662, 114)),
+    (0.000, "mouse_down", CAPTURE_CLICK),
+    (0.030, "mouse_up", CAPTURE_CLICK),
+    (0.350, "hotkey", ("ctrl", "a")),
+    (0.200, "hotkey", ("ctrl", "c")),
+    (0.050, "read_clipboard", ()),
+    (0.000, "mouse_down", CAPTURE_CLICK),
+    (0.030, "mouse_up", CAPTURE_CLICK),
 ]
 
 
@@ -43,8 +50,56 @@ def _capture_error(message: str, *, text: str = "", valid: bool = False, rows: i
 
 
 def _raw_mc_card_count(text: str) -> int:
-    lines = [line.strip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
-    return sum(1 for line in lines if line.upper() == "MC")
+    return sum(1 for line in text.splitlines() if line.strip().upper() == "MC")
+
+
+def _capture_seconds(cap: dict, key: str, default: float, *, minimum: float, maximum: float) -> float:
+    try:
+        value = float(cap.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _capture_int(cap: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(cap.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _click_capture_anchor(pyautogui, hold_seconds: float) -> None:
+    x, y = CAPTURE_CLICK
+    pyautogui.moveTo(x, y)
+    pyautogui.mouseDown(button="left")
+    if hold_seconds > 0:
+        time.sleep(hold_seconds)
+    pyautogui.mouseUp(button="left")
+
+
+def _ensure_capture_marker(pyperclip) -> str:
+    """Guarantee that a failed Ctrl+C cannot be mistaken for a fresh snapshot.
+
+    The public facade normally primes a fresh verified V24 sentinel first. Direct
+    calls to this base module are also protected: if no public sentinel is present,
+    install and verify a local marker before touching the browser.
+    """
+    try:
+        current = pyperclip.paste() or ""
+    except Exception:
+        current = ""
+    if current.startswith("__V24_CLIPBOARD_SENTINEL_"):
+        return current
+    marker = f"__V24_CAPTURE_SENTINEL_{uuid.uuid4().hex}__"
+    try:
+        pyperclip.copy(marker)
+        observed = pyperclip.paste()
+    except Exception as exc:
+        raise RuntimeError("Could not prime/verify the clipboard before Axiom capture") from exc
+    if observed != marker:
+        raise RuntimeError("Clipboard capture marker verification failed before Axiom capture")
+    return marker
 
 
 def _capture_clipboard(cfg: dict, cycle_count: int) -> tuple[str, str]:
@@ -53,48 +108,88 @@ def _capture_clipboard(cfg: dict, cycle_count: int) -> tuple[str, str]:
         import pyperclip
     except Exception as exc:
         raise RuntimeError("Clipboard collection requires pyautogui and pyperclip in an interactive desktop session") from exc
-    cap = cfg.get("capture", {})
-    read_timeout = float(cap.get("clipboard_read_timeout_seconds", 6.0))
-    poll_seconds = float(cap.get("clipboard_poll_seconds", 0.25))
-    try:
-        pyperclip.copy("")
-    except Exception:
-        pass
+
+    cap = cfg.get("capture", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(cap, dict):
+        cap = {}
+    read_timeout = _capture_seconds(cap, "clipboard_read_timeout_seconds", 6.0, minimum=1.0, maximum=30.0)
+    poll_seconds = _capture_seconds(cap, "clipboard_poll_seconds", 0.05, minimum=0.01, maximum=1.0)
+    click_hold = _capture_seconds(cap, "click_hold_seconds", 0.03, minimum=0.01, maximum=0.25)
+    focus_settle = _capture_seconds(cap, "focus_settle_seconds", 0.35, minimum=0.10, maximum=2.0)
+    selection_settle = _capture_seconds(cap, "selection_settle_seconds", 0.20, minimum=0.10, maximum=2.0)
+    post_copy_settle = _capture_seconds(cap, "post_copy_settle_seconds", 0.05, minimum=0.0, maximum=1.0)
+    refresh_settle = _capture_seconds(cap, "refresh_settle_seconds", 2.0, minimum=1.0, maximum=10.0)
+    retry_after = _capture_seconds(cap, "copy_retry_after_seconds", 0.75, minimum=0.25, maximum=3.0)
+    max_retries = _capture_int(cap, "copy_retries", 2, minimum=0, maximum=5)
+
+    marker = _ensure_capture_marker(pyperclip)
     clipboard_text = ""
-    macro_events = MACRO_EVENTS.copy()
-    if cycle_count % 601 == 0:
-        macro_events.insert(2, (2.000, "hotkey", ("ctrl", "shift", "r")))
-    for delay_seconds, action, payload in macro_events:
-        time.sleep(delay_seconds)
-        if action == "mouse_down":
-            x, y = payload; pyautogui.moveTo(x, y); pyautogui.mouseDown(button="left")
-        elif action == "mouse_up":
-            x, y = payload; pyautogui.moveTo(x, y); pyautogui.mouseUp(button="left")
-        elif action == "hotkey":
-            pyautogui.hotkey(*payload)
-        elif action == "read_clipboard":
-            deadline = time.time() + read_timeout
-            last_nonempty = ""
-            while time.time() < deadline:
-                try:
-                    candidate = pyperclip.paste() or ""
-                except Exception:
-                    candidate = ""
+    captured_at: str | None = None
+    last_nonempty = ""
+
+    _click_capture_anchor(pyautogui, click_hold)
+    time.sleep(focus_settle)
+    try:
+        if cycle_count % REFRESH_EVERY_CYCLES == 0:
+            pyautogui.hotkey("ctrl", "shift", "r")
+            # Refresh is rare and remains deliberately conservative. Normal cycles
+            # do not pay this cost.
+            time.sleep(refresh_settle)
+
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(selection_settle)
+        pyautogui.hotkey("ctrl", "c")
+        if post_copy_settle > 0:
+            time.sleep(post_copy_settle)
+
+        started_wait = time.monotonic()
+        deadline = started_wait + read_timeout
+        next_retry = started_wait + retry_after
+        retries = 0
+        while time.monotonic() < deadline:
+            try:
+                candidate = pyperclip.paste() or ""
+            except Exception:
+                candidate = ""
+            # The marker check is independent of structural validation. Even a
+            # structurally valid old Axiom payload cannot be accepted unless the
+            # clipboard changed after this capture started.
+            if candidate != marker:
                 if candidate.strip():
                     last_nonempty = candidate
                 if clipboard_looks_like_axiom(candidate):
                     clipboard_text = candidate
+                    # Timestamp the actual successful copy, not the later UI
+                    # cleanup, improving minute-level temporal accuracy.
+                    captured_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
                     break
-                time.sleep(poll_seconds)
-            else:
-                if last_nonempty:
-                    raise _capture_error("Clipboard text did not pass the Axiom structural validator; nothing was stored", text=last_nonempty)
-                raise _capture_error("Ctrl+C did not produce clipboard text before timeout; nothing was stored")
+            now = time.monotonic()
+            if retries < max_retries and now >= next_retry:
+                # A browser can occasionally miss a key chord while busy. Retrying
+                # selection+copy is safer than accepting stale data and usually
+                # recovers without waiting for the full timeout.
+                pyautogui.hotkey("ctrl", "a")
+                time.sleep(selection_settle)
+                pyautogui.hotkey("ctrl", "c")
+                retries += 1
+                next_retry = now + retry_after
+            time.sleep(poll_seconds)
         else:
-            raise ValueError(f"Unknown MACRO_EVENTS action: {action}")
-    if not clipboard_text:
-        raise _capture_error("MACRO_EVENTS completed without a valid Axiom clipboard capture")
-    return clipboard_text, datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            if last_nonempty:
+                raise _capture_error("Clipboard text did not pass the Axiom structural validator; nothing was stored", text=last_nonempty)
+            raise _capture_error("Ctrl+C did not produce fresh clipboard text before timeout; nothing was stored")
+    finally:
+        # Always clear the page selection/focus state, even if validation fails.
+        # This replaces the old ~2 second cleanup delay with the same physical
+        # click performed immediately after the clipboard has been captured.
+        try:
+            _click_capture_anchor(pyautogui, click_hold)
+        except Exception:
+            pass
+
+    if not clipboard_text or captured_at is None:
+        raise _capture_error("Clipboard capture completed without a valid fresh Axiom payload")
+    return clipboard_text, captured_at
 
 
 def _safe_capture_stem(snapshot_at: str) -> str:

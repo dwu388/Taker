@@ -2,7 +2,14 @@
   "layout_version": "v24-clipboard-only-25h-view",
   "capture": {
     "clipboard_read_timeout_seconds": 6.0,
-    "clipboard_poll_seconds": 0.25,
+    "clipboard_poll_seconds": 0.05,
+    "click_hold_seconds": 0.03,
+    "focus_settle_seconds": 0.35,
+    "selection_settle_seconds": 0.20,
+    "post_copy_settle_seconds": 0.05,
+    "copy_retry_after_seconds": 0.75,
+    "copy_retries": 2,
+    "refresh_settle_seconds": 2.0,
     "cycle_seconds": 60
   },
   "model_lifecycle": {
