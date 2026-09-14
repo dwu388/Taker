@@ -6,7 +6,7 @@ import sqlite3
 from typing import Sequence
 
 from .db import RAW_DB_DEFAULT
-from . import pretraining_contract_v3 as contract
+from . import pretraining_contract_v5 as contract
 
 
 def main(argv: Sequence[str] | None = None) -> int:

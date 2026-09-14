@@ -3,9 +3,10 @@ from __future__ import annotations
 """Official V24 runtime bound to the latest pretraining contract.
 
 V3 retains the training/maintenance CLI. V4 installs continuity-safe target
-semantics, indexed heartbeat lookup, friction-safe policy refreshes, and a fast
-read-only status path. Ordinary status must never rebuild every historical
-price-path target merely to display operational state.
+semantics, indexed heartbeat lookup, friction-safe policy refreshes, a fast
+read-only status path, and command-scoped single materialization for bootstrap.
+Ordinary status must never rebuild every historical price-path target merely to
+display operational state.
 """
 
 import argparse
@@ -15,14 +16,27 @@ from typing import Sequence
 
 from . import axiom_v24 as v24
 from . import pretraining_contract_v4 as contract
+from . import pretraining_contract_v5 as _single_refresh
 from . import pretraining_capture_index
 from . import pretraining_status
 from . import v24_contract_runtime_v3 as runtime
 
 # Keep V4 target semantics unchanged while replacing the pathological collector-
-# heartbeat prefix scan with an indexed interval lookup. This patch is in-place
-# so every retained V4 barrier/collapse function resolves the optimized helper.
+# heartbeat prefix scan with an indexed interval lookup.
 pretraining_capture_index.install(contract)
+
+# Preserve the public V4 contract module identity expected by existing callers,
+# but install the V5 execution-only orchestration onto that module. The V5 layer
+# froze the original V4 functions before these assignments, so delegation cannot
+# recurse.
+for _name in (
+    "refresh_pretraining_targets",
+    "training_readiness",
+    "assert_training_ready",
+    "evaluate_baselines",
+    "command_refresh_scope",
+):
+    setattr(contract, _name, getattr(_single_refresh, _name))
 
 runtime.contract = contract
 runtime.shared.target_contract_hash = contract.target_contract_hash
@@ -95,9 +109,13 @@ def _status_main(argv: Sequence[str]) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] == "status":
-        return _status_main(args)
-    return runtime.main(argv)
+    # Bootstrap first materializes targets in _pretraining_for_command. Readiness
+    # and baselines then see the same command-scoped marker and reuse that table.
+    # The scope is discarded on return, so later commands remain fresh by default.
+    with contract.command_refresh_scope():
+        if args and args[0] == "status":
+            return _status_main(args)
+        return runtime.main(argv)
 
 
 if __name__ == "__main__":
