@@ -173,7 +173,7 @@ def assert_training_ready(
     report = training_readiness(db, cfg, refresh_targets=refresh_targets)
     if not report["ready"]:
         failed = [
-            k
+            f"{k} (value={v.get('value')}, minimum={v.get('minimum')})"
             for k, v in report["gates"].items()
             if not bool(v.get("pass")) and k != "operational_death_tokens"
         ]

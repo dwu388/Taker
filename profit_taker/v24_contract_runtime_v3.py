@@ -664,6 +664,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     shared.target_contract_hash = contract.target_contract_hash
     shared.install_target_hash_contract(pcfg)
     cfg,cfg_source=_runtime_cfg(args,args.cmd)
+    if args.cmd == "bootstrap":
+        # Readiness reads derived peak events and calendar assignments. Build
+        # those from raw observations before checking them on a fresh database.
+        # Use the same label settings as bootstrap_v24 and the requested cohort
+        # config; assignments remain immutable and no evaluation is consumed.
+        peak_cfg = v24.peak.PeakStructureConfig(
+            horizon_minutes=cfg.horizon_minutes,
+            death_gap_minutes=cfg.operational_gap_minutes,
+            death_missed_cycles=int(cfg.operational_gap_minutes),
+            age_out_minutes=cfg.age_out_minutes,
+        )
+        v24.peak.refresh_labels(args.db, peak_cfg)
+        with sqlite3.connect(args.db) as conn:
+            v24.refresh_token_assignments(conn, cfg)
     pretraining=_pretraining_for_command(args.cmd,args.db,pcfg)
 
     if args.cmd=="bootstrap":
