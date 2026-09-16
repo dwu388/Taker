@@ -553,7 +553,11 @@ def evaluate_baselines(db: str, cfg: PretrainingConfig | None = None) -> dict[st
         obs, _ = peak.load_observations(conn)
         if t.empty or obs.empty:
             return {"available": False, "reason": "resolved baseline target unavailable"}
-        obs["snapshot_at"] = pd.to_datetime(obs.snapshot_at, utc=True); t["decision_at"] = pd.to_datetime(t.decision_at, utc=True)
+        # Persisted ISO timestamps legitimately mix whole and fractional seconds.
+        # Parse the ISO family explicitly instead of inferring one fixed format
+        # from the first row. Keep strict errors and exact UTC instants.
+        obs["snapshot_at"] = pd.to_datetime(obs.snapshot_at, format="ISO8601", utc=True)
+        t["decision_at"] = pd.to_datetime(t.decision_at, format="ISO8601", utc=True)
         first = obs.groupby("token_key").snapshot_at.min().sort_values(); tokens = list(first.index.astype(str))
         cut = max(1, int(len(tokens)*0.70)); train_tokens=set(tokens[:cut]); eval_tokens=set(tokens[cut:])
         if not eval_tokens:
