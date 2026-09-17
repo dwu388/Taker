@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +18,7 @@ class FreshBootstrapReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "raw.sqlite")
             migrate(db)
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn, conn:
                 for day in range(16):
                     for minute, mc in enumerate((100., 150., 120.)):
                         stamp = pd.Timestamp("2026-08-01", tz="UTC") + pd.Timedelta(days=day, minutes=minute)
@@ -33,7 +34,7 @@ class FreshBootstrapReadinessTests(unittest.TestCase):
                 pass
 
             def inspect(db_path, cfg):
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn, conn:
                     peaks = conn.execute("SELECT COUNT(DISTINCT token_key) FROM axiom_peak_events_v21").fetchone()[0]
                     self.assertEqual(peaks, 16)
                     self.assertGreaterEqual(counts._mature_development_blocks(
