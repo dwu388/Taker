@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
@@ -129,7 +130,7 @@ _base.infer_token_terminal = infer_token_terminal
 def _stored_label_contract_mismatch(db: str, config: PeakStructureConfig) -> bool:
     """Return True when durable labels were finalized under a different target contract."""
     try:
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn, conn:
             if LABEL_TABLE not in _impl._all_tables(conn):
                 return False
             rows = conn.execute(
@@ -277,7 +278,7 @@ def refresh_labels(db: str, config: PeakStructureConfig, full_rebuild: bool = Fa
     """
     contract_rebuild = _stored_label_contract_mismatch(db, config)
     rebuild = bool(full_rebuild or contract_rebuild)
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         _impl.migrate(conn)
         manual_stop.migrate(conn)
         observations, source = load_observations(conn)

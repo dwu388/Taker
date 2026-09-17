@@ -55,6 +55,7 @@ def test_timestamp_check_read_only_and_missing_path(tmp_path):
 
 
 @pytest.mark.parametrize("profile", ["full", "first_model"])
+@pytest.mark.usefixtures("closed_sqlite_connections")
 def test_frame_check_runs_real_loader_without_training_or_source_writes(tmp_path, profile, capsys):
     from profit_taker import v24_contract_runtime_v4 as official
     db = tmp_path / "raw.sqlite"

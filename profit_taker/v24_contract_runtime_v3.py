@@ -6,6 +6,7 @@ import json
 import shutil
 import sqlite3
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -676,7 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             age_out_minutes=cfg.age_out_minutes,
         )
         v24.peak.refresh_labels(args.db, peak_cfg)
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             v24.refresh_token_assignments(conn, cfg)
     pretraining=_pretraining_for_command(args.cmd,args.db,pcfg)
 

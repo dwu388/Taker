@@ -1,10 +1,12 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from profit_taker import v24_contract_runtime_v4 as official
 from profit_taker import pretraining_contract_v5 as contract
@@ -12,12 +14,13 @@ from profit_taker import pretraining_contract_v2 as counts
 from profit_taker.db import migrate
 
 
+@pytest.mark.usefixtures("closed_sqlite_connections")
 class FreshBootstrapReadinessTests(unittest.TestCase):
     def test_raw_only_bootstrap_materializes_gate_evidence_before_readiness(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "raw.sqlite")
             migrate(db)
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn, conn:
                 for day in range(16):
                     for minute, mc in enumerate((100., 150., 120.)):
                         stamp = pd.Timestamp("2026-08-01", tz="UTC") + pd.Timedelta(days=day, minutes=minute)
@@ -33,7 +36,7 @@ class FreshBootstrapReadinessTests(unittest.TestCase):
                 pass
 
             def inspect(db_path, cfg):
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn, conn:
                     peaks = conn.execute("SELECT COUNT(DISTINCT token_key) FROM axiom_peak_events_v21").fetchone()[0]
                     self.assertEqual(peaks, 16)
                     self.assertGreaterEqual(counts._mature_development_blocks(
