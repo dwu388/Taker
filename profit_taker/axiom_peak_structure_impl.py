@@ -101,7 +101,7 @@ def _utc_iso(value: Any) -> str:
 
 
 def _to_timestamp(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, utc=True, errors="coerce")
+    return pd.to_datetime(series, format="ISO8601", utc=True, errors="coerce")
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -1381,8 +1381,8 @@ def train(db: str, output_dir: str, allow_small: bool = False) -> dict[str, Any]
         "heads": heads,
         "training_mode": "full_bootstrap",
         "training_watermark": (
-            pd.to_datetime(frame.get("learning_updated_at"), errors="coerce", utc=True).max().isoformat()
-            if "learning_updated_at" in frame and pd.to_datetime(frame.get("learning_updated_at"), errors="coerce", utc=True).notna().any()
+            pd.to_datetime(frame.get("learning_updated_at"), errors="coerce", format="ISO8601", utc=True).max().isoformat()
+            if "learning_updated_at" in frame and pd.to_datetime(frame.get("learning_updated_at"), errors="coerce", format="ISO8601", utc=True).notna().any()
             else datetime.now(timezone.utc).isoformat()
         ),
         "incremental_rounds": 0,
@@ -1473,7 +1473,7 @@ def _continue_head(
     target = head.get("target")
     if data.empty or target is None:
         return head, {"new_rows": 0, "reason": "no valid target rows"}
-    learn_ts = pd.to_datetime(data.get("learning_updated_at"), errors="coerce", utc=True)
+    learn_ts = pd.to_datetime(data.get("learning_updated_at"), errors="coerce", format="ISO8601", utc=True)
     new_mask = learn_ts.notna() & (learn_ts > watermark)
     new = data[new_mask].copy()
     if new.empty:
@@ -1582,7 +1582,7 @@ def incremental_train(
             "Run an explicit full compaction/bootstrap instead."
         )
 
-    learn_ts = pd.to_datetime(frame.get("learning_updated_at"), errors="coerce", utc=True)
+    learn_ts = pd.to_datetime(frame.get("learning_updated_at"), errors="coerce", format="ISO8601", utc=True)
     if learn_ts.notna().sum() == 0 or not bool((learn_ts > watermark).any()):
         return {"trained": False, "reason": "no new mature/revised targets after model watermark", "watermark": watermark.isoformat()}
     new_watermark = learn_ts.max()
@@ -1860,3 +1860,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

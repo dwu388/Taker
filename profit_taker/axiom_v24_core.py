@@ -335,11 +335,11 @@ def _invalidate_sequence_cache_for_late_insertions(
         )
         if cached.empty:
             continue
-        cached_times = set(pd.to_datetime(cached.snapshot_at, utc=True, errors="coerce").dropna())
+        cached_times = set(pd.to_datetime(cached.snapshot_at, format="ISO8601", utc=True, errors="coerce").dropna())
         if not cached_times:
             continue
         last_cached = max(cached_times)
-        observed_times = pd.to_datetime(g.snapshot_at, utc=True, errors="coerce").dropna()
+        observed_times = pd.to_datetime(g.snapshot_at, format="ISO8601", utc=True, errors="coerce").dropna()
         missing_historical = sorted(t for t in observed_times if t <= last_cached and t not in cached_times)
         if not missing_historical:
             continue
@@ -442,8 +442,8 @@ def evaluate_sealed_audit_stream(conn: sqlite3.Connection, cfg: V24Config) -> di
     led = led[led.token_key.astype(str).isin(audit_tokens)].copy()
     if led.empty:
         return {"available": False, "reason": "no live predictions for mature audit-born tokens"}
-    led["decision_at"] = pd.to_datetime(led.decision_at, utc=True, errors="coerce")
-    led["generated_at"] = pd.to_datetime(led.generated_at, utc=True, errors="coerce")
+    led["decision_at"] = pd.to_datetime(led.decision_at, format="ISO8601", utc=True, errors="coerce")
+    led["generated_at"] = pd.to_datetime(led.generated_at, format="ISO8601", utc=True, errors="coerce")
     led = led.sort_values("generated_at").drop_duplicates(["token_key", "decision_at"], keep="first")
 
     labels = pd.read_sql_query(
@@ -453,7 +453,7 @@ def evaluate_sealed_audit_stream(conn: sqlite3.Connection, cfg: V24Config) -> di
     )
     if labels.empty:
         return {"available": False, "reason": "audit labels unavailable"}
-    labels["decision_at"] = pd.to_datetime(labels.decision_at, utc=True, errors="coerce")
+    labels["decision_at"] = pd.to_datetime(labels.decision_at, format="ISO8601", utc=True, errors="coerce")
     data = led.merge(labels, on=["token_key", "decision_at"], how="inner")
     if data.empty:
         return {"available": False, "reason": "audit predictions do not yet have matching labels"}
@@ -551,3 +551,4 @@ def lifecycle_contract() -> dict[str, object]:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
+
