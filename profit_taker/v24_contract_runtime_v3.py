@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from contextlib import closing
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -430,7 +431,7 @@ def _graduate_first_model_champion(
             "Reduced champion execution-definition hash does not match its persisted config; refusing graduation"
         )
 
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory = sqlite3.Row
         v24.migrate(conn)
         peak_cfg = v24.peak.PeakStructureConfig(
@@ -614,7 +615,7 @@ def _maintain_with_auto_graduation(
 
 def _refresh(db: str, pcfg: contract.PretrainingConfig) -> dict:
     targets = contract.refresh_pretraining_targets(db, pcfg)
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         friction = contract.enrich_counterfactual_friction(conn, pcfg)
     return {"targets": targets, "counterfactual_friction": friction}
 
@@ -676,7 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             age_out_minutes=cfg.age_out_minutes,
         )
         v24.peak.refresh_labels(args.db, peak_cfg)
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             v24.refresh_token_assignments(conn, cfg)
     pretraining=_pretraining_for_command(args.cmd,args.db,pcfg)
 
@@ -706,13 +707,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.cmd=="train-policy": out=v24.train_distributional_policy(args.db,args.policy_root,cfg,allow_small=False)
     elif args.cmd=="status": out=v24.status(args.db,cfg)
     elif args.cmd=="rebuild-sequence-cache":
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             obs,_=v24.peak.load_observations(conn); out=v24.refresh_sequence_fingerprint_cache(conn,obs,cfg,force=True)
     elif args.cmd=="audit-manifest":
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             v24.refresh_calendar_cohorts(conn,cfg); out=v24.audit_manifest(conn,cfg,reveal=args.reveal)
     elif args.cmd=="audit-evaluate":
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             v24.refresh_calendar_cohorts(conn,cfg); out=v24.evaluate_sealed_audit_stream(conn,cfg)
     else: raise RuntimeError(args.cmd)
 
