@@ -641,7 +641,7 @@ def refresh_data_vintage(conn: sqlite3.Connection, observations: pd.DataFrame) -
     if observations.empty:
         return {"inserted": 0, "corrected": 0}
     safe_cols = [c for c in observations.columns if c not in {"_rowid_"}]
-    latest_event = pd.to_datetime(observations.snapshot_at, utc=True).max()
+    latest_event = pd.to_datetime(observations.snapshot_at, format="ISO8601", utc=True).max()
     for r in observations[safe_cols].itertuples(index=False, name=None):
         rec = dict(zip(safe_cols, r))
         token = str(rec.get("token_key")); event = _iso(rec.get("snapshot_at"))
@@ -750,7 +750,7 @@ def refresh_calendar_cohorts(conn: sqlite3.Connection, cfg: V24Config) -> dict[s
     )
     if labels.empty:
         return {"created": 0, "total": 0}
-    decisions = pd.to_datetime(labels.decision_at, utc=True, errors="coerce").dropna()
+    decisions = pd.to_datetime(labels.decision_at, format="ISO8601", utc=True, errors="coerce").dropna()
     if decisions.empty:
         return {"created": 0, "total": 0}
     first = _block_floor(decisions.min(), cfg.cohort_hours)
@@ -841,8 +841,8 @@ def refresh_token_assignments(conn: sqlite3.Connection, cfg: V24Config) -> dict[
         if conn.execute(f"SELECT 1 FROM {TOKEN_ASSIGNMENT_TABLE} WHERE token_key=?",(str(token),)).fetchone():
             continue
         t=_utc(first_seen)
-        f=forecast[(pd.to_datetime(forecast.start_at,utc=True)<=t)&(pd.to_datetime(forecast.end_at,utc=True)>t)]
-        p=policy_rows[(pd.to_datetime(policy_rows.start_at,utc=True)<=t)&(pd.to_datetime(policy_rows.end_at,utc=True)>t)]
+        f=forecast[(pd.to_datetime(forecast.start_at,format="ISO8601", utc=True)<=t)&(pd.to_datetime(forecast.end_at,format="ISO8601", utc=True)>t)]
+        p=policy_rows[(pd.to_datetime(policy_rows.start_at,format="ISO8601", utc=True)<=t)&(pd.to_datetime(policy_rows.end_at,format="ISO8601", utc=True)>t)]
         if f.empty or p.empty:
             continue
         fr=f.iloc[-1]; pr=p.iloc[-1]
@@ -890,9 +890,9 @@ def _cohort_rows(conn: sqlite3.Connection) -> pd.DataFrame:
 def _row_cohort_ordinal(times: pd.Series, cohorts: pd.DataFrame) -> pd.Series:
     if cohorts.empty:
         return pd.Series([-1] * len(times), index=times.index, dtype=int)
-    starts = pd.to_datetime(cohorts.start_at, utc=True).astype("int64").to_numpy()
+    starts = pd.to_datetime(cohorts.start_at, format="ISO8601", utc=True).astype("int64").to_numpy()
     ords = cohorts.ordinal.to_numpy(dtype=int)
-    vals = pd.to_datetime(times, utc=True).astype("int64").to_numpy()
+    vals = pd.to_datetime(times, format="ISO8601", utc=True).astype("int64").to_numpy()
     idx = np.searchsorted(starts, vals, side="right") - 1
     out = np.where(idx >= 0, ords[np.clip(idx, 0, len(ords) - 1)], -1)
     return pd.Series(out, index=times.index, dtype=int)
@@ -914,8 +914,10 @@ def _attach_calendar_and_lifetime(conn: sqlite3.Connection, frame: pd.DataFrame)
     life = pd.read_sql_query(f"SELECT * FROM {LIFETIME_TABLE}", conn)
     out["lifetime_id"] = None
     if not life.empty:
-        life["first_seen_at"] = pd.to_datetime(life.first_seen_at, utc=True)
-        life["last_seen_at"] = pd.to_datetime(life.last_seen_at, utc=True)
+        # Stored ISO timestamps legitimately mix whole and fractional seconds.
+        # Explicit ISO parsing preserves both precisions and still rejects bad data.
+        life["first_seen_at"] = pd.to_datetime(life.first_seen_at, format="ISO8601", utc=True)
+        life["last_seen_at"] = pd.to_datetime(life.last_seen_at, format="ISO8601", utc=True)
         for token, idxs in out.groupby("token_key").groups.items():
             episodes = life[life.token_key.astype(str) == str(token)].sort_values("first_seen_at")
             if episodes.empty: continue
@@ -975,7 +977,7 @@ def build_long_history_fingerprint(observations: pd.DataFrame, cfg: V24Config) -
     bases = [c for c in _SEQUENCE_BASES if c in observations.columns]
     for token, g in observations.groupby("token_key", sort=False):
         g = g.sort_values("snapshot_at").reset_index(drop=True)
-        times = pd.to_datetime(g.snapshot_at, utc=True).astype("int64").to_numpy()
+        times = pd.to_datetime(g.snapshot_at, format="ISO8601", utc=True).astype("int64").to_numpy()
         arrays = {c: _obs_numeric(g, c) for c in bases}
         for i, r in g.iterrows():
             rec: dict[str, Any] = {"token_key": str(token), "snapshot_at": r.snapshot_at}
@@ -1011,15 +1013,15 @@ def refresh_sequence_fingerprint_cache(conn:sqlite3.Connection,observations:pd.D
     inserted=deleted=tokens=0; now=_now_iso(); bases=[c for c in _SEQUENCE_BASES if c in observations.columns]
     vintage=pd.read_sql_query(f"SELECT token_key,event_time,row_fingerprint,last_corrected_at FROM {DATA_VINTAGE_TABLE}",conn) if _table_exists(conn,DATA_VINTAGE_TABLE) else pd.DataFrame()
     if not vintage.empty:
-        vintage["event_time"]=pd.to_datetime(vintage.event_time,utc=True); vmap={(str(r.token_key),_utc(r.event_time)):(str(r.row_fingerprint),_utc(r.last_corrected_at)) for r in vintage.itertuples(index=False)}
+        vintage["event_time"]=pd.to_datetime(vintage.event_time,format="ISO8601", utc=True); vmap={(str(r.token_key),_utc(r.event_time)):(str(r.row_fingerprint),_utc(r.last_corrected_at)) for r in vintage.itertuples(index=False)}
     else: vmap={}
     for token,g in observations.groupby("token_key",sort=False):
         token=str(token); g=g.sort_values("snapshot_at").reset_index(drop=True)
         cache=pd.read_sql_query(f"SELECT snapshot_at,source_fingerprint,created_at FROM {SEQUENCE_CACHE_TABLE} WHERE token_key=? ORDER BY snapshot_at",conn,params=(token,))
         dirty=None
         if not cache.empty:
-            cache["snapshot_at"]=pd.to_datetime(cache.snapshot_at,utc=True); cache_by={_utc(r.snapshot_at):(r.source_fingerprint,_utc(r.created_at)) for r in cache.itertuples(index=False)}
-            for t in pd.to_datetime(g.snapshot_at,utc=True):
+            cache["snapshot_at"]=pd.to_datetime(cache.snapshot_at,format="ISO8601", utc=True); cache_by={_utc(r.snapshot_at):(r.source_fingerprint,_utc(r.created_at)) for r in cache.itertuples(index=False)}
+            for t in pd.to_datetime(g.snapshot_at,format="ISO8601", utc=True):
                 vt=vmap.get((token,_utc(t))); cr=cache_by.get(_utc(t))
                 if cr is None: continue
                 if vt is not None and (str(cr[0] or "")!=str(vt[0]) or vt[1]>cr[1]): dirty=_utc(t); break
@@ -1028,7 +1030,7 @@ def refresh_sequence_fingerprint_cache(conn:sqlite3.Connection,observations:pd.D
         lastrow=conn.execute(f"SELECT MAX(snapshot_at) FROM {SEQUENCE_CACHE_TABLE} WHERE token_key=?",(token,)).fetchone(); last=_utc(lastrow[0]) if lastrow and lastrow[0] else None
         new_idx=[i for i,t in enumerate(g.snapshot_at) if last is None or _utc(t)>last]
         if not new_idx: continue
-        tokens+=1; times=pd.to_datetime(g.snapshot_at,utc=True).astype("int64").to_numpy(); arrays={c:_obs_numeric(g,c) for c in bases}
+        tokens+=1; times=pd.to_datetime(g.snapshot_at,format="ISO8601", utc=True).astype("int64").to_numpy(); arrays={c:_obs_numeric(g,c) for c in bases}
         for i in new_idx:
             rec=_fingerprint_for_index(token,g,times,arrays,i,cfg); payload={k:(float(v) if _finite(v) is not None else None) for k,v in rec.items() if k not in {"token_key","snapshot_at"}}
             src=vmap.get((token,_utc(rec["snapshot_at"])),(None,None))[0]
@@ -1040,7 +1042,7 @@ def load_sequence_fingerprint_cache(conn: sqlite3.Connection, observations: pd.D
     refresh_sequence_fingerprint_cache(conn,observations,cfg,force=False)
     df=pd.read_sql_query(f"SELECT token_key,snapshot_at,fingerprint_json FROM {SEQUENCE_CACHE_TABLE} ORDER BY snapshot_at",conn)
     if df.empty: return pd.DataFrame(columns=["token_key","snapshot_at"])
-    df["snapshot_at"]=pd.to_datetime(df.snapshot_at,utc=True)
+    df["snapshot_at"]=pd.to_datetime(df.snapshot_at,format="ISO8601", utc=True)
     expanded=pd.DataFrame([_loads(x) for x in df.fingerprint_json])
     return pd.concat([df[["token_key","snapshot_at"]].reset_index(drop=True),expanded.reset_index(drop=True)],axis=1)
 
@@ -1194,11 +1196,11 @@ def load_v24_frame(conn: sqlite3.Connection, cfg: V24Config) -> tuple[pd.DataFra
     frame = _attach_calendar_and_lifetime(conn, frame)
     vint=pd.read_sql_query(f"SELECT token_key,event_time,first_ingested_at,last_corrected_at,value_version,ingestion_provenance FROM {DATA_VINTAGE_TABLE}",conn)
     if not vint.empty:
-        vint["event_time"]=pd.to_datetime(vint.event_time,utc=True)
+        vint["event_time"]=pd.to_datetime(vint.event_time,format="ISO8601", utc=True)
         frame=frame.merge(vint,left_on=["token_key","snapshot_at"],right_on=["token_key","event_time"],how="left").drop(columns=["event_time"],errors="ignore")
     # label interval is what must be purged against validation intervals.
-    frame["label_interval_start"] = pd.to_datetime(frame.decision_at, utc=True)
-    end = pd.to_datetime(frame.path_end_at, utc=True, errors="coerce")
+    frame["label_interval_start"] = pd.to_datetime(frame.decision_at, format="ISO8601", utc=True)
+    end = pd.to_datetime(frame.path_end_at, format="ISO8601", utc=True, errors="coerce")
     fallback = frame.label_interval_start + pd.Timedelta(minutes=cfg.horizon_minutes)
     frame["label_interval_end"] = end.fillna(fallback)
     seqraw = load_sequence_fingerprint_cache(conn, obs, cfg)
@@ -1235,8 +1237,8 @@ def _vintage_known_by(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.Series:
     """A historical row is replayable only if its current value version existed then."""
     if "first_ingested_at" not in frame.columns or "last_corrected_at" not in frame.columns:
         return pd.Series(False,index=frame.index)
-    first=pd.to_datetime(frame.first_ingested_at,utc=True,errors="coerce")
-    corrected=pd.to_datetime(frame.last_corrected_at,utc=True,errors="coerce")
+    first=pd.to_datetime(frame.first_ingested_at,format="ISO8601", utc=True,errors="coerce")
+    corrected=pd.to_datetime(frame.last_corrected_at,format="ISO8601", utc=True,errors="coerce")
     return first.notna() & corrected.notna() & (first<=cutoff) & (corrected<=cutoff)
 
 
@@ -1361,14 +1363,14 @@ def _event_sources(conn: sqlite3.Connection) -> tuple[dict[str,list[tuple[pd.Tim
     if _table_exists(conn,peak.PEAK_EVENT_TABLE):
         e=pd.read_sql_query(f"SELECT token_key,peak_at,confirmed_at,peak_price FROM {peak.PEAK_EVENT_TABLE} ORDER BY token_key,peak_at",conn)
         if not e.empty:
-            e["peak_at"]=pd.to_datetime(e.peak_at,utc=True); e["confirmed_at"]=pd.to_datetime(e.confirmed_at,utc=True)
+            e["peak_at"]=pd.to_datetime(e.peak_at,format="ISO8601", utc=True); e["confirmed_at"]=pd.to_datetime(e.confirmed_at,format="ISO8601", utc=True)
             for k,g in e.groupby("token_key"):
                 peaks_by[str(k)]=[(r.peak_at,r.confirmed_at,float(r.peak_price)) for r in g.itertuples(index=False)]
     life_by: dict[str,list[tuple[pd.Timestamp,str]]]={}
     if _table_exists(conn,LIFETIME_TABLE):
         l=pd.read_sql_query(f"SELECT token_key,terminal_at,terminal_reason FROM {LIFETIME_TABLE} WHERE terminal_at IS NOT NULL",conn)
         if not l.empty:
-            l["terminal_at"]=pd.to_datetime(l.terminal_at,utc=True)
+            l["terminal_at"]=pd.to_datetime(l.terminal_at,format="ISO8601", utc=True)
             for k,g in l.groupby("token_key"):
                 life_by[str(k)]=[(r.terminal_at,str(r.terminal_reason or "")) for r in g.itertuples(index=False)]
     return peaks_by,life_by
@@ -1460,7 +1462,7 @@ def _future_peak_lists(conn: sqlite3.Connection) -> dict[str,list[dict[str,Any]]
     df=pd.read_sql_query(
         f"SELECT token_key,peak_at,peak_price,confirmed_at,confirmation_price,runup_pct,confirmation_retrace_pct FROM {peak.PEAK_EVENT_TABLE} ORDER BY token_key,peak_at",conn)
     if df.empty: return {}
-    df["peak_at"]=pd.to_datetime(df.peak_at,utc=True); df["confirmed_at"]=pd.to_datetime(df.confirmed_at,utc=True)
+    df["peak_at"]=pd.to_datetime(df.peak_at,format="ISO8601", utc=True); df["confirmed_at"]=pd.to_datetime(df.confirmed_at,format="ISO8601", utc=True)
     out={}
     for k,g in df.groupby("token_key"):
         ev=[]; prev=None
@@ -1564,7 +1566,7 @@ def add_barrier_targets(conn: sqlite3.Connection,frame: pd.DataFrame,cfg: V24Con
         for h in cfg.probability_horizons_minutes: out[f"hit_plus{_threshold_tag(thr)}_by_{h}m"]=np.nan
     index_map={(str(r.token_key),_utc(r.snapshot_at)):i for i,r in out.iterrows()}
     for token,g in obs.groupby("token_key",sort=False):
-        g=g.sort_values("snapshot_at").reset_index(drop=True); times=pd.to_datetime(g.snapshot_at,utc=True); times_ns=times.astype("int64").to_numpy(); mc=pd.to_numeric(g.market_cap_usd,errors="coerce").to_numpy(dtype=float)
+        g=g.sort_values("snapshot_at").reset_index(drop=True); times=pd.to_datetime(g.snapshot_at,format="ISO8601", utc=True); times_ns=times.astype("int64").to_numpy(); mc=pd.to_numeric(g.market_cap_usd,errors="coerce").to_numpy(dtype=float)
         for h in cfg.probability_horizons_minutes:
             mx=_future_window_max(times_ns,mc,int(h),as_of_ns=asof_ns)
             for j,t in enumerate(times):
@@ -2528,7 +2530,7 @@ def eligible_oos_predictions(conn:sqlite3.Connection)->pd.DataFrame:
     assign=_token_assignments(conn); fc=_cohort_rows(conn)[["cohort_id","status"]].rename(columns={"cohort_id":"forecast_cohort_id","status":"forecast_status"}); pc=pd.read_sql_query(f"SELECT cohort_id,status FROM {POLICY_COHORT_TABLE}",conn).rename(columns={"cohort_id":"policy_cohort_id","status":"policy_status"})
     x=df.merge(assign,on="token_key",how="left").merge(fc,on="forecast_cohort_id",how="left").merge(pc,on="policy_cohort_id",how="left")
     ok=(x.forecast_role.ne("audit")&x.policy_role.ne("audit")&(~x.forecast_role.eq("promotion")|x.forecast_status.eq("consumed"))&(~x.policy_role.eq("promotion")|x.policy_status.eq("consumed")))
-    x=x[ok].copy(); x["decision_at"]=pd.to_datetime(x.decision_at,utc=True); x["generated_at"]=pd.to_datetime(x.generated_at,utc=True)
+    x=x[ok].copy(); x["decision_at"]=pd.to_datetime(x.decision_at,format="ISO8601", utc=True); x["generated_at"]=pd.to_datetime(x.generated_at,format="ISO8601", utc=True)
     return x
 
 
@@ -2911,12 +2913,12 @@ def refresh_counterfactual_policy_targets(conn:sqlite3.Connection,cfg:V24Config)
     obs,_=peak.load_observations(conn)
     if obs.empty: return {"written":0}
     obs=obs[["token_key","snapshot_at","market_cap_usd"]].dropna().copy()
-    obs["token_key"]=obs.token_key.astype(str); obs["snapshot_at"]=pd.to_datetime(obs.snapshot_at,utc=True)
+    obs["token_key"]=obs.token_key.astype(str); obs["snapshot_at"]=pd.to_datetime(obs.snapshot_at,format="ISO8601", utc=True)
     by={k:g.sort_values("snapshot_at") for k,g in obs.groupby("token_key")}
     life=pd.read_sql_query(f"SELECT token_key,terminal_at FROM {LIFETIME_TABLE} WHERE terminal_at IS NOT NULL",conn)
     terminal_by={}
     if not life.empty:
-        life["terminal_at"]=pd.to_datetime(life.terminal_at,utc=True)
+        life["terminal_at"]=pd.to_datetime(life.terminal_at,format="ISO8601", utc=True)
         for k,g in life.groupby("token_key"): terminal_by[str(k)]=list(g.terminal_at.sort_values())
     sources=[]
     if _table_exists(conn,"axiom_paper_candidates_v20"):
@@ -2927,7 +2929,7 @@ def refresh_counterfactual_policy_targets(conn:sqlite3.Connection,cfg:V24Config)
         m["action_kind"]="hold"; sources.append(m)
     if not sources: return {"written":0}
     src=pd.concat(sources,ignore_index=True).drop_duplicates(["token_key","decision_at","action_kind"])
-    src["decision_at"]=pd.to_datetime(src.decision_at,utc=True); src["decision_mc"]=pd.to_numeric(src.decision_mc,errors="coerce")
+    src["decision_at"]=pd.to_datetime(src.decision_at,format="ISO8601", utc=True); src["decision_mc"]=pd.to_numeric(src.decision_mc,errors="coerce")
     written=0; now=_now_iso()
     for r in src.itertuples(index=False):
         token=str(r.token_key); decision=_utc(r.decision_at); dmc=float(r.decision_mc) if np.isfinite(r.decision_mc) and r.decision_mc>0 else None
@@ -2993,7 +2995,7 @@ def _entry_policy_training_rows(conn:sqlite3.Connection,*,eval_cohort_id:str|Non
     if led.empty: return pd.DataFrame()
     cf=pd.read_sql_query(f"SELECT * FROM {COUNTERFACTUAL_TABLE} WHERE action_kind='entry' AND horizon_minutes=? AND entry_execution_return IS NOT NULL",conn,params=(int(horizon),))
     if cf.empty: return pd.DataFrame()
-    cf["decision_at"]=pd.to_datetime(cf.decision_at,utc=True); led["decision_at"]=pd.to_datetime(led.decision_at,utc=True)
+    cf["decision_at"]=pd.to_datetime(cf.decision_at,format="ISO8601", utc=True); led["decision_at"]=pd.to_datetime(led.decision_at,format="ISO8601", utc=True)
     out=led.merge(cf,on=["token_key","decision_at"],how="inner"); out["target"]=pd.to_numeric(out.entry_execution_return,errors="coerce")
     return out
 
@@ -3003,7 +3005,7 @@ def _hold_policy_training_rows(conn:sqlite3.Connection,*,eval_cohort_id:str|None
     if led.empty: return pd.DataFrame()
     cf=pd.read_sql_query(f"SELECT * FROM {COUNTERFACTUAL_TABLE} WHERE action_kind='hold' AND horizon_minutes=? AND hold_advantage_return IS NOT NULL",conn,params=(int(horizon),))
     if cf.empty: return pd.DataFrame()
-    cf["decision_at"]=pd.to_datetime(cf.decision_at,utc=True); led["decision_at"]=pd.to_datetime(led.decision_at,utc=True)
+    cf["decision_at"]=pd.to_datetime(cf.decision_at,format="ISO8601", utc=True); led["decision_at"]=pd.to_datetime(led.decision_at,format="ISO8601", utc=True)
     out=led.merge(cf,on=["token_key","decision_at"],how="inner"); out["target"]=pd.to_numeric(out.hold_advantage_return,errors="coerce")
     return out
 
@@ -3049,10 +3051,10 @@ def doubly_robust_entry_ope(conn:sqlite3.Connection,bundle:dict[str,Any],cfg:V24
     if not _table_exists(conn,"axiom_paper_candidates_v20"): return {"available":False}
     c=pd.read_sql_query("SELECT * FROM axiom_paper_candidates_v20 WHERE action_probability IS NOT NULL",conn)
     if c.empty: return {"available":False}
-    c["decision_at"]=pd.to_datetime(c.snapshot_at,utc=True)
+    c["decision_at"]=pd.to_datetime(c.snapshot_at,format="ISO8601", utc=True)
     cf=pd.read_sql_query(f"SELECT token_key,decision_at,entry_execution_return FROM {COUNTERFACTUAL_TABLE} WHERE action_kind='entry' AND horizon_minutes=?",conn,params=(int(horizon),))
     if cf.empty:return {"available":False}
-    cf["decision_at"]=pd.to_datetime(cf.decision_at,utc=True); x=c.merge(cf,on=["token_key","decision_at"],how="inner")
+    cf["decision_at"]=pd.to_datetime(cf.decision_at,format="ISO8601", utc=True); x=c.merge(cf,on=["token_key","decision_at"],how="inner")
     led=eligible_oos_predictions(conn)[["token_key","decision_at","prediction_json"]]
     x=x.merge(led,on=["token_key","decision_at"],how="inner")
     if x.empty:return {"available":False}
@@ -3063,7 +3065,7 @@ def doubly_robust_entry_ope(conn:sqlite3.Connection,bundle:dict[str,Any],cfg:V24
     pos=pd.read_sql_query("SELECT token_key,entry_decision_at,COALESCE(execution_net_return_pct,net_return_pct) reward FROM axiom_paper_positions_v20 WHERE status='closed' AND entry_decision_at IS NOT NULL",conn)
     reward=np.zeros(len(x),dtype=float)
     if not pos.empty:
-        pos["decision_at"]=pd.to_datetime(pos.entry_decision_at,utc=True); rm={(str(r.token_key),_utc(r.decision_at)):float(r.reward) for r in pos.itertuples(index=False) if _finite(r.reward) is not None}
+        pos["decision_at"]=pd.to_datetime(pos.entry_decision_at,format="ISO8601", utc=True); rm={(str(r.token_key),_utc(r.decision_at)):float(r.reward) for r in pos.itertuples(index=False) if _finite(r.reward) is not None}
         for i,r in enumerate(x.itertuples(index=False)):
             if a[i]==1: reward[i]=rm.get((str(r.token_key),_utc(r.decision_at)),float(r.entry_execution_return))
     w=np.minimum(1.0/np.maximum(mu,cfg.propensity_floor),cfg.dr_clip_weight)
@@ -3137,7 +3139,7 @@ def fit_liquidity_model(
     q=f"SELECT * FROM {LIQUIDITY_TABLE}"+(" WHERE "+" AND ".join(where) if where else "")+" ORDER BY observed_at"
     data=pd.read_sql_query(q,conn,params=params)
     if data.empty:return {"active":False,"reason":"no cutoff-eligible executed-liquidity observations","fallback_round_trip_bps":cfg.fallback_round_trip_bps,"training_cutoff":_iso(cutoff) if cutoff is not None else None}
-    data["observed_at"]=pd.to_datetime(data.observed_at,utc=True); qprice=pd.to_numeric(data.quoted_price,errors="coerce"); eprice=pd.to_numeric(data.executed_price,errors="coerce")
+    data["observed_at"]=pd.to_datetime(data.observed_at,format="ISO8601", utc=True); qprice=pd.to_numeric(data.quoted_price,errors="coerce"); eprice=pd.to_numeric(data.executed_price,errors="coerce")
     side=data.get("side",pd.Series([None]*len(data))).astype(str).str.upper()
     slip=pd.to_numeric(data.slippage_bps,errors="coerce")
     valid=qprice.gt(0)&eprice.gt(0)
@@ -3197,7 +3199,7 @@ def audit_manifest(conn: sqlite3.Connection, cfg: V24Config, reveal: bool = Fals
     latest = _latest_capture(conn)
     mature = 0
     if latest is not None:
-        mature = int(sum(pd.to_datetime(rows.end_at, utc=True) + pd.Timedelta(minutes=cfg.horizon_minutes) <= latest))
+        mature = int(sum(pd.to_datetime(rows.end_at, format="ISO8601", utc=True) + pd.Timedelta(minutes=cfg.horizon_minutes) <= latest))
     if not reveal:
         return {
             "sealed_audit_cohorts": int(len(rows)), "mature_sealed_audit_cohorts": mature,
@@ -3233,7 +3235,7 @@ def evaluate_sealed_audit_stream(conn: sqlite3.Connection, cfg: V24Config) -> di
     )
     if led.empty:
         return {"available": False, "reason": "no prospective audit predictions recorded"}
-    led["decision_at"] = pd.to_datetime(led.decision_at, utc=True)
+    led["decision_at"] = pd.to_datetime(led.decision_at, format="ISO8601", utc=True)
     allowed = np.zeros(len(led), dtype=bool)
     for r in cohorts.itertuples(index=False):
         a, b = _utc(r.start_at), _utc(r.end_at)
@@ -3244,7 +3246,7 @@ def evaluate_sealed_audit_stream(conn: sqlite3.Connection, cfg: V24Config) -> di
     labels = pd.read_sql_query(
         f"SELECT token_key,decision_at,next_substantial_peak_at,terminal_at,terminal_reason,path_end_at,label_finalized FROM {peak.LABEL_TABLE}", conn
     )
-    labels["decision_at"] = pd.to_datetime(labels.decision_at, utc=True)
+    labels["decision_at"] = pd.to_datetime(labels.decision_at, format="ISO8601", utc=True)
     data = led.merge(labels, on=["token_key","decision_at"], how="inner")
     if data.empty:
         return {"available": False, "reason": "audit labels unavailable"}
