@@ -134,11 +134,16 @@ def test_legacy_bootstrap_alias_cannot_bypass_latest_runtime():
 def test_first_model_runtime_reduces_capacity_without_allow_small():
     args = SimpleNamespace(cohort_hours=24, promotion_every=4, audit_every=5, warmup_blocks=7)
     cfg = runtime.runtime._cfg(args)
-    profile = runtime.runtime._apply_first_model_profile(cfg, contract.PretrainingConfig())
-    assert profile["production_readiness_required"] is True
-    assert cfg.stable_estimators <= 150
-    assert cfg.probability_horizons_minutes == (60, 240)
-    assert max(cfg.survival_bins_minutes) == 240
-    assert cfg.upside_thresholds == (0.30, 0.50)
-    assert cfg.sequence_challenger_min_tokens >= 10**9
-    assert v24.RECURRENT_HORIZONS_MINUTES == (240,)
+    try:
+        profile = runtime.runtime._apply_first_model_profile(cfg, contract.PretrainingConfig())
+        assert profile["production_readiness_required"] is True
+        assert cfg.stable_estimators <= 150
+        assert cfg.probability_horizons_minutes == (60, 240)
+        assert max(cfg.survival_bins_minutes) == 240
+        assert cfg.upside_thresholds == (0.30, 0.50)
+        assert cfg.sequence_challenger_min_tokens >= 10**9
+        assert v24.RECURRENT_HORIZONS_MINUTES == (240,)
+    finally:
+        # The runtime grid is process-wide. Do not let this reduced-profile test
+        # alter later tests that exercise the default 24-hour contract.
+        runtime.runtime._activate_recurrent_grid(v24.V24Config())

@@ -5,6 +5,7 @@ import sqlite3
 from profit_taker import axiom_manual_stop as manual_stop
 from profit_taker import axiom_peak_structure as peak
 from profit_taker import axiom_v24_base as v24base
+from profit_taker import v24_contract_runtime_v4 as runtime_v4
 from profit_taker.db import migrate
 
 
@@ -147,6 +148,11 @@ def test_v24_counterfactual_refresh_prunes_windows_crossing_stop(tmp_path, monke
             v24base,
             "_original_refresh_counterfactual_policy_targets",
             lambda _conn, _cfg: {"written": 0},
+        )
+        monkeypatch.setattr(
+            runtime_v4.contract,
+            "enrich_counterfactual_friction",
+            lambda _conn, _cfg: {"updated": 0},
         )
         result = v24base.refresh_counterfactual_policy_targets(conn, None)
         remaining = conn.execute(
