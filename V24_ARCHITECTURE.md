@@ -19,6 +19,10 @@ the 24-hour lifecycle conversion.
 - Promotion/audit role is assigned at token first-seen for the token lifetime, preventing decision-time holdout leakage.
 - Collector heartbeat state is separated from token presence so outages are not interpreted as token death.
 - Immutable definition hashes and data-vintage state are part of the V24 audit contract.
+- First-bootstrap vintage can be reconstructed from canonical immutable inserts only
+  when the production collection session, completed clipboard-valid cycle, successful
+  attempt and archived payload independently corroborate the observation timestamp and
+  original insertion time. Replayed, altered or uncorroborated history remains blocked.
 - A changed lifecycle target changes schema/target hashes and forces a clean model generation.
 
 ## Targets

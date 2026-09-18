@@ -80,10 +80,24 @@ def check_frame(db, args):
             if frame.empty:
                 raise ValueError("Training frame is empty")
             cohort = v24.next_one_use_promotion_cohort(conn, cfg)
+            if cohort is None:
+                raise ValueError("No fully matured one-use promotion cohort is available")
+            cutoff = v24._utc(cohort["start_at"])
+            evaluation = v24._cohort_frame(frame, cohort)
+            evaluation_tokens = set(evaluation.token_key.astype(str))
+            eligibility = v24.training_history_diagnostics(
+                conn, frame, cutoff, cfg, exclude_tokens=evaluation_tokens
+            )
+            if int(eligibility["eligible_training_rows"]) < 200:
+                raise ValueError(
+                    "Insufficient leakage-safe V24 training history before fitting: "
+                    + json.dumps(eligibility, sort_keys=True, default=str)
+                )
             return {"frame_rows": len(frame), "sequence_rows": len(seq),
                     "tokens": int(frame.token_key.nunique()), "sources": sources,
-                    "mature_promotion_available": cohort is not None,
-                    "note": "Frame check only; readiness, baselines and fitting remain unchecked."}
+                    "mature_promotion_available": True,
+                    "training_eligibility": eligibility,
+                    "note": "Frame and leakage-safe eligibility check only; readiness, baselines and fitting remain unchecked."}
 
 
 def main(argv=None):

@@ -28,7 +28,8 @@ previously failing lifetime join:
 .venv\Scripts\python.exe -m profit_taker.v24_preflight --db data\axiom_v24_raw.sqlite --stage frame --profile full
 ```
 
-Expect `"passed": true` with nonzero frame rows. This stage can take appreciable
+Expect `"passed": true` with nonzero frame rows and
+`training_eligibility.eligible_training_rows >= 200`. This stage can take appreciable
 time because it builds labels and sequence features. It uses a temporary SQLite
 backup, including committed WAL data; it does not alter the source database,
 consume promotion cohorts, evaluate sealed audits, or write model files. Ensure
@@ -37,9 +38,15 @@ enough temporary disk space for the database and derived tables. Use
 Sequence fingerprints are validated/materialized in SQLite but are not expanded
 into one process-wide pandas table; the loader reports the durable cache row count
 and later decodes only token-scoped batches during fitting.
-`mature_promotion_available: false` means a bootstrap requirement is still missing.
-This check does not certify model dependencies, training sufficiency, or model
-quality. It does not run the pretraining barriers or baseline evaluation.
+The check also applies the exact stable-training cohort, embargo, label-maturity,
+data-vintage and promotion-token exclusions used immediately before fitting. It
+fails before an expensive bootstrap when fewer than 200 leakage-safe rows survive.
+Canonical observations whose vintage table was materialized late are reconstructed
+only when their original insertion time is corroborated by the production session,
+completed clipboard-valid capture, successful matching attempt and archived raw
+payload. Replays and uncorroborated legacy rows remain ineligible.
+This check does not certify model dependencies or model quality. It does not run
+the pretraining barriers or baseline evaluation.
 
 4. Inspect the cached readiness snapshot without rebuilding pretraining targets:
 

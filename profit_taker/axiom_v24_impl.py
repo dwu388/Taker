@@ -641,44 +641,102 @@ def _contiguous_capture_absence(
 def refresh_data_vintage(conn: sqlite3.Connection, observations: pd.DataFrame) -> dict[str, int]:
     """Track when the *current value version* became available.
 
-    Existing pre-V24 history is intentionally marked legacy/unknown at migration
-    time.  It can train a model *now*, but cannot be replayed as if the repaired
-    value had been known at an earlier historical cross-fit cutoff.
+    Canonical V24 observations are immutable hard inserts.  Their original
+    ``created_at`` is therefore valid knowledge time when it is corroborated by a
+    completed clipboard-valid capture, a successful matching capture attempt, an
+    exact archived payload, and the production collection-session contract.  This
+    lets a first model reconstruct vintage even if the derived vintage table was
+    not materialized continuously during collection.  Imported/replayed rows and
+    uncorroborated legacy history remain unknown and cannot be replayed through a
+    historical cutoff.
     """
     migrate(conn)
     _ensure_column(conn, DATA_VINTAGE_TABLE, "ingestion_provenance TEXT")
-    now = _now_iso(); inserted = corrected = 0
+    now = _now_iso(); inserted = corrected = reconstructed = 0
     if observations.empty:
-        return {"inserted": 0, "corrected": 0}
+        return {"inserted": 0, "corrected": 0, "reconstructed": 0}
+
+    trusted_cycles: dict[int, pd.Timestamp] = {}
+    required_tables = {
+        "collection_sessions", "capture_cycles", "capture_attempts", "capture_payloads"
+    }
+    if all(_table_exists(conn, table) for table in required_tables):
+        rows = conn.execute(
+            """SELECT DISTINCT c.cycle_id,c.captured_at
+               FROM capture_cycles c
+               JOIN collection_sessions s ON s.session_id=c.session_id
+               JOIN capture_attempts a ON a.cycle_id=c.cycle_id
+               JOIN capture_payloads p ON p.cycle_id=c.cycle_id
+               WHERE c.completed=1 AND c.clipboard_valid=1
+                 AND s.purpose='v24_production_raw_collection'
+                 AND s.collector_schema='v24_clipboard_raw_v2'
+                 AND a.success=1 AND a.clipboard_valid=1
+                 AND a.raw_payload_sha256=p.sha256
+                 AND a.raw_payload_bytes=p.byte_count"""
+        ).fetchall()
+        trusted_cycles = {int(cycle): _utc(captured) for cycle, captured in rows}
+
+    def durable_ingestion(rec: dict[str, Any], event_ts: pd.Timestamp) -> pd.Timestamp | None:
+        cycle = rec.get("cycle_id")
+        created = rec.get("created_at")
+        if cycle is None or pd.isna(cycle) or created is None or pd.isna(created):
+            return None
+        captured = trusted_cycles.get(int(cycle))
+        if captured is None or abs((captured - event_ts).total_seconds()) > 1.0:
+            return None
+        try:
+            ingested = _utc(created)
+        except (TypeError, ValueError):
+            return None
+        # SQLite CURRENT_TIMESTAMP is second-precision UTC, while capture times
+        # may contain microseconds.  Permit that truncation and ordinary capture
+        # processing latency, but never reinterpret a historical replay as live.
+        delay = (ingested - event_ts).total_seconds()
+        return ingested if -1.0 <= delay <= 15.0 * 60.0 else None
+
     safe_cols = [c for c in observations.columns if c not in {"_rowid_"}]
-    latest_event = pd.to_datetime(observations.snapshot_at, format="ISO8601", utc=True).max()
     for r in observations[safe_cols].itertuples(index=False, name=None):
         rec = dict(zip(safe_cols, r))
         token = str(rec.get("token_key")); event = _iso(rec.get("snapshot_at"))
+        event_ts = _utc(event)
+        durable = durable_ingestion(rec, event_ts)
         fp = _stable_hash(rec)
         prior = conn.execute(
-            f"SELECT row_fingerprint,value_version FROM {DATA_VINTAGE_TABLE} WHERE token_key=? AND event_time=?",
+            f"""SELECT row_fingerprint,value_version,first_ingested_at,last_corrected_at,
+                       ingestion_provenance
+                FROM {DATA_VINTAGE_TABLE} WHERE token_key=? AND event_time=?""",
             (token, event),
         ).fetchone()
         if prior is None:
-            event_ts = _utc(event)
-            prospective = abs((latest_event - event_ts).total_seconds()) <= 15 * 60
-            provenance = "prospective_v24" if prospective else "legacy_unknown_vintage"
+            known_at = durable.isoformat() if durable is not None else now
+            provenance = "canonical_prospective_insert" if durable is not None else "legacy_unknown_vintage"
             conn.execute(
                 f"""INSERT INTO {DATA_VINTAGE_TABLE}
                     (token_key,event_time,first_ingested_at,last_corrected_at,value_version,row_fingerprint,ingestion_provenance)
                     VALUES(?,?,?,?,?,?,?)""",
-                (token, event, now, now, 1, fp, provenance),
+                (token, event, known_at, known_at, 1, fp, provenance),
             ); inserted += 1
         elif str(prior[0]) != fp:
             conn.execute(
                 f"""UPDATE {DATA_VINTAGE_TABLE}
-                    SET last_corrected_at=?,value_version=?,row_fingerprint=?
+                    SET last_corrected_at=?,value_version=?,row_fingerprint=?,
+                        ingestion_provenance=?
                     WHERE token_key=? AND event_time=?""",
-                (now, int(prior[1]) + 1, fp, token, event),
+                (now, int(prior[1]) + 1, fp, "corrected_after_ingestion", token, event),
             ); corrected += 1
+        elif durable is not None and str(prior[4] or "") == "legacy_unknown_vintage":
+            # The value is byte-for-byte unchanged since vintage was first
+            # observed, and the authoritative capture tables independently prove
+            # when the immutable canonical row was inserted.
+            known_at = durable.isoformat()
+            conn.execute(
+                f"""UPDATE {DATA_VINTAGE_TABLE}
+                    SET first_ingested_at=?,last_corrected_at=?,ingestion_provenance=?
+                    WHERE token_key=? AND event_time=?""",
+                (known_at, known_at, "canonical_prospective_reconstructed", token, event),
+            ); reconstructed += 1
     conn.commit()
-    return {"inserted": inserted, "corrected": corrected}
+    return {"inserted": inserted, "corrected": corrected, "reconstructed": reconstructed}
 
 
 def refresh_lifetimes(
@@ -1495,6 +1553,60 @@ def _vintage_known_by(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.Series:
     return first.notna() & corrected.notna() & (first<=cutoff) & (corrected<=cutoff)
 
 
+def _training_history_selection(
+    conn: sqlite3.Connection,
+    frame: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    cfg: V24Config,
+    exclude_tokens: set[str] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    cutoff = _utc(cutoff)
+    allowed = _eligible_train_ordinals(conn, cutoff)
+    embargo_cutoff = cutoff - pd.Timedelta(hours=cfg.promotion_embargo_hours)
+    allowed_mask = frame.calendar_cohort_ordinal.isin(allowed)
+    embargo_mask = frame.snapshot_at < embargo_cutoff
+    label_mask = frame.label_interval_end <= cutoff
+    vintage_mask = _vintage_known_by(frame, cutoff)
+    before_exclusion_mask = allowed_mask & embargo_mask & label_mask & vintage_mask
+    before_exclusion = int(before_exclusion_mask.sum())
+    excluded = pd.Series(False, index=frame.index)
+    if exclude_tokens:
+        excluded = frame.token_key.astype(str).isin(set(map(str, exclude_tokens)))
+    cumulative = before_exclusion_mask & ~excluded
+    provenance = (
+        frame.loc[allowed_mask, "ingestion_provenance"].fillna("missing").astype(str).value_counts().to_dict()
+        if "ingestion_provenance" in frame.columns else {"missing": int(allowed_mask.sum())}
+    )
+    diagnostics: dict[str, Any] = {
+        "cutoff": cutoff.isoformat(),
+        "embargo_cutoff": embargo_cutoff.isoformat(),
+        "total_frame_rows": int(len(frame)),
+        "allowed_train_ordinals": sorted(int(v) for v in allowed),
+        "allowed_cohort_rows": int(allowed_mask.sum()),
+        "before_embargo_rows": int((allowed_mask & embargo_mask).sum()),
+        "mature_label_rows": int((allowed_mask & embargo_mask & label_mask).sum()),
+        "vintage_known_rows": before_exclusion,
+        "excluded_evaluation_rows": int((before_exclusion_mask & excluded).sum()),
+        "eligible_training_rows": int(cumulative.sum()),
+        "allowed_cohort_vintage_provenance": {str(k): int(v) for k, v in provenance.items()},
+    }
+    return frame[cumulative].copy(), diagnostics
+
+
+def training_history_diagnostics(
+    conn: sqlite3.Connection,
+    frame: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    cfg: V24Config,
+    exclude_tokens: set[str] | None = None,
+) -> dict[str, Any]:
+    """Explain every cumulative gate used by stable batch training."""
+    _, diagnostics = _training_history_selection(
+        conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens
+    )
+    return diagnostics
+
+
 def training_history_before(conn: sqlite3.Connection, frame: pd.DataFrame, cutoff: pd.Timestamp, cfg: V24Config, exclude_tokens: set[str] | None = None) -> pd.DataFrame:
     """Fully mature history for stable batch training.
 
@@ -1502,17 +1614,9 @@ def training_history_before(conn: sqlite3.Connection, frame: pd.DataFrame, cutof
     the actual label interval to end before the cutoff already performs the causal
     purge.  A small embargo remains around the external evaluation boundary.
     """
-    cutoff=_utc(cutoff); allowed=_eligible_train_ordinals(conn,cutoff)
-    if not allowed: return frame.iloc[0:0].copy()
-    embargo_cutoff=cutoff-pd.Timedelta(hours=cfg.promotion_embargo_hours)
-    mask=(
-        frame.calendar_cohort_ordinal.isin(allowed)
-        & (frame.snapshot_at < embargo_cutoff)
-        & (frame.label_interval_end <= cutoff)
-        & _vintage_known_by(frame,cutoff)
+    out, _ = _training_history_selection(
+        conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens
     )
-    out=frame[mask].copy()
-    if exclude_tokens: out=out[~out.token_key.astype(str).isin(set(map(str,exclude_tokens)))].copy()
     return out
 
 
@@ -2476,9 +2580,14 @@ def fit_batch_bundle(
     generation: int = 1,
     exclude_tokens: set[str] | None = None,
 ) -> dict[str, Any]:
-    eligible_train = training_history_before(conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens)
+    eligible_train, eligibility = _training_history_selection(
+        conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens
+    )
     if len(eligible_train) < (40 if allow_small else 200):
-        raise RuntimeError(f"Insufficient leakage-safe V24 training history: {len(eligible_train)} rows")
+        raise RuntimeError(
+            "Insufficient leakage-safe V24 training history: "
+            f"{len(eligible_train)} rows; diagnostics={_json(eligibility)}"
+        )
     train = _bounded_model_training_rows(eligible_train, cfg)
     sequence_challenger=_fit_ts2vec_from_source(
         seqraw, train, cfg, allow_small=allow_small
