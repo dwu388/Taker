@@ -63,24 +63,26 @@ def _safe_feature_name(name: str) -> bool:
 
 def _load_cached_feature_frame(conn: sqlite3.Connection, current_at: pd.Timestamp | None = None) -> pd.DataFrame:
     if current_at is None:
-        df = pd.read_sql_query(
-            f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} ORDER BY snapshot_at",
-            conn,
-        )
+        query = f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} ORDER BY snapshot_at"
+        params = None
     else:
-        df = pd.read_sql_query(
-            f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} WHERE snapshot_at=?",
-            conn,
-            params=(_utc_iso(current_at),),
-        )
-    if df.empty:
+        query = f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} WHERE snapshot_at=?"
+        params = (_utc_iso(current_at),)
+    parts: list[pd.DataFrame] = []
+    for df in pd.read_sql_query(query, conn, params=params, chunksize=2048):
+        if df.empty:
+            continue
+        expanded = pd.DataFrame.from_records([_flatten_numeric_json(v) for v in df.features_json])
+        keep = [c for c in expanded.columns if _safe_feature_name(c)]
+        expanded = expanded.reindex(columns=keep)
+        if len(expanded.columns):
+            expanded = expanded.apply(pd.to_numeric, errors="coerce").astype(np.float32, copy=False)
+        base = df[["token_key", "snapshot_at"]].copy()
+        base["snapshot_at"] = _to_timestamp(base["snapshot_at"])
+        parts.append(pd.concat([base.reset_index(drop=True), expanded.reset_index(drop=True)], axis=1, copy=False))
+    if not parts:
         return pd.DataFrame(columns=["token_key", "snapshot_at"])
-    expanded = pd.DataFrame([_flatten_numeric_json(v) for v in df.features_json])
-    keep = [c for c in expanded.columns if _safe_feature_name(c)]
-    expanded = expanded.reindex(columns=keep)
-    base = df[["token_key", "snapshot_at"]].copy()
-    base["snapshot_at"] = _to_timestamp(base["snapshot_at"])
-    return pd.concat([base.reset_index(drop=True), expanded.reset_index(drop=True)], axis=1)
+    return pd.concat(parts, ignore_index=True, sort=False, copy=False)
 
 
 _impl._safe_feature_name = _safe_feature_name

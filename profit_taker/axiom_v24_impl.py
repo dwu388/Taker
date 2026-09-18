@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import itertools
 import json
@@ -181,6 +182,13 @@ class V24Config:
     sequence_challenger_batch_size: int = 32
     sequence_challenger_min_tokens: int = 24
 
+    # Minute observations are strongly autocorrelated.  Bound the rows presented
+    # to the estimators while retaining every token and evenly covering each
+    # lifecycle.  External promotion/audit evaluation remains completely
+    # unsampled.
+    model_max_training_rows: int = 50_000
+    model_max_rows_per_token: int = 384
+
     # Slippage remains dormant until enough executed-liquidity observations exist.
     liquidity_min_rows: int = 100
     liquidity_validation_fraction: float = 0.20
@@ -212,6 +220,8 @@ def _loads(value: Any) -> dict[str, Any]:
     try:
         obj = json.loads(value)
         return obj if isinstance(obj, dict) else {}
+    except MemoryError:
+        raise
     except Exception:
         return {}
 
@@ -671,10 +681,16 @@ def refresh_data_vintage(conn: sqlite3.Connection, observations: pd.DataFrame) -
     return {"inserted": inserted, "corrected": corrected}
 
 
-def refresh_lifetimes(conn: sqlite3.Connection, cfg: V24Config) -> dict[str, int]:
+def refresh_lifetimes(
+    conn: sqlite3.Connection,
+    cfg: V24Config,
+    observations: pd.DataFrame | None = None,
+) -> dict[str, int]:
     """Track token episodes using successful-capture absence, never wall-clock gaps alone."""
     migrate(conn)
-    obs, _ = peak.load_observations(conn)
+    obs = observations
+    if obs is None:
+        obs, _ = peak.load_observations(conn)
     if obs.empty:
         return {"tokens": 0, "lifetimes": 0, "new_lifetimes": 0}
     refresh_capture_heartbeats(conn, obs)
@@ -1038,13 +1054,138 @@ def refresh_sequence_fingerprint_cache(conn:sqlite3.Connection,observations:pd.D
     conn.commit(); return {"changed_tokens":tokens,"inserted":inserted,"invalidated_rows":deleted}
 
 
-def load_sequence_fingerprint_cache(conn: sqlite3.Connection, observations: pd.DataFrame, cfg: V24Config) -> pd.DataFrame:
+@dataclass(frozen=True)
+class SequenceFingerprintCache:
+    """Connection-local, lazy view of the wide sequence-fingerprint cache.
+
+    The durable JSON rows are intentionally not materialized together.  A mature
+    cache can contain hundreds of thousands of rows and more than one thousand
+    numeric fields per row; expanding every JSON document before pandas allocates
+    the numeric matrix temporarily requires several copies of the dataset.
+    """
+
+    conn: sqlite3.Connection
+    row_count: int
+    feature_columns: tuple[str, ...]
+
+    def __len__(self) -> int:
+        return int(self.row_count)
+
+
+SequenceFingerprintSource = pd.DataFrame | SequenceFingerprintCache
+
+
+def _sequence_feature_columns(observations: pd.DataFrame, cfg: V24Config) -> tuple[str, ...]:
+    bases = [c for c in _SEQUENCE_BASES if c in observations.columns]
+    scalar = (
+        "has_window", "coverage", "points", "change", "log_vol",
+        "positive_ratio", "path_efficiency", "fraction_of_high", "fraction_of_low",
+    )
+    names: list[str] = []
+    for base in bases:
+        for window in cfg.sequence_windows_minutes:
+            names.extend(f"seqraw__{base}__{int(window)}m__{name}" for name in scalar)
+            for segment in range(int(cfg.sequence_segments)):
+                names.append(f"seqraw__{base}__{int(window)}m__seg{segment}_present")
+                names.append(f"seqraw__{base}__{int(window)}m__seg{segment}_return")
+    return tuple(names)
+
+
+def load_sequence_fingerprint_cache(
+    conn: sqlite3.Connection,
+    observations: pd.DataFrame,
+    cfg: V24Config,
+) -> SequenceFingerprintCache:
     refresh_sequence_fingerprint_cache(conn,observations,cfg,force=False)
-    df=pd.read_sql_query(f"SELECT token_key,snapshot_at,fingerprint_json FROM {SEQUENCE_CACHE_TABLE} ORDER BY snapshot_at",conn)
-    if df.empty: return pd.DataFrame(columns=["token_key","snapshot_at"])
-    df["snapshot_at"]=pd.to_datetime(df.snapshot_at,format="ISO8601", utc=True)
-    expanded=pd.DataFrame([_loads(x) for x in df.fingerprint_json])
-    return pd.concat([df[["token_key","snapshot_at"]].reset_index(drop=True),expanded.reset_index(drop=True)],axis=1)
+    row_count = int(conn.execute(f"SELECT COUNT(*) FROM {SEQUENCE_CACHE_TABLE}").fetchone()[0])
+    return SequenceFingerprintCache(
+        conn=conn,
+        row_count=row_count,
+        feature_columns=_sequence_feature_columns(observations, cfg),
+    )
+
+
+def _sequence_keys(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["token_key", "snapshot_at"])
+    keys = frame[["token_key", "snapshot_at"]].copy()
+    keys["token_key"] = keys.token_key.astype(str)
+    keys["snapshot_at"] = pd.to_datetime(keys.snapshot_at, format="ISO8601", utc=True)
+    return keys.drop_duplicates(["token_key", "snapshot_at"], keep="last").reset_index(drop=True)
+
+
+def _raw_sequence_frame(
+    rows: list[tuple[Any, Any, Any]],
+    feature_columns: Sequence[str] | None,
+) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["token_key", "snapshot_at"])
+    records = [_loads(row[2]) for row in rows]
+    expanded = pd.DataFrame.from_records(records, columns=feature_columns)
+    if len(expanded.columns):
+        expanded = expanded.apply(pd.to_numeric, errors="coerce").astype(np.float32, copy=False)
+    base = pd.DataFrame({
+        "token_key": [str(row[0]) for row in rows],
+        "snapshot_at": pd.to_datetime([row[1] for row in rows], format="ISO8601", utc=True),
+    })
+    return pd.concat([base, expanded], axis=1, copy=False)
+
+
+def _iter_sequence_raw_by_token(
+    source: SequenceFingerprintSource,
+    keys: pd.DataFrame,
+) -> Iterable[pd.DataFrame]:
+    """Yield one token at a time, never a full cache of decoded JSON objects."""
+    wanted = _sequence_keys(keys)
+    if wanted.empty:
+        return
+    if isinstance(source, pd.DataFrame):
+        for token, token_keys in wanted.groupby("token_key", sort=False):
+            raw = token_keys.merge(source, on=["token_key", "snapshot_at"], how="left")
+            raw["token_key"] = str(token)
+            yield raw.sort_values("snapshot_at").reset_index(drop=True)
+        return
+
+    table = f"_v24_sequence_keys_{uuid.uuid4().hex}"
+    quoted = '"' + table.replace('"', '""') + '"'
+    source.conn.execute(
+        f"CREATE TEMP TABLE {quoted}(token_key TEXT NOT NULL,snapshot_at TEXT NOT NULL,"
+        "PRIMARY KEY(token_key,snapshot_at)) WITHOUT ROWID"
+    )
+    try:
+        source.conn.executemany(
+            f"INSERT OR IGNORE INTO {quoted}(token_key,snapshot_at) VALUES(?,?)",
+            ((str(r.token_key), _iso(r.snapshot_at)) for r in wanted.itertuples(index=False)),
+        )
+        cursor = source.conn.execute(
+            f"SELECT k.token_key,k.snapshot_at,c.fingerprint_json FROM {quoted} k "
+            f"LEFT JOIN {SEQUENCE_CACHE_TABLE} c "
+            "ON c.token_key=k.token_key AND c.snapshot_at=k.snapshot_at "
+            "ORDER BY k.token_key,k.snapshot_at"
+        )
+        current_token: str | None = None
+        token_rows: list[tuple[Any, Any, Any]] = []
+        for row in cursor:
+            token = str(row[0])
+            if current_token is not None and token != current_token:
+                yield _raw_sequence_frame(token_rows, source.feature_columns)
+                token_rows = []
+            current_token = token
+            token_rows.append((row[0], row[1], row[2]))
+        if token_rows:
+            yield _raw_sequence_frame(token_rows, source.feature_columns)
+    finally:
+        source.conn.execute(f"DROP TABLE IF EXISTS {quoted}")
+
+
+def _sequence_raw_for_keys(
+    source: SequenceFingerprintSource,
+    keys: pd.DataFrame,
+) -> pd.DataFrame:
+    parts = list(_iter_sequence_raw_by_token(source, keys))
+    if not parts:
+        return pd.DataFrame(columns=["token_key", "snapshot_at"])
+    return pd.concat(parts, ignore_index=True, copy=False)
 
 
 def _token_balanced_rows(df:pd.DataFrame,max_per_token:int) -> pd.DataFrame:
@@ -1056,6 +1197,41 @@ def _token_balanced_rows(df:pd.DataFrame,max_per_token:int) -> pd.DataFrame:
             idx=np.unique(np.linspace(0,len(g)-1,max_per_token).round().astype(int)); g=g.iloc[idx]
         parts.append(g)
     return pd.concat(parts,ignore_index=True) if parts else df.iloc[0:0].copy()
+
+
+def _bounded_model_training_rows(frame: pd.DataFrame, cfg: V24Config) -> pd.DataFrame:
+    """Deterministically cap correlated minute rows without dropping any token."""
+    if frame.empty:
+        return frame.copy()
+    groups = [(str(token), g.sort_values("snapshot_at")) for token, g in frame.groupby(frame.token_key.astype(str), sort=True)]
+    caps = {token: min(len(g), max(1, int(cfg.model_max_rows_per_token))) for token, g in groups}
+    budget = max(int(cfg.model_max_training_rows), len(groups))
+    if sum(caps.values()) <= budget:
+        quotas = caps
+    else:
+        low, high = 1, max(caps.values())
+        while low < high:
+            mid = (low + high + 1) // 2
+            if sum(min(cap, mid) for cap in caps.values()) <= budget:
+                low = mid
+            else:
+                high = mid - 1
+        quotas = {token: min(cap, low) for token, cap in caps.items()}
+        remaining = budget - sum(quotas.values())
+        for token in sorted(quotas):
+            if remaining <= 0:
+                break
+            if quotas[token] < caps[token]:
+                quotas[token] += 1
+                remaining -= 1
+    pieces = []
+    for token, group in groups:
+        quota = int(quotas[token])
+        if len(group) > quota:
+            index = np.unique(np.linspace(0, len(group) - 1, quota).round().astype(int))
+            group = group.iloc[index]
+        pieces.append(group)
+    return pd.concat(pieces, ignore_index=True) if pieces else frame.iloc[0:0].copy()
 
 
 def fit_sequence_encoder(train_raw:pd.DataFrame,cfg:V24Config) -> dict[str,Any]:
@@ -1076,6 +1252,18 @@ def apply_sequence_encoder(raw:pd.DataFrame,encoder:dict[str,Any]) -> pd.DataFra
     X=numeric.fillna(encoder.get("impute",{})).fillna(0.0).to_numpy(dtype=float); Z=encoder["scaler"].transform(X); emb=encoder["pca"].transform(Z)
     for j in range(emb.shape[1]): out[f"seqenc__{j:02d}"]=emb[:,j]
     return out
+
+
+def _fit_sequence_encoder_from_source(
+    source: SequenceFingerprintSource,
+    frame: pd.DataFrame,
+    cfg: V24Config,
+) -> dict[str, Any]:
+    keys = _token_balanced_rows(
+        _sequence_keys(frame),
+        max(1, int(cfg.sequence_balance_rows_per_token)),
+    )
+    return fit_sequence_encoder(_sequence_raw_for_keys(source, keys), cfg)
 
 
 
@@ -1165,12 +1353,20 @@ def fit_ts2vec_style_encoder(train_raw:pd.DataFrame,cfg:V24Config,*,allow_small:
     return {'kind':'ts2vec_style_causal','columns':cols,'impute':impute,'scaler':scaler,'pre_pca':pre,'in_dim':pre_dim,'out_dim':out_dim,'state':_torch_state_to_numpy(model),'training_tokens':len(sequences),'training_rows':len(balanced)}
 
 
-def apply_ts2vec_style_encoder(raw:pd.DataFrame,encoder:dict[str,Any]|None)->pd.DataFrame:
+def apply_ts2vec_style_encoder(
+    raw: pd.DataFrame,
+    encoder: dict[str, Any] | None,
+    *,
+    model: Any | None = None,
+) -> pd.DataFrame:
     out=raw[['token_key','snapshot_at']].copy()
     if not encoder or torch is None: return out
     cols=encoder['columns']; num=raw.reindex(columns=cols).replace([np.inf,-np.inf],np.nan).apply(pd.to_numeric,errors='coerce')
     X=num.fillna(encoder.get('impute',{})).fillna(0.0).to_numpy(dtype=np.float32); Z=encoder['scaler'].transform(X).astype(np.float32); P=encoder['pre_pca'].transform(Z).astype(np.float32)
-    model=_CausalConvEncoder(int(encoder['in_dim']),int(encoder['out_dim'])); _torch_state_from_numpy(model,encoder['state']); model.eval()
+    if model is None:
+        model=_CausalConvEncoder(int(encoder['in_dim']),int(encoder['out_dim']))
+        _torch_state_from_numpy(model,encoder['state'])
+        model.eval()
     emb=np.full((len(raw),int(encoder['out_dim'])),np.nan,dtype=np.float32)
     work=raw[['token_key','snapshot_at']].copy(); work['__idx']=np.arange(len(raw))
     with torch.no_grad():
@@ -1179,20 +1375,77 @@ def apply_ts2vec_style_encoder(raw:pd.DataFrame,encoder:dict[str,Any]|None)->pd.
     for j in range(emb.shape[1]): out[f'ts2enc__{j:02d}']=emb[:,j]
     return out
 
+
+def _fit_ts2vec_from_source(
+    source: SequenceFingerprintSource,
+    frame: pd.DataFrame,
+    cfg: V24Config,
+    *,
+    allow_small: bool,
+) -> dict[str, Any] | None:
+    keys = _token_balanced_rows(
+        _sequence_keys(frame),
+        max(int(cfg.sequence_balance_rows_per_token) * 4, 48),
+    )
+    return fit_ts2vec_style_encoder(
+        _sequence_raw_for_keys(source, keys), cfg, allow_small=allow_small
+    )
+
+
+def _encode_sequence_keys(
+    source: SequenceFingerprintSource,
+    keys: pd.DataFrame,
+    encoder: dict[str, Any],
+    sequence_challenger: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Decode and transform one token at a time, retaining only compact embeddings."""
+    parts: list[pd.DataFrame] = []
+    challenger_model = None
+    if sequence_challenger and torch is not None:
+        challenger_model = _CausalConvEncoder(
+            int(sequence_challenger['in_dim']), int(sequence_challenger['out_dim'])
+        )
+        _torch_state_from_numpy(challenger_model, sequence_challenger['state'])
+        challenger_model.eval()
+    for raw in _iter_sequence_raw_by_token(source, keys):
+        encoded = apply_sequence_encoder(raw, encoder)
+        if sequence_challenger:
+            challenger = apply_ts2vec_style_encoder(
+                raw, sequence_challenger, model=challenger_model
+            )
+            extra = [c for c in challenger.columns if c.startswith("ts2enc__")]
+            if extra:
+                encoded = pd.concat(
+                    [encoded.reset_index(drop=True), challenger[extra].reset_index(drop=True)],
+                    axis=1,
+                    copy=False,
+                )
+        parts.append(encoded)
+    if not parts:
+        return pd.DataFrame(columns=["token_key", "snapshot_at"])
+    return pd.concat(parts, ignore_index=True, copy=False)
+
 # ---------------------------------------------------------------------------
 # Leakage-safe training frame and CPCV
 # ---------------------------------------------------------------------------
 
-def load_v24_frame(conn: sqlite3.Connection, cfg: V24Config) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+def load_v24_frame(
+    conn: sqlite3.Connection,
+    cfg: V24Config,
+) -> tuple[pd.DataFrame, SequenceFingerprintSource, dict[str, Any]]:
     migrate(conn)
-    obs, _ = peak.load_observations(conn)
+    obs, obs_source = peak.load_observations(conn)
     refresh_capture_heartbeats(conn, obs)
     refresh_data_vintage(conn, obs)
-    refresh_lifetimes(conn, cfg)
+    refresh_lifetimes(conn, cfg, observations=obs)
     refresh_calendar_cohorts(conn, cfg)
     refresh_policy_cohorts(conn, cfg)
     refresh_token_assignments(conn, cfg)
-    frame, feature_source, obs_source = peak.load_training_frame(conn)
+    frame, feature_source, obs_source = peak.load_training_frame(
+        conn,
+        observations=obs,
+        observation_source=obs_source,
+    )
     frame = _attach_calendar_and_lifetime(conn, frame)
     vint=pd.read_sql_query(f"SELECT token_key,event_time,first_ingested_at,last_corrected_at,value_version,ingestion_provenance FROM {DATA_VINTAGE_TABLE}",conn)
     if not vint.empty:
@@ -1560,7 +1813,18 @@ def _threshold_tag(x: float) -> str:
 
 def add_barrier_targets(conn: sqlite3.Connection,frame: pd.DataFrame,cfg: V24Config,*,as_of: pd.Timestamp | None=None) -> pd.DataFrame:
     """Future upside barriers using only observations available at ``as_of``."""
-    out=frame.copy(); obs,_=peak.load_observations(conn)
+    out=frame.copy()
+    source=peak.discover_observation_source(conn)
+    table='"'+source["table"].replace('"','""')+'"'
+    selected=[source["token"],source["time"],source["mc"]]
+    quoted=", ".join('"'+c.replace('"','""')+'"' for c in selected)
+    obs=pd.read_sql_query(f"SELECT {quoted} FROM {table}",conn).rename(columns={
+        source["token"]:"token_key",source["time"]:"snapshot_at",source["mc"]:"market_cap_usd",
+    })
+    obs["snapshot_at"]=pd.to_datetime(obs.snapshot_at,format="ISO8601",utc=True)
+    obs["market_cap_usd"]=pd.to_numeric(obs.market_cap_usd,errors="coerce")
+    obs=obs.dropna(subset=["token_key","snapshot_at","market_cap_usd"])
+    obs=obs[obs.market_cap_usd>0].drop_duplicates(["token_key","snapshot_at"],keep="last")
     asof=_utc(as_of) if as_of is not None else None; asof_ns=int(asof.value) if asof is not None else None
     for thr in cfg.upside_thresholds:
         for h in cfg.probability_horizons_minutes: out[f"hit_plus{_threshold_tag(thr)}_by_{h}m"]=np.nan
@@ -1678,12 +1942,13 @@ def _binary_components(n_estimators: int) -> list[tuple[str,Any]]:
 
 
 def _fit_binary_head(data: pd.DataFrame, features: list[str], target: str, n_estimators: int) -> dict[str,Any] | None:
-    d=data.copy(); d[target]=pd.to_numeric(d[target],errors="coerce"); d=d[d[target].isin([0,1])].copy()
+    d=data[["token_key",*features,target]].copy(); d[target]=pd.to_numeric(d[target],errors="coerce"); d=d[d[target].isin([0,1])].copy()
     if len(d)<20 or d[target].nunique()<2: return None
     X=d[features].replace([np.inf,-np.inf],np.nan); y=d[target].astype(int).to_numpy(); w=_token_weights(d.token_key)
     fitted=[]
     for name,m in _binary_components(n_estimators):
         try: m.fit(X,y,sample_weight=w); fitted.append((name,m))
+        except MemoryError: raise
         except Exception: continue
     return {"features":features,"target":target,"models":fitted} if fitted else None
 
@@ -1692,6 +1957,7 @@ def _predict_binary_head(head: dict[str,Any], frame: pd.DataFrame) -> np.ndarray
     X=frame.reindex(columns=head["features"]).replace([np.inf,-np.inf],np.nan); ps=[]
     for _,m in head.get("models",[]):
         try: ps.append(np.asarray(m.predict_proba(X)[:,1],dtype=float))
+        except MemoryError: raise
         except Exception: continue
     return np.mean(ps,axis=0) if ps else np.full(len(frame),np.nan)
 
@@ -1705,7 +1971,7 @@ def _fit_blended_regression(
     quantile: float | None = None,
     poisson: bool = False,
 ) -> dict[str, Any] | None:
-    d = data.copy()
+    d = data[["token_key", *features, target]].copy()
     d[target] = pd.to_numeric(d[target], errors="coerce")
     d = d[d[target].notna() & np.isfinite(d[target])].copy()
     if len(d) < 15:
@@ -1718,6 +1984,8 @@ def _fit_blended_regression(
         try:
             model.fit(X, y, sample_weight=w)
             fitted.append((name, model))
+        except MemoryError:
+            raise
         except Exception:
             continue
     if not fitted:
@@ -1731,6 +1999,8 @@ def _predict_blended(head: dict[str, Any], frame: pd.DataFrame) -> np.ndarray:
     for _, m in head.get("models", []):
         try:
             preds.append(np.asarray(m.predict(X), dtype=float))
+        except MemoryError:
+            raise
         except Exception:
             continue
     return np.mean(preds, axis=0) if preds else np.full(len(frame), np.nan)
@@ -1770,6 +2040,8 @@ def _fit_hazard_model(
         try:
             model.fit(X, y, sample_weight=w)
             fitted.append((name, model))
+        except MemoryError:
+            raise
         except Exception:
             continue
     if not fitted:
@@ -1784,8 +2056,9 @@ def _predict_hazard_probs(hazard: dict[str, Any], frame: pd.DataFrame) -> dict[s
     cif_peak = np.zeros(n, dtype=float)
     cif_death = np.zeros(n, dtype=float)
     by_bin: dict[str, np.ndarray] = {}
+    base_features = [c for c in hazard["features"] if not c.startswith("hazard__")]
     for bidx, bend in enumerate(bins):
-        x = frame.copy()
+        x = frame.reindex(columns=base_features).copy()
         x["hazard__bin_index"] = float(bidx)
         x["hazard__log_end"] = math.log1p(bend)
         X = x.reindex(columns=hazard["features"]).replace([np.inf, -np.inf], np.nan)
@@ -1799,6 +2072,8 @@ def _predict_hazard_probs(hazard: dict[str, Any], frame: pd.DataFrame) -> dict[s
                     if int(cls) in (0, 1, 2):
                         full[:, int(cls)] = p[:, j]
                 components.append(full)
+            except MemoryError:
+                raise
             except Exception:
                 continue
         if not components:
@@ -1854,6 +2129,7 @@ def _hazard_person_period_logloss(hazard: dict[str,Any], frame: pd.DataFrame, su
                 p=np.asarray(m.predict_proba(X),dtype=float); full=np.zeros((len(g),3))
                 for j,cls in enumerate(m.classes_): full[:,int(cls)]=p[:,j]
                 comps.append(full)
+            except MemoryError: raise
             except Exception: continue
         if comps:
             pp=np.mean(comps,axis=0); pp=np.clip(pp,1e-7,None); pp/=pp.sum(axis=1,keepdims=True)
@@ -1862,14 +2138,17 @@ def _hazard_person_period_logloss(hazard: dict[str,Any], frame: pd.DataFrame, su
     return float(log_loss(np.asarray(ys),np.vstack(probs),labels=[0,1,2]))
 
 
-def run_cpcv_diagnostics(conn: sqlite3.Connection, train: pd.DataFrame, seqraw: pd.DataFrame, cfg: V24Config, allow_small: bool) -> dict[str,Any]:
+def run_cpcv_diagnostics(conn: sqlite3.Connection, train: pd.DataFrame, seqraw: SequenceFingerprintSource, cfg: V24Config, allow_small: bool) -> dict[str,Any]:
     folds=[]
     for split in purged_cpcv_splits(train,cfg):
         tr=train.iloc[split["train_idx"]].copy(); te=train.iloc[split["test_idx"]].copy()
         if len(tr)<(25 if allow_small else 120) or len(te)<5: continue
-        tr_raw=tr[["token_key","snapshot_at"]].merge(seqraw,on=["token_key","snapshot_at"],how="left")
-        encoder=fit_sequence_encoder(tr_raw,cfg)
-        enc=apply_sequence_encoder(seqraw,encoder)
+        encoder=_fit_sequence_encoder_from_source(seqraw,tr,cfg)
+        fold_keys=pd.concat(
+            [tr[["token_key","snapshot_at"]],te[["token_key","snapshot_at"]]],
+            ignore_index=True,
+        ).drop_duplicates(["token_key","snapshot_at"])
+        enc=_encode_sequence_keys(seqraw,fold_keys,encoder)
         trm=add_barrier_targets(conn,add_recurrent_targets(conn,tr.merge(enc,on=["token_key","snapshot_at"],how="left"),cfg),cfg)
         tem=add_barrier_targets(conn,add_recurrent_targets(conn,te.merge(enc,on=["token_key","snapshot_at"],how="left"),cfg),cfg)
         features=_safe_feature_columns(trm)
@@ -1879,6 +2158,8 @@ def run_cpcv_diagnostics(conn: sqlite3.Connection, train: pd.DataFrame, seqraw: 
         try:
             hazard=_fit_hazard_model(trm,build_survival_person_period(trm,cfg),features,max(15,cfg.small_estimators if allow_small else 100))
             score=_hazard_person_period_logloss(hazard,tem,build_survival_person_period(tem,cfg))
+        except MemoryError:
+            raise
         except Exception:
             score=None
         folds.append({"fold_id":split["fold_id"],"test_blocks":split["test_blocks"],"train_rows":len(tr),"test_rows":len(te),"train_tokens":tr.token_key.nunique(),"test_tokens":te.token_key.nunique(),"hazard_logloss":score})
@@ -1898,18 +2179,24 @@ def _fit_isotonic_from_samples(samples:dict[str,list[tuple[float,float,str]]])->
         w=_token_weights(tok)
         try:
             iso=IsotonicRegression(increasing=True,out_of_bounds='clip'); iso.fit(p,y,sample_weight=w); out[key]=iso
+        except MemoryError: raise
         except Exception: continue
     return out
 
 
-def fit_cpcv_calibrators(conn:sqlite3.Connection,train:pd.DataFrame,seqraw:pd.DataFrame,cfg:V24Config,allow_small:bool)->dict[str,Any]:
+def fit_cpcv_calibrators(conn:sqlite3.Connection,train:pd.DataFrame,seqraw:SequenceFingerprintSource,cfg:V24Config,allow_small:bool)->dict[str,Any]:
     """Fit probability calibrators only from purged out-of-fold predictions."""
     samples:dict[str,list[tuple[float,float,str]]]={}
     splits=purged_cpcv_splits(train,cfg)
     for split in splits[:(3 if allow_small else len(splits))]:
         tr=train.iloc[split['train_idx']].copy(); te=train.iloc[split['test_idx']].copy()
         if len(tr)<(25 if allow_small else 120) or len(te)<5: continue
-        tr_raw=tr[['token_key','snapshot_at']].merge(seqraw,on=['token_key','snapshot_at'],how='left'); enc=fit_sequence_encoder(tr_raw,cfg); allenc=apply_sequence_encoder(seqraw,enc)
+        enc=_fit_sequence_encoder_from_source(seqraw,tr,cfg)
+        fold_keys=pd.concat(
+            [tr[['token_key','snapshot_at']],te[['token_key','snapshot_at']]],
+            ignore_index=True,
+        ).drop_duplicates(['token_key','snapshot_at'])
+        allenc=_encode_sequence_keys(seqraw,fold_keys,enc)
         trm=tr.merge(allenc,on=['token_key','snapshot_at'],how='left'); tem=te.merge(allenc,on=['token_key','snapshot_at'],how='left')
         trm=add_barrier_targets(conn,add_recurrent_targets(conn,trm,cfg),cfg); tem=add_barrier_targets(conn,add_recurrent_targets(conn,tem,cfg),cfg)
         feats=_safe_feature_columns(trm)
@@ -1926,6 +2213,7 @@ def fit_cpcv_calibrators(conn:sqlite3.Connection,train:pd.DataFrame,seqraw:pd.Da
                         key=f'{name}{int(h)}m'
                         if key in hp:
                             y=float(event==kind and event_min<=h); samples.setdefault(key,[]).append((float(hp[key][j]),y,str(r.token_key)))
+        except MemoryError: raise
         except Exception: pass
         jb=_fit_shared_binary_grid(trm,feats,_barrier_specs(cfg),n,'jointbarrier')
         for target,pred in _predict_shared_binary_grid(jb,tem).items() if jb else []:
@@ -2009,7 +2297,7 @@ def update_adaptive_calibration(conn:sqlite3.Connection,frame:pd.DataFrame,cfg:V
 def _prepare_model_frame(
     conn: sqlite3.Connection,
     frame: pd.DataFrame,
-    seqraw: pd.DataFrame,
+    seqraw: SequenceFingerprintSource,
     cfg: V24Config,
     *,
     encoder: dict[str, Any] | None = None,
@@ -2017,18 +2305,17 @@ def _prepare_model_frame(
     fit_encoder_on: pd.DataFrame | None = None,
     as_of: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    raw = seqraw.copy()
     if encoder is None:
         if fit_encoder_on is None:
             fit_encoder_on = frame
-        keys = fit_encoder_on[["token_key", "snapshot_at"]]
-        train_raw = keys.merge(raw, on=["token_key", "snapshot_at"], how="left")
-        encoder = fit_sequence_encoder(train_raw, cfg)
-    enc = apply_sequence_encoder(raw, encoder)
+        encoder = _fit_sequence_encoder_from_source(seqraw, fit_encoder_on, cfg)
+    enc = _encode_sequence_keys(
+        seqraw,
+        frame[["token_key", "snapshot_at"]],
+        encoder,
+        sequence_challenger=sequence_challenger,
+    )
     out = frame.merge(enc, on=["token_key", "snapshot_at"], how="left")
-    if sequence_challenger:
-        tsenc=apply_ts2vec_style_encoder(raw,sequence_challenger)
-        out=out.merge(tsenc,on=["token_key","snapshot_at"],how="left")
     out = add_recurrent_targets(conn, out, cfg, as_of=as_of)
     out = add_barrier_targets(conn, out, cfg, as_of=as_of)
     return out, encoder
@@ -2037,11 +2324,16 @@ def _prepare_model_frame(
 
 def _shared_grid_long(data: pd.DataFrame,features:list[str],specs:list[tuple[str,float,float]],prefix:str) -> tuple[pd.DataFrame,list[str]]:
     parts=[]
+    base=data[["token_key",*features]].copy()
+    if features:
+        base[features]=base[features].apply(pd.to_numeric,errors="coerce").astype(np.float32,copy=False)
     for target,a,b in specs:
         if target not in data.columns: continue
-        d=data.copy(); d["__y"]=pd.to_numeric(d[target],errors="coerce"); d=d[d["__y"].isin([0,1])].copy()
+        target_values=pd.to_numeric(data[target],errors="coerce")
+        valid=target_values.isin([0,1])
+        d=base.loc[valid].copy(); d["__y"]=target_values.loc[valid].astype(np.int8).to_numpy()
         if d.empty: continue
-        d[f"{prefix}__a"]=float(a); d[f"{prefix}__log_b"]=math.log1p(float(b)); d[f"{prefix}__a_log_b"]=float(a)*math.log1p(float(b)); d[f"{prefix}__target_name"]=target
+        d[f"{prefix}__a"]=np.float32(a); d[f"{prefix}__log_b"]=np.float32(math.log1p(float(b))); d[f"{prefix}__a_log_b"]=np.float32(float(a)*math.log1p(float(b)))
         parts.append(d)
     if not parts: return pd.DataFrame(),[]
     long=pd.concat(parts,ignore_index=True); meta=[f"{prefix}__a",f"{prefix}__log_b",f"{prefix}__a_log_b"]
@@ -2056,6 +2348,7 @@ def _fit_shared_binary_grid(data: pd.DataFrame,features:list[str],specs:list[tup
     fitted=[]
     for name,m in _binary_components(n_estimators):
         try: m.fit(X,y,sample_weight=w); fitted.append((name,m))
+        except MemoryError: raise
         except Exception: continue
     return {"features":all_features,"base_features":features,"specs":specs,"prefix":prefix,"models":fitted} if fitted else None
 
@@ -2064,10 +2357,11 @@ def _predict_shared_binary_grid(head:dict[str,Any],frame:pd.DataFrame) -> dict[s
     if not head: return {}
     out={}; prefix=head["prefix"]
     for target,a,b in head["specs"]:
-        x=frame.copy(); x[f"{prefix}__a"]=float(a); x[f"{prefix}__log_b"]=math.log1p(float(b)); x[f"{prefix}__a_log_b"]=float(a)*math.log1p(float(b))
+        x=frame.reindex(columns=head.get("base_features",[])).copy(); x[f"{prefix}__a"]=float(a); x[f"{prefix}__log_b"]=math.log1p(float(b)); x[f"{prefix}__a_log_b"]=float(a)*math.log1p(float(b))
         X=x.reindex(columns=head["features"]).replace([np.inf,-np.inf],np.nan); ps=[]
         for _,m in head.get("models",[]):
             try: ps.append(np.asarray(m.predict_proba(X)[:,1],dtype=float))
+            except MemoryError: raise
             except Exception: continue
         out[target]=np.mean(ps,axis=0) if ps else np.full(len(frame),np.nan)
     return out
@@ -2174,7 +2468,7 @@ def bundle_identity_hash(bundle:dict[str,Any])->str:
 def fit_batch_bundle(
     conn: sqlite3.Connection,
     frame: pd.DataFrame,
-    seqraw: pd.DataFrame,
+    seqraw: SequenceFingerprintSource,
     cutoff: pd.Timestamp,
     cfg: V24Config,
     *,
@@ -2182,11 +2476,13 @@ def fit_batch_bundle(
     generation: int = 1,
     exclude_tokens: set[str] | None = None,
 ) -> dict[str, Any]:
-    train = training_history_before(conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens)
-    if len(train) < (40 if allow_small else 200):
-        raise RuntimeError(f"Insufficient leakage-safe V24 training history: {len(train)} rows")
-    train_raw=train[["token_key","snapshot_at"]].merge(seqraw,on=["token_key","snapshot_at"],how="left")
-    sequence_challenger=fit_ts2vec_style_encoder(train_raw,cfg,allow_small=allow_small)
+    eligible_train = training_history_before(conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens)
+    if len(eligible_train) < (40 if allow_small else 200):
+        raise RuntimeError(f"Insufficient leakage-safe V24 training history: {len(eligible_train)} rows")
+    train = _bounded_model_training_rows(eligible_train, cfg)
+    sequence_challenger=_fit_ts2vec_from_source(
+        seqraw, train, cfg, allow_small=allow_small
+    )
     model_frame, encoder = _prepare_model_frame(conn, train, seqraw, cfg, fit_encoder_on=train, as_of=cutoff, sequence_challenger=sequence_challenger)
     features = _safe_feature_columns(model_frame)
     if not features:
@@ -2196,9 +2492,13 @@ def fit_batch_bundle(
     hazard = _fit_hazard_model(model_frame, survival, features, n_estimators)
 
     recurrent: dict[str,Any]={}
-    for h in (240,720,1440,4320):
+    recurrent_horizons=tuple(
+        int(h) for h in cfg.probability_horizons_minutes
+        if 240 <= int(h) <= int(cfg.horizon_minutes)
+    )
+    for h in recurrent_horizons:
         name=f"recurrent_peak_count_{h}m"
-        fit=_fit_blended_regression(model_frame,features,name,n_estimators,poisson=False)
+        fit=_fit_blended_regression(model_frame,features,name,n_estimators,poisson=True)
         if fit: recurrent[name]=fit
     for q in (0.25,0.50,0.75):
         fit=_fit_blended_regression(model_frame[model_frame.recurrent_next_gap_minutes.notna()],features,"recurrent_next_gap_minutes",n_estimators,quantile=q)
@@ -2218,6 +2518,8 @@ def fit_batch_bundle(
     cpcv = run_cpcv_diagnostics(conn, train, seqraw, cfg, allow_small)
     try:
         probability_calibrators=fit_cpcv_calibrators(conn,train,seqraw,cfg,allow_small)
+    except MemoryError:
+        raise
     except Exception:
         probability_calibrators={}
     feature_reference=_feature_reference(model_frame,features,cfg)
@@ -2245,7 +2547,13 @@ def fit_batch_bundle(
         "probability_calibrators": probability_calibrators,
         "liquidity_model": fit_liquidity_model(conn, cfg, allow_small=allow_small, cutoff=cutoff),
         "training_rows": int(len(model_frame)),
+        "eligible_training_rows": int(len(eligible_train)),
         "training_tokens": int(model_frame.token_key.nunique()),
+        "training_row_sampling": {
+            "method": "deterministic_even_lifecycle_token_balanced",
+            "max_rows": int(cfg.model_max_training_rows),
+            "max_rows_per_token": int(cfg.model_max_rows_per_token),
+        },
         "cpcv_diagnostics": cpcv,
     }
 
@@ -2261,7 +2569,7 @@ def fit_online_adapter(
     conn: sqlite3.Connection,
     champion: dict[str, Any],
     frame: pd.DataFrame,
-    seqraw: pd.DataFrame,
+    seqraw: SequenceFingerprintSource,
     cutoff: pd.Timestamp,
     cfg: V24Config,
     *,
@@ -2269,9 +2577,10 @@ def fit_online_adapter(
     exclude_tokens: set[str] | None = None,
 ) -> dict[str, Any]:
     stable_cutoff = _utc(champion["stable_training_cutoff"])
-    recent = _adapter_training_frame(conn, frame, cutoff, stable_cutoff, cfg, exclude_tokens=exclude_tokens)
-    if len(recent) < (20 if allow_small else 100):
-        raise RuntimeError(f"Insufficient recent rows for V24 online adapter: {len(recent)}")
+    eligible_recent = _adapter_training_frame(conn, frame, cutoff, stable_cutoff, cfg, exclude_tokens=exclude_tokens)
+    if len(eligible_recent) < (20 if allow_small else 100):
+        raise RuntimeError(f"Insufficient recent rows for V24 online adapter: {len(eligible_recent)}")
+    recent = _bounded_model_training_rows(eligible_recent, cfg)
     model_frame, _ = _prepare_model_frame(
         conn, recent, seqraw, cfg, encoder=champion["sequence_encoder"], sequence_challenger=champion.get("sequence_challenger"), as_of=cutoff
     )
@@ -2280,9 +2589,13 @@ def fit_online_adapter(
     survival = build_survival_person_period(model_frame, cfg, conn=conn, as_of=cutoff)
     hazard = _fit_hazard_model(model_frame, survival, features, n_estimators)
     recurrent: dict[str,Any]={}
-    for h in (240,720,1440,4320):
+    recurrent_horizons=tuple(
+        int(h) for h in cfg.probability_horizons_minutes
+        if 240 <= int(h) <= int(cfg.horizon_minutes)
+    )
+    for h in recurrent_horizons:
         name=f"recurrent_peak_count_{h}m"
-        fit=_fit_blended_regression(model_frame,features,name,n_estimators,poisson=False)
+        fit=_fit_blended_regression(model_frame,features,name,n_estimators,poisson=True)
         if fit: recurrent[name]=fit
     for q in (0.25,0.50,0.75):
         fit=_fit_blended_regression(model_frame[model_frame.recurrent_next_gap_minutes.notna()],features,"recurrent_next_gap_minutes",n_estimators,quantile=q)
@@ -2300,6 +2613,7 @@ def fit_online_adapter(
     adapter = {
         "created_at": _now_iso(), "adapter_created_at": _now_iso(), "training_start": recent.snapshot_at.min().isoformat(),
         "training_cutoff": _iso(cutoff), "rows": int(len(model_frame)),
+        "eligible_rows": int(len(eligible_recent)),
         "tokens": int(model_frame.token_key.nunique()), "weight": weight, "weights":weights,"drift_score":drift,
         "hazard": hazard, "recurrent": recurrent, "joint_barrier": joint_barrier,
         "marked_higher": marked_higher,
@@ -2355,7 +2669,7 @@ def predict_frame(
     conn: sqlite3.Connection,
     bundle: dict[str, Any],
     base_frame: pd.DataFrame,
-    seqraw: pd.DataFrame,
+    seqraw: SequenceFingerprintSource,
     cfg: V24Config,
 ) -> pd.DataFrame:
     model_frame, _ = _prepare_model_frame(
@@ -2424,18 +2738,18 @@ def predict_frame(
     return result
 
 
-def _current_feature_rows(conn: sqlite3.Connection, cfg: V24Config) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _current_feature_rows(conn: sqlite3.Connection, cfg: V24Config) -> tuple[pd.DataFrame, SequenceFingerprintSource]:
     frame, seqraw, _ = load_v24_frame(conn, cfg)
     latest = frame.snapshot_at.max()
-    return frame[frame.snapshot_at == latest].copy(), seqraw[seqraw.snapshot_at == latest].copy()
+    return frame[frame.snapshot_at == latest].copy(), seqraw
 
 
 def predict_current(db:str,model_path:str,out_path:str,cfg:V24Config)->pd.DataFrame:
     bundle=joblib.load(model_path)
     if bundle.get("schema_version")!=SCHEMA_VERSION: raise RuntimeError("V24 model schema mismatch")
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn); frame,seqraw,_=load_v24_frame(conn,cfg); update_adaptive_calibration(conn,frame,cfg)
-        latest=frame.snapshot_at.max(); current=frame[frame.snapshot_at==latest].copy(); current_seq=seqraw[seqraw.snapshot_at==latest].copy(); out=predict_frame(conn,bundle,current,current_seq,cfg)
+        latest=frame.snapshot_at.max(); current=frame[frame.snapshot_at==latest].copy(); out=predict_frame(conn,bundle,current,seqraw,cfg)
         out["v24_model_hash"]=_hash_file(model_path); out["v24_model_training_cutoff"]=_model_training_cutoff_from_bundle(bundle).isoformat(); Path(out_path).parent.mkdir(parents=True,exist_ok=True); out.to_csv(out_path,index=False); record_live_prediction_frame(conn,out,model_path,bundle,cfg); conn.commit()
     return out
 
@@ -2564,7 +2878,7 @@ def _required_promotion_components(cfg:V24Config)->list[str]:
     return comps
 
 
-def _token_promotion_losses(conn:sqlite3.Connection,bundle:dict[str,Any],frame:pd.DataFrame,seqraw:pd.DataFrame,cfg:V24Config)->pd.DataFrame:
+def _token_promotion_losses(conn:sqlite3.Connection,bundle:dict[str,Any],frame:pd.DataFrame,seqraw:SequenceFingerprintSource,cfg:V24Config)->pd.DataFrame:
     if frame.empty:return pd.DataFrame()
     model_frame,_=_prepare_model_frame(conn,frame,seqraw,cfg,encoder=bundle["sequence_encoder"],sequence_challenger=bundle.get("sequence_challenger"))
     truth=add_barrier_targets(conn,model_frame,cfg); pred=predict_frame(conn,bundle,frame,seqraw,cfg)
@@ -2594,7 +2908,7 @@ def _token_promotion_losses(conn:sqlite3.Connection,bundle:dict[str,Any],frame:p
     return d.groupby("token_key",as_index=False).mean(numeric_only=True)
 
 
-def evaluate_bundle(conn:sqlite3.Connection,bundle:dict[str,Any],frame:pd.DataFrame,seqraw:pd.DataFrame,cfg:V24Config)->dict[str,Any]:
+def evaluate_bundle(conn:sqlite3.Connection,bundle:dict[str,Any],frame:pd.DataFrame,seqraw:SequenceFingerprintSource,cfg:V24Config)->dict[str,Any]:
     losses=_token_promotion_losses(conn,bundle,frame,seqraw,cfg)
     if losses.empty:return {"available":False,"reason":"empty evaluation frame"}
     required=_required_promotion_components(cfg); missing=[c for c in required if c not in losses.columns or not np.isfinite(pd.to_numeric(losses[c],errors="coerce")).any()]
@@ -2653,7 +2967,7 @@ def _register_model(conn:sqlite3.Connection,path:str,bundle:dict[str,Any],status
 
 
 def bootstrap_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool = False) -> dict[str, Any]:
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory = sqlite3.Row
         peak_cfg = peak.PeakStructureConfig(
             horizon_minutes=cfg.horizon_minutes,
@@ -2670,8 +2984,7 @@ def bootstrap_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool
         eval_frame = _cohort_frame(frame, cohort)
         eval_tokens = set(eval_frame.token_key.astype(str))
         bundle = fit_batch_bundle(conn, frame, seqraw, cutoff, cfg, allow_small=allow_small, generation=1, exclude_tokens=eval_tokens)
-        eval_seq = seqraw.merge(eval_frame[["token_key", "snapshot_at"]], on=["token_key", "snapshot_at"], how="inner")
-        cand_eval = evaluate_bundle(conn, bundle, eval_frame, eval_seq, cfg)
+        cand_eval = evaluate_bundle(conn, bundle, eval_frame, seqraw, cfg)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         candidate = _save_bundle(bundle, model_root, f"challengers/v24_bootstrap_{stamp}.joblib")
         champion = Path(model_root) / "champion.joblib"
@@ -2709,7 +3022,7 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
         raise RuntimeError("V24 target-definition hash changed. Refusing warm adapter/promotion comparison; bootstrap a clean model generation.")
     if champion.get("execution_definition_hash") != current_execution_hash:
         raise RuntimeError("V24 execution-definition hash changed. Refusing warm adapter/promotion comparison; bootstrap a clean model generation.")
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory = sqlite3.Row
         peak_cfg = peak.PeakStructureConfig(
             horizon_minutes=cfg.horizon_minutes,
@@ -2745,9 +3058,8 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
             candidate_bundle["created_at"] = _now_iso()
             mode = "stable_plus_online_adapter"
 
-        eval_seq = seqraw.merge(eval_frame[["token_key", "snapshot_at"]], on=["token_key", "snapshot_at"], how="inner")
-        cand_eval = evaluate_bundle(conn, candidate_bundle, eval_frame, eval_seq, cfg)
-        champ_eval = evaluate_bundle(conn, champion, eval_frame, eval_seq, cfg)
+        cand_eval = evaluate_bundle(conn, candidate_bundle, eval_frame, seqraw, cfg)
+        champ_eval = evaluate_bundle(conn, champion, eval_frame, seqraw, cfg)
         promoted, reason = compare_promotion(cand_eval, champ_eval, cfg)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         candidate_path = _save_bundle(candidate_bundle, model_root, f"challengers/v24_{stamp}.joblib")
@@ -2791,7 +3103,7 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
 def crossfit_policy_predictions(db:str,cfg:V24Config,*,max_folds:int=5,allow_small:bool=False)->dict[str,Any]:
     """Strict rolling-origin OOS forecasts with historical data-vintage enforcement."""
     stored=folds_used=0
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory=sqlite3.Row; frame,seqraw,_=load_v24_frame(conn,cfg); assignments=_token_assignments(conn)
         # Only blocks whose token roles are presently development-eligible may be replayed.
         blocks=[]
@@ -2808,9 +3120,11 @@ def crossfit_policy_predictions(db:str,cfg:V24Config,*,max_folds:int=5,allow_sma
             if te.empty: continue
             try:
                 fold_bundle=fit_batch_bundle(conn,frame,seqraw,test_start,cfg,allow_small=allow_small,generation=0,exclude_tokens=test_tokens)
+            except MemoryError:
+                raise
             except Exception:
                 continue
-            pred=predict_frame(conn,fold_bundle,te,seqraw.merge(te[['token_key','snapshot_at']],on=['token_key','snapshot_at'],how='inner'),cfg); model_hash=bundle_identity_hash(fold_bundle); fold_id=f"rolling_oos_birthblock_{b:06d}"
+            pred=predict_frame(conn,fold_bundle,te,seqraw,cfg); model_hash=bundle_identity_hash(fold_bundle); fold_id=f"rolling_oos_birthblock_{b:06d}"
             for r in pred.to_dict('records'):
                 token=r.pop('token_key'); decision=r.pop('snapshot_at'); r['__target_definition_hash']=fold_bundle.get('target_definition_hash'); r['__feature_definition_hash']=fold_bundle.get('feature_definition_hash'); r['__execution_definition_hash']=fold_bundle.get('execution_definition_hash'); r['__data_vintage_hash']=fold_bundle.get('training_data_hash')
                 if record_prediction(conn,token,decision,decision,model_hash,_model_training_cutoff_from_bundle(fold_bundle),r,'crossfit',cfg,fold_id=fold_id): stored+=1
@@ -2850,6 +3164,8 @@ def _fit_distribution_head(rows: pd.DataFrame, target: str, cfg: V24Config, allo
             try:
                 m.fit(X, data[target].to_numpy(dtype=float), sample_weight=_token_weights(data.token_key))
                 fitted.append((name, m))
+            except MemoryError:
+                raise
             except Exception:
                 continue
         if fitted:
@@ -3075,7 +3391,7 @@ def doubly_robust_entry_ope(conn:sqlite3.Connection,bundle:dict[str,Any],cfg:V24
 
 
 def train_distributional_policy(db:str,policy_root:str,cfg:V24Config,*,allow_small:bool=False)->dict[str,Any]:
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory=sqlite3.Row; migrate(conn)
         from . import axiom_self_teach as selfteach
         selfteach.migrate(conn); refresh_counterfactual_policy_targets(conn,cfg); refresh_policy_cohorts(conn); refresh_token_assignments(conn)
@@ -3279,7 +3595,7 @@ def evaluate_sealed_audit_stream(conn: sqlite3.Connection, cfg: V24Config) -> di
 
 
 def status(db: str, cfg: V24Config) -> dict[str, Any]:
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory = sqlite3.Row
         migrate(conn)
         refresh_calendar_cohorts(conn, cfg)
@@ -3368,15 +3684,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.cmd == "status":
         out = status(args.db, cfg)
     elif args.cmd == "rebuild-sequence-cache":
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             obs,_=peak.load_observations(conn)
             out=refresh_sequence_fingerprint_cache(conn,obs,cfg,force=True)
     elif args.cmd == "audit-manifest":
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             refresh_calendar_cohorts(conn, cfg)
             out = audit_manifest(conn, cfg, reveal=args.reveal)
     elif args.cmd == "audit-evaluate":
-        with sqlite3.connect(args.db) as conn:
+        with closing(sqlite3.connect(args.db)) as conn, conn:
             refresh_calendar_cohorts(conn, cfg)
             out = evaluate_sealed_audit_stream(conn, cfg)
     else:  # pragma: no cover

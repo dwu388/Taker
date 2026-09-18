@@ -9,6 +9,7 @@ policy champions from crossing that target-definition boundary.
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 import datetime as _datetime
@@ -98,26 +99,6 @@ def fit_batch_bundle(
         generation=generation,
         exclude_tokens=exclude_tokens,
     )
-    train = _impl.training_history_before(
-        conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens
-    )
-    model_frame, _ = _impl._prepare_model_frame(
-        conn,
-        train,
-        seqraw,
-        cfg,
-        encoder=bundle["sequence_encoder"],
-        sequence_challenger=bundle.get("sequence_challenger"),
-        as_of=cutoff,
-    )
-    n_estimators = cfg.small_estimators if allow_small else cfg.stable_estimators
-    bundle["recurrent"] = _refit_recurrent_count_heads(
-        model_frame,
-        bundle["features"],
-        bundle.get("recurrent"),
-        n_estimators,
-        cfg,
-    )
     return bundle
 
 
@@ -148,33 +129,6 @@ def fit_online_adapter(
         allow_small=allow_small,
         exclude_tokens=exclude_tokens,
     )
-    stable_cutoff = _impl._utc(champion["stable_training_cutoff"])
-    recent = _impl.adapter_history_before(
-        conn,
-        frame,
-        cutoff,
-        stable_cutoff,
-        cfg,
-        exclude_tokens=exclude_tokens,
-    )
-    model_frame, _ = _impl._prepare_model_frame(
-        conn,
-        recent,
-        seqraw,
-        cfg,
-        encoder=champion["sequence_encoder"],
-        sequence_challenger=champion.get("sequence_challenger"),
-        as_of=cutoff,
-    )
-    n_estimators = max(30, cfg.adapter_estimators // (2 if allow_small else 1))
-    adapter["recurrent"] = _refit_recurrent_count_heads(
-        model_frame,
-        champion["features"],
-        adapter.get("recurrent"),
-        n_estimators,
-        cfg,
-    )
-    # The active outer 24h facade supplies horizon-aware head weights at call time.
     adapter["head_weights"] = _impl._derive_adapter_head_weights(adapter, cfg)
     return adapter
 
@@ -277,7 +231,7 @@ def train_distributional_policy(
     from a different target definition (notably the former 72h lifecycle) is never
     compared against or warm-promoted into the active generation.
     """
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory = sqlite3.Row
         migrate(conn)
         from . import axiom_self_teach as selfteach

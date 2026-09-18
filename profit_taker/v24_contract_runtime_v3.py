@@ -474,29 +474,19 @@ def _graduate_first_model_champion(
         )
         candidate_bundle["graduation_from_target_definition_hash"] = champion.get("target_definition_hash")
         candidate_bundle["graduation_contract"] = "first_model_to_full_v1"
-        full_eval_seq = full_seq.merge(
-            full_eval_frame[["token_key", "snapshot_at"]],
-            on=["token_key", "snapshot_at"],
-            how="inner",
-        )
         candidate_full_eval = v24.evaluate_bundle(
-            conn, candidate_bundle, full_eval_frame, full_eval_seq, full_cfg
+            conn, candidate_bundle, full_eval_frame, full_seq, full_cfg
         )
         candidate_losses = v24._token_promotion_losses(
-            conn, candidate_bundle, full_eval_frame, full_eval_seq, full_cfg
+            conn, candidate_bundle, full_eval_frame, full_seq, full_cfg
         )
 
         champion_eval_cfg = _first_model_evaluation_cfg(champion_cfg)
         _activate_recurrent_grid(champion_eval_cfg)
         champion_frame, champion_seq, _ = v24.load_v24_frame(conn, champion_eval_cfg)
         champion_eval_frame = v24._cohort_frame(champion_frame, cohort)
-        champion_eval_seq = champion_seq.merge(
-            champion_eval_frame[["token_key", "snapshot_at"]],
-            on=["token_key", "snapshot_at"],
-            how="inner",
-        )
         champion_losses = v24._token_promotion_losses(
-            conn, champion, champion_eval_frame, champion_eval_seq, champion_eval_cfg
+            conn, champion, champion_eval_frame, champion_seq, champion_eval_cfg
         )
         shared = _shared_graduation_components(champion_eval_cfg, full_cfg)
         candidate_shared_eval = _evaluation_from_component_losses(candidate_losses, shared)

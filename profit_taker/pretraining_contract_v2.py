@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from typing import Any, Sequence
 
 import pandas as pd
@@ -30,7 +31,7 @@ def refresh_pretraining_targets(db: str, cfg: PretrainingConfig | None = None) -
     # SQLite UNIQUE constraints treat NULLs as distinct. Economic-collapse rows
     # intentionally have no up/down barrier, so compact each decision to the newest
     # materialization after every refresh.
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         conn.execute(
             f"""DELETE FROM {TARGET_TABLE}
@@ -117,7 +118,7 @@ def training_readiness(db: str, cfg: PretrainingConfig | None = None) -> dict[st
     # Materialize current truth first, then start from the V1 token-balanced report.
     refresh_pretraining_targets(db, cfg)
     report = _base.training_readiness(db, cfg)
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         obs, _ = peak.load_observations(conn)
         latest = None if obs.empty else pd.to_datetime(obs.snapshot_at, utc=True).max()
@@ -168,7 +169,7 @@ def assert_training_ready(db: str, cfg: PretrainingConfig | None = None) -> dict
 def collection_audit(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
     cfg = cfg or PretrainingConfig()
     report = _base.collection_audit(db, cfg)
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         sessions = {}
         if _table_exists(conn, "collection_sessions"):
             for schema, n in conn.execute("SELECT collector_schema,COUNT(*) FROM collection_sessions GROUP BY collector_schema"):
@@ -216,7 +217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.cmd == "baselines": out = evaluate_baselines(args.db, cfg)
     elif args.cmd == "profile": out = first_model_profile(cfg)
     elif args.cmd == "enrich-friction":
-        with sqlite3.connect(args.db) as conn: out = enrich_counterfactual_friction(conn, cfg)
+        with closing(sqlite3.connect(args.db)) as conn, conn: out = enrich_counterfactual_friction(conn, cfg)
     else: raise RuntimeError(args.cmd)
     print(json.dumps(out, indent=2, default=str)); return 0
 

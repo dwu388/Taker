@@ -844,6 +844,8 @@ def _flatten_numeric_json(value: Any) -> dict[str, float]:
         return {}
     try:
         obj = json.loads(value) if isinstance(value, str) else value
+    except MemoryError:
+        raise
     except Exception:
         return {}
     if not isinstance(obj, dict):
@@ -879,23 +881,40 @@ def _load_existing_features(conn: sqlite3.Connection) -> pd.DataFrame | None:
     if not source:
         return None
     table = source["table"]
-    df = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
-    if df.empty:
-        return None
-    df = df.rename(columns={source["token"]: "token_key", source["time"]: "snapshot_at"})
-    df["snapshot_at"] = _to_timestamp(df["snapshot_at"])
-    base = df[["token_key", "snapshot_at"]].copy()
-
+    quote = lambda value: '"' + str(value).replace('"', '""') + '"'
     if "json" in source:
-        expanded = pd.DataFrame([_flatten_numeric_json(v) for v in df[source["json"]]])
-        expanded = expanded[[c for c in expanded.columns if _safe_feature_name(c)]]
-        return pd.concat([base.reset_index(drop=True), expanded.reset_index(drop=True)], axis=1)
+        selected = [source["token"], source["time"], source["json"]]
+        query = f"SELECT {','.join(quote(c) for c in selected)} FROM {quote(table)}"
+    else:
+        query = f"SELECT * FROM {quote(table)}"
 
-    numeric = df.select_dtypes(include=[np.number, "bool"]).copy()
-    keep = [c for c in numeric.columns if _safe_feature_name(c)]
-    if not keep:
+    parts: list[pd.DataFrame] = []
+    for df in pd.read_sql_query(query, conn, chunksize=2048):
+        if df.empty:
+            continue
+        df = df.rename(columns={source["token"]: "token_key", source["time"]: "snapshot_at"})
+        base = df[["token_key", "snapshot_at"]].copy()
+        base["snapshot_at"] = _to_timestamp(base["snapshot_at"])
+
+        if "json" in source:
+            expanded = pd.DataFrame.from_records(
+                [_flatten_numeric_json(v) for v in df[source["json"]]]
+            )
+            keep = [c for c in expanded.columns if _safe_feature_name(c)]
+            numeric = expanded.reindex(columns=keep)
+        else:
+            numeric = df.select_dtypes(include=[np.number, "bool"])
+            keep = [c for c in numeric.columns if _safe_feature_name(c)]
+            numeric = numeric.reindex(columns=keep)
+        if len(numeric.columns):
+            numeric = numeric.apply(pd.to_numeric, errors="coerce").astype(np.float32, copy=False)
+        parts.append(
+            pd.concat([base.reset_index(drop=True), numeric.reset_index(drop=True)], axis=1, copy=False)
+        )
+    if not parts:
         return None
-    return pd.concat([base.reset_index(drop=True), numeric[keep].reset_index(drop=True)], axis=1)
+    result = pd.concat(parts, ignore_index=True, sort=False, copy=False)
+    return result if len(result.columns) > 2 else None
 
 
 def _numeric_observation_columns(obs: pd.DataFrame) -> list[str]:
@@ -1056,20 +1075,24 @@ def refresh_feature_cache(conn: sqlite3.Connection, observations: pd.DataFrame, 
 
 def _load_cached_feature_frame(conn: sqlite3.Connection, current_at: pd.Timestamp | None = None) -> pd.DataFrame:
     if current_at is None:
-        df = pd.read_sql_query(
-            f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} ORDER BY snapshot_at", conn
-        )
+        query = f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} ORDER BY snapshot_at"
+        params = None
     else:
-        df = pd.read_sql_query(
-            f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} WHERE snapshot_at=?",
-            conn, params=(_utc_iso(current_at),),
-        )
-    if df.empty:
+        query = f"SELECT token_key,snapshot_at,features_json FROM {FEATURE_CACHE_TABLE} WHERE snapshot_at=?"
+        params = (_utc_iso(current_at),)
+    parts: list[pd.DataFrame] = []
+    for df in pd.read_sql_query(query, conn, params=params, chunksize=2048):
+        if df.empty:
+            continue
+        expanded = pd.DataFrame.from_records([_flatten_numeric_json(v) for v in df.features_json])
+        if len(expanded.columns):
+            expanded = expanded.apply(pd.to_numeric, errors="coerce").astype(np.float32, copy=False)
+        base = df[["token_key", "snapshot_at"]].copy()
+        base["snapshot_at"] = _to_timestamp(base["snapshot_at"])
+        parts.append(pd.concat([base.reset_index(drop=True), expanded.reset_index(drop=True)], axis=1, copy=False))
+    if not parts:
         return pd.DataFrame(columns=["token_key", "snapshot_at"])
-    expanded = pd.DataFrame([_flatten_numeric_json(v) for v in df.features_json])
-    base = df[["token_key", "snapshot_at"]].copy()
-    base["snapshot_at"] = _to_timestamp(base["snapshot_at"])
-    return pd.concat([base.reset_index(drop=True), expanded.reset_index(drop=True)], axis=1)
+    return pd.concat(parts, ignore_index=True, sort=False, copy=False)
 
 
 def build_feature_frame(conn: sqlite3.Connection, observations: pd.DataFrame) -> tuple[pd.DataFrame, str]:
@@ -1086,8 +1109,15 @@ def build_current_feature_frame(conn: sqlite3.Connection, observations: pd.DataF
     latest = observations.snapshot_at.max()
     return _load_cached_feature_frame(conn, current_at=latest), "v21_append_only_feature_cache_current"
 
-def load_training_frame(conn: sqlite3.Connection) -> tuple[pd.DataFrame, str, dict[str, str]]:
-    observations, obs_source = load_observations(conn)
+def load_training_frame(
+    conn: sqlite3.Connection,
+    observations: pd.DataFrame | None = None,
+    observation_source: dict[str, str] | None = None,
+) -> tuple[pd.DataFrame, str, dict[str, str]]:
+    if observations is None:
+        observations, obs_source = load_observations(conn)
+    else:
+        obs_source = observation_source or discover_observation_source(conn)
     features, feature_source = build_feature_frame(conn, observations)
     labels = pd.read_sql_query(f"SELECT * FROM {LABEL_TABLE}", conn)
     if labels.empty:
@@ -1860,4 +1890,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -245,6 +245,7 @@ def install(public, core, base, impl) -> None:
     def fit_batch_bundle(conn, frame, seqraw, cutoff, cfg, *, allow_small=False, generation=1, exclude_tokens=None):
         bundle = original_fit_batch_bundle(conn, frame, seqraw, cutoff, cfg, allow_small=allow_small, generation=generation, exclude_tokens=exclude_tokens)
         train = impl.training_history_before(conn, frame, cutoff, cfg, exclude_tokens=exclude_tokens)
+        train = impl._bounded_model_training_rows(train, cfg)
         model_frame, _ = impl._prepare_model_frame(conn, train, seqraw, cfg, encoder=bundle["sequence_encoder"], sequence_challenger=bundle.get("sequence_challenger"), as_of=cutoff)
         n_estimators = cfg.small_estimators if allow_small else cfg.stable_estimators
         bundle["recurrent"] = _fit_minute_timing_heads(impl, model_frame, bundle["features"], bundle.get("recurrent"), n_estimators)
@@ -260,6 +261,7 @@ def install(public, core, base, impl) -> None:
         adapter = original_fit_online_adapter(conn, champion, frame, seqraw, cutoff, cfg, allow_small=allow_small, exclude_tokens=exclude_tokens)
         stable_cutoff = impl._utc(champion["stable_training_cutoff"])
         recent = impl.adapter_history_before(conn, frame, cutoff, stable_cutoff, cfg, exclude_tokens=exclude_tokens)
+        recent = impl._bounded_model_training_rows(recent, cfg)
         model_frame, _ = impl._prepare_model_frame(conn, recent, seqraw, cfg, encoder=champion["sequence_encoder"], sequence_challenger=champion.get("sequence_challenger"), as_of=cutoff)
         n_estimators = max(30, cfg.adapter_estimators // (2 if allow_small else 1))
         adapter["recurrent"] = _fit_minute_timing_heads(impl, model_frame, champion["features"], adapter.get("recurrent"), n_estimators)
