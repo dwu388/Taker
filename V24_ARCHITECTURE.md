@@ -37,6 +37,19 @@ The causal sequence representation is re-centered on the shorter lifecycle, usin
 1h, 4h, 6h, 12h and 24h windows. The TS2Vec-style challenger, sequence-vintage
 controls, late-insert invalidation and PCA/stable representation machinery remain.
 
+Wide sequence fingerprints remain durable JSON in SQLite and are decoded one token
+at a time. Training retains only the compact PCA/TS2Vec embeddings in memory, so a
+mature one-minute cache is never duplicated into a full list of Python dictionaries
+and a second wide pandas frame. Encoder fitting uses deterministic, evenly spaced
+token-balanced rows.
+
+Estimator fitting is bounded to 50,000 leakage-safe development rows and at most 384
+evenly spaced rows per token by default. Every development token remains represented,
+first/last lifecycle coverage is retained whenever a token receives at least two
+rows, and token weights still equalize total contribution. This bound applies only
+to fitting and internal CPCV/calibration. One-use promotion and sealed-audit scoring
+remain unsampled and use every eligible evaluation row.
+
 ## Validation clocks
 
 - Calendar cohorts remain 24-hour UTC blocks.

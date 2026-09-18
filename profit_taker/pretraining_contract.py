@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -269,7 +270,7 @@ def _economic_collapse(g: pd.DataFrame, decision: pd.Timestamp, cfg: Pretraining
 
 def refresh_pretraining_targets(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
     cfg = cfg or PretrainingConfig()
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         obs, source = peak.load_observations(conn)
         if obs.empty:
@@ -397,7 +398,7 @@ def _terminal_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 def collection_audit(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
     cfg = cfg or PretrainingConfig()
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         obs, source = peak.load_observations(conn)
         if obs.empty:
@@ -461,7 +462,7 @@ def _barrier_cell_counts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def training_readiness(db: str, cfg: PretrainingConfig | None = None) -> dict[str, Any]:
     cfg = cfg or PretrainingConfig()
     refresh_pretraining_targets(db, cfg)
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         obs, _ = peak.load_observations(conn)
         obs["snapshot_at"] = pd.to_datetime(obs.snapshot_at, utc=True) if not obs.empty else pd.Series(dtype="datetime64[ns, UTC]")
@@ -543,7 +544,7 @@ def evaluate_baselines(db: str, cfg: PretrainingConfig | None = None) -> dict[st
     """
     cfg = cfg or PretrainingConfig()
     refresh_pretraining_targets(db, cfg)
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         t = pd.read_sql_query(
             f"""SELECT token_key,decision_at,outcome FROM {TARGET_TABLE}
@@ -641,7 +642,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.cmd=="baselines": out=evaluate_baselines(args.db,cfg)
     elif args.cmd=="profile": out=first_model_profile(cfg)
     elif args.cmd=="enrich-friction":
-        with sqlite3.connect(args.db) as conn: out=enrich_counterfactual_friction(conn,cfg)
+        with closing(sqlite3.connect(args.db)) as conn, conn: out=enrich_counterfactual_friction(conn,cfg)
     else: raise RuntimeError(args.cmd)
     print(json.dumps(out,indent=2,default=str)); return 0
 

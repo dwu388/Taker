@@ -34,6 +34,9 @@ backup, including committed WAL data; it does not alter the source database,
 consume promotion cohorts, evaluate sealed audits, or write model files. Ensure
 enough temporary disk space for the database and derived tables. Use
 `--temp-dir D:\TakerTemp` to choose an existing directory on another drive.
+Sequence fingerprints are validated/materialized in SQLite but are not expanded
+into one process-wide pandas table; the loader reports the durable cache row count
+and later decodes only token-scoped batches during fitting.
 `mature_promotion_available: false` means a bootstrap requirement is still missing.
 This check does not certify model dependencies, training sufficiency, or model
 quality. It does not run the pretraining barriers or baseline evaluation.

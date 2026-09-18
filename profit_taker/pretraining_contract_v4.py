@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from contextlib import closing
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -330,7 +331,7 @@ def _economic_collapse(
 
 def _capture_context(db: str, cfg: PretrainingConfig):
     try:
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn, conn:
             captures = tuple(_v1._capture_times(conn))
     except sqlite3.DatabaseError:
         captures = ()

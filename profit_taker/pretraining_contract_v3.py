@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from contextlib import closing
 from typing import Any
 
 from . import pretraining_contract_v2 as _compat
@@ -16,7 +17,7 @@ for _export_name in dir(_compat):
 
 
 def _dedupe_economic_collapse(db: str) -> int:
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn, conn:
         migrate(conn)
         conn.execute(
             f"""DELETE FROM {TARGET_TABLE}
