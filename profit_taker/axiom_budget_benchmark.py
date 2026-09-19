@@ -49,22 +49,13 @@ def _cycle_v24(
     policy_version = _policy_version(policy, policy_model) if policy_compatible else "bootstrap_pending_v24_policy_promotion"
     entry_fee_rate, exit_fee_rate = _entry_exit_rates(config)
 
-    if is_v24_forecast and v24 is not None:
-        try:
-            with sqlite3.connect(source_db) as src:
-                v24.migrate(src)
-                v24.record_capture_heartbeat(
-                    src, snapshot, valid_capture=True, row_count=len(current), source="benchmark_v24"
-                )
-        except Exception:
-            pass
-
     def terminal_absence(last_seen: pd.Timestamp) -> tuple[bool, float]:
         elapsed = max(0.0, (snapshot - last_seen).total_seconds() / 60.0)
         if is_v24_forecast and v24 is not None:
             try:
-                with sqlite3.connect(source_db) as src:
-                    v24.migrate(src)
+                with sqlite3.connect(source_db, timeout=10.0) as src:
+                    src.execute("PRAGMA busy_timeout=10000")
+                    src.execute("PRAGMA query_only=ON")
                     run_start, run_end, n = v24._contiguous_capture_absence(
                         src, last_seen, v24.V24Config(), upto=snapshot
                     )
@@ -79,8 +70,9 @@ def _cycle_v24(
                 return False, elapsed
         return elapsed >= config.missing_close_minutes, elapsed
 
-    with sqlite3.connect(benchmark_db) as conn:
+    with sqlite3.connect(benchmark_db, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
         migrate(conn)
         acct = _account(conn)
         if acct is None:
