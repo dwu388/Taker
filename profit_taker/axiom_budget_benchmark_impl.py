@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 
 try:
@@ -41,7 +42,22 @@ DEFAULT_POLICY_MODEL = "models/axiom_policy_v24/champion.joblib"
 class BenchmarkConfig:
     initial_cash_usd: float = 1000.0
     max_open_positions: int = 5
-    position_fraction: float = 0.20
+    # Compatibility alias for legacy benchmark models. V24 uses the conviction
+    # tiers below, and the legacy default now matches the ordinary 5% tier.
+    position_fraction: float = 0.05
+    ordinary_position_fraction: float = 0.05
+    strong_position_fraction: float = 0.075
+    exceptional_position_fraction: float = 0.10
+    max_total_exposure_fraction: float = 0.30
+    min_cash_reserve_fraction: float = 0.70
+    max_correlated_exposure_fraction: float = 0.15
+    strong_score_quantile: float = 0.75
+    exceptional_score_quantile: float = 0.95
+    conviction_calibration_min_scores: int = 40
+    conviction_calibration_max_scores: int = 5000
+    correlation_lookback_minutes: float = 240.0
+    correlation_min_overlap: int = 10
+    correlation_threshold: float = 0.80
     min_entry_score: float = 0.0
     min_hold_minutes: float = 2.0
     max_hold_minutes: float = 72.0 * 60.0
@@ -313,6 +329,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     for definition in (
         "entry_decision_at TEXT",
         "entry_fill_kind TEXT",
+        "conviction_tier TEXT",
+        "target_position_fraction REAL",
+        "risk_bucket TEXT",
         "pending_exit_at TEXT",
         "pending_exit_reason TEXT",
         "exit_kind TEXT",
@@ -338,6 +357,22 @@ def migrate(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, "benchmark_marks_v22", definition)
 
     for definition in (
+        "conviction_tier TEXT",
+        "target_position_fraction REAL",
+        "target_cash_usd REAL",
+        "risk_bucket TEXT",
+        "selection_reason TEXT",
+    ):
+        _ensure_column(conn, "benchmark_candidates_v22", definition)
+
+    for definition in (
+        "conviction_tier TEXT",
+        "target_position_fraction REAL",
+        "risk_bucket TEXT",
+    ):
+        _ensure_column(conn, "benchmark_pending_entries_v24", definition)
+
+    for definition in (
         "observed_equity_usd REAL",
         "execution_cash_usd REAL",
         "execution_open_value_usd REAL",
@@ -358,6 +393,7 @@ def _account(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def init_benchmark(db: str, config: BenchmarkConfig, *, reset: bool = False) -> dict[str, Any]:
+    _validate_munger_config(config)
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
@@ -409,6 +445,182 @@ def _config_from_saved_json(value: str) -> BenchmarkConfig:
     defaults = asdict(BenchmarkConfig())
     defaults.update({k: raw[k] for k in defaults if k in raw})
     return BenchmarkConfig(**defaults)
+
+
+def _validate_munger_config(config: BenchmarkConfig) -> None:
+    fractions = (
+        config.ordinary_position_fraction,
+        config.strong_position_fraction,
+        config.exceptional_position_fraction,
+    )
+    if not (0.0 < fractions[0] <= fractions[1] <= fractions[2] <= 0.10):
+        raise ValueError("V24 position tiers must be ordered, positive, and capped at 10%.")
+    if not (0.0 < config.max_correlated_exposure_fraction <= config.max_total_exposure_fraction <= 0.30):
+        raise ValueError("V24 correlated/total exposure caps must be positive and no more than 30%.")
+    if not (0.70 <= config.min_cash_reserve_fraction < 1.0):
+        raise ValueError("V24 cash reserve must be at least 70% of execution-conservative equity.")
+    if config.max_total_exposure_fraction + config.min_cash_reserve_fraction > 1.0 + 1e-12:
+        raise ValueError("V24 exposure cap and cash reserve cannot sum to more than 100%.")
+    if not (0.0 < config.strong_score_quantile < config.exceptional_score_quantile < 1.0):
+        raise ValueError("Conviction quantiles must satisfy 0 < strong < exceptional < 1.")
+    if config.conviction_calibration_min_scores < 1 or config.conviction_calibration_max_scores < 1:
+        raise ValueError("Conviction calibration sample limits must be positive.")
+    if not (0.0 <= config.correlation_threshold <= 1.0):
+        raise ValueError("Correlation threshold must be between 0 and 1.")
+    if config.correlation_min_overlap < 2 or config.correlation_lookback_minutes <= 0:
+        raise ValueError("Correlation lookback and overlap must be positive.")
+
+
+def _conviction_thresholds(
+    conn: sqlite3.Connection,
+    benchmark_id: str,
+    score_kind: str,
+    snapshot: pd.Timestamp,
+    config: BenchmarkConfig,
+) -> tuple[float, float] | None:
+    """Return causal score thresholds from decisions strictly before snapshot."""
+    rows = conn.execute(
+        """
+        SELECT entry_score FROM benchmark_candidates_v22
+        WHERE benchmark_id=? AND score_kind=? AND snapshot_at<? AND entry_score>?
+        ORDER BY snapshot_at DESC LIMIT ?
+        """,
+        (
+            benchmark_id,
+            score_kind,
+            snapshot.isoformat(),
+            float(config.min_entry_score),
+            int(config.conviction_calibration_max_scores),
+        ),
+    ).fetchall()
+    scores = pd.Series([float(r[0]) for r in rows if _finite_float(r[0]) is not None], dtype=float)
+    if len(scores) < int(config.conviction_calibration_min_scores):
+        return None
+    return (
+        float(scores.quantile(config.strong_score_quantile)),
+        float(scores.quantile(config.exceptional_score_quantile)),
+    )
+
+
+def _conviction_tier(score: float, thresholds: tuple[float, float] | None) -> str:
+    if thresholds is None:
+        return "ordinary"
+    strong, exceptional = thresholds
+    # Strict comparisons prevent tied/flat score histories from making every
+    # candidate exceptional merely because it equals a quantile boundary.
+    if score > exceptional:
+        return "exceptional"
+    if score > strong:
+        return "strong"
+    return "ordinary"
+
+
+def _tier_fraction(tier: str, config: BenchmarkConfig) -> float:
+    return {
+        "ordinary": float(config.ordinary_position_fraction),
+        "strong": float(config.strong_position_fraction),
+        "exceptional": float(config.exceptional_position_fraction),
+    }[tier]
+
+
+def _correlation_buckets(
+    source_db: str,
+    tokens: set[str],
+    snapshot: pd.Timestamp,
+    config: BenchmarkConfig,
+) -> dict[str, str]:
+    """Group only statistically obvious recent positive-return correlations.
+
+    Components are based solely on price observations available by the decision
+    timestamp. Tokens without enough paired returns remain separate buckets.
+    """
+    ordered = sorted(str(t) for t in tokens)
+    if len(ordered) < 2:
+        return {token: token for token in ordered}
+    start = snapshot - pd.Timedelta(minutes=float(config.correlation_lookback_minutes))
+    placeholders = ",".join("?" for _ in ordered)
+    sql = f"""
+        SELECT token_key,snapshot_at,market_cap_usd FROM axiom_observations
+        WHERE snapshot_at>=? AND snapshot_at<=? AND token_key IN ({placeholders})
+          AND market_cap_usd>0
+        ORDER BY snapshot_at
+    """
+    try:
+        with sqlite3.connect(source_db, timeout=10.0) as src:
+            src.execute("PRAGMA busy_timeout=10000")
+            src.execute("PRAGMA query_only=ON")
+            frame = pd.read_sql_query(sql, src, params=(start.isoformat(), snapshot.isoformat(), *ordered))
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        return {token: token for token in ordered}
+    if frame.empty:
+        return {token: token for token in ordered}
+    frame["snapshot_at"] = pd.to_datetime(frame["snapshot_at"], errors="coerce", utc=True)
+    frame["market_cap_usd"] = pd.to_numeric(frame["market_cap_usd"], errors="coerce")
+    frame = frame.dropna(subset=["snapshot_at", "market_cap_usd"])
+    if frame.empty:
+        return {token: token for token in ordered}
+    prices = frame.pivot_table(
+        index="snapshot_at", columns="token_key", values="market_cap_usd", aggfunc="last"
+    ).sort_index()
+    returns = np.log(prices.where(prices > 0)).diff()
+    corr = returns.corr(min_periods=int(config.correlation_min_overlap))
+    parent = {token: token for token in ordered}
+
+    def find(token: str) -> str:
+        while parent[token] != token:
+            parent[token] = parent[parent[token]]
+            token = parent[token]
+        return token
+
+    def union(left: str, right: str) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    for i, left in enumerate(ordered):
+        if left not in corr.index:
+            continue
+        for right in ordered[i + 1:]:
+            value = corr.at[left, right] if right in corr.columns else np.nan
+            if pd.notna(value) and float(value) >= float(config.correlation_threshold):
+                union(left, right)
+    return {token: find(token) for token in ordered}
+
+
+def _allocation_amount(
+    *,
+    target_cash: float,
+    available_cash: float,
+    current_cash: float,
+    execution_equity: float,
+    committed_total: float,
+    committed_bucket: float,
+    config: BenchmarkConfig,
+) -> float:
+    """Apply per-position, total, correlated, and reserve limits in dollars."""
+    equity = max(0.0, float(execution_equity))
+    reserve_headroom = max(
+        0.0,
+        float(current_cash) - float(config.min_cash_reserve_fraction) * equity,
+    )
+    total_headroom = max(
+        0.0,
+        float(config.max_total_exposure_fraction) * equity - float(committed_total),
+    )
+    bucket_headroom = max(
+        0.0,
+        float(config.max_correlated_exposure_fraction) * equity - float(committed_bucket),
+    )
+    return max(
+        0.0,
+        min(
+            float(target_cash),
+            float(available_cash),
+            reserve_headroom,
+            total_headroom,
+            bucket_headroom,
+        ),
+    )
 
 def _entry_exit_rates(config: BenchmarkConfig) -> tuple[float, float]:
     half = max(0.0, config.friction_bps_round_trip) / 20000.0
@@ -1331,7 +1543,19 @@ def status(db: str) -> dict[str, Any]:
             exec_eq = pd.to_numeric(eq["execution_equity_usd"], errors="coerce").dropna()
             execution_dd = _max_drawdown(exec_eq) if not exec_eq.empty else None
         friction_stress=friction_stress_curves_from_closed(closed,initial,(100.0,300.0,500.0,1000.0))
-        pending_count=int(conn.execute("SELECT COUNT(*) FROM benchmark_pending_entries_v24 WHERE benchmark_id=? AND status='pending'",(bid,)).fetchone()[0])
+        pending_row = conn.execute(
+            """SELECT COUNT(*),COALESCE(SUM(reserved_cash_usd),0)
+               FROM benchmark_pending_entries_v24 WHERE benchmark_id=? AND status='pending'""",
+            (bid,),
+        ).fetchone()
+        pending_count = int(pending_row[0])
+        pending_exposure = float(pending_row[1] or 0.0)
+        open_cost_exposure = (
+            float(pd.to_numeric(open_["entry_cash_spent_usd"], errors="coerce").fillna(0.0).sum())
+            if not open_.empty else 0.0
+        )
+        committed_exposure = open_cost_exposure + pending_exposure
+        committed_fraction = committed_exposure / execution_equity if execution_equity > 0 else None
 
         return {
             "initialized": True,
@@ -1379,6 +1603,18 @@ def status(db: str) -> dict[str, Any]:
             "effectiveness_total_return_pct": execution_equity / initial - 1.0,
             "open_positions": int(len(open_)),
             "pending_entry_orders": pending_count,
+            "munger_sizing": {
+                "ordinary_position_fraction": config.ordinary_position_fraction,
+                "strong_position_fraction": config.strong_position_fraction,
+                "exceptional_position_fraction": config.exceptional_position_fraction,
+                "max_total_exposure_fraction": config.max_total_exposure_fraction,
+                "max_correlated_exposure_fraction": config.max_correlated_exposure_fraction,
+                "min_cash_reserve_fraction": config.min_cash_reserve_fraction,
+                "open_cost_exposure_usd": open_cost_exposure,
+                "pending_reserved_exposure_usd": pending_exposure,
+                "committed_exposure_usd": committed_exposure,
+                "committed_exposure_fraction": committed_fraction,
+            },
             "friction_stress_fixed_trade_replay": friction_stress,
             "closed_trades": int(len(closed)),
             "disappearance_terminal_trades": disappearance_count,
@@ -1503,6 +1739,25 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--initial-cash-usd", type=float, default=d.initial_cash_usd)
     p.add_argument("--max-open-positions", type=int, default=d.max_open_positions)
     p.add_argument("--position-fraction", type=float, default=d.position_fraction)
+    p.add_argument("--ordinary-position-fraction", type=float, default=d.ordinary_position_fraction)
+    p.add_argument("--strong-position-fraction", type=float, default=d.strong_position_fraction)
+    p.add_argument("--exceptional-position-fraction", type=float, default=d.exceptional_position_fraction)
+    p.add_argument("--max-total-exposure-fraction", type=float, default=d.max_total_exposure_fraction)
+    p.add_argument("--min-cash-reserve-fraction", type=float, default=d.min_cash_reserve_fraction)
+    p.add_argument("--max-correlated-exposure-fraction", type=float, default=d.max_correlated_exposure_fraction)
+    p.add_argument("--strong-score-quantile", type=float, default=d.strong_score_quantile)
+    p.add_argument("--exceptional-score-quantile", type=float, default=d.exceptional_score_quantile)
+    p.add_argument(
+        "--conviction-calibration-min-scores", type=int,
+        default=d.conviction_calibration_min_scores,
+    )
+    p.add_argument(
+        "--conviction-calibration-max-scores", type=int,
+        default=d.conviction_calibration_max_scores,
+    )
+    p.add_argument("--correlation-lookback-minutes", type=float, default=d.correlation_lookback_minutes)
+    p.add_argument("--correlation-min-overlap", type=int, default=d.correlation_min_overlap)
+    p.add_argument("--correlation-threshold", type=float, default=d.correlation_threshold)
     p.add_argument("--min-entry-score", type=float, default=d.min_entry_score)
     p.add_argument("--min-hold-minutes", type=float, default=d.min_hold_minutes)
     p.add_argument("--max-hold-minutes", type=float, default=d.max_hold_minutes)

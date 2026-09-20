@@ -44,6 +44,13 @@ old 72h forecaster/policy champions are not warm-promoted into the new generatio
 - `profit_taker/axiom_v24.py`: 24h V24 forecaster/policy/audit implementation, with token-first holdouts, data vintage, sequence-cache invalidation and sealed prospective audit.
 - `profit_taker/axiom_budget_benchmark.py`: V24-aware isolated $1,000 paper benchmark.
 
+The V24 benchmark leaves the trained prediction and policy models unchanged and
+applies conviction only at execution: ordinary/strong/exceptional entries target
+5%/7.5%/10% of execution-conservative equity. Open positions plus pending orders
+are capped at 30%, at least 70% remains unreserved cash, and empirically highly
+correlated tokens share a 15% risk-bucket cap. Existing benchmark databases gain
+these defaults through the additive migration; no model retraining is required.
+
 V24 model outputs default to `models/axiom_v24`, policy artifacts to
 `models/axiom_policy_v24`, and predictions to `data/axiom_predictions_v24.csv`.
 

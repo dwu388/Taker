@@ -65,6 +65,10 @@ remain unsampled and use every eligible evaluation row.
 ## Execution and policy learning
 
 - Paper entries and exits execute on the next observable price after the decision, not the price that caused the decision.
+- The isolated $1,000 benchmark applies the frozen entry score through a Munger-style sizing layer; it does not retrain or alter the forecast or policy model. Positive ordinary scores receive 5% of execution-conservative equity, scores above the causal trailing 75th percentile receive 7.5%, and scores above the trailing 95th percentile receive 10%. Until 40 prior scores of the same score kind exist, qualifying entries remain at the ordinary 5% tier.
+- Open cost basis and pending reservations jointly count toward a 30% portfolio exposure ceiling, while at least 70% of execution-conservative equity remains unreserved cash. No position can exceed 10%.
+- Tokens with at least 10 paired recent returns and correlation of 0.80 or greater over the trailing four hours share one risk bucket capped at 15% of execution-conservative equity. These groupings use only observations available at decision time.
+- Exposure limits are checked both when an order is reserved and again at its next-observation fill. A stale legacy 20% pending order is therefore reduced to the current ordinary tier or cancelled if no safe capacity remains.
 - The policy has an independent one-use challenger/promotion system.
 - Candidate action propensities and counterfactual HOLD targets support doubly robust/off-policy evaluation rather than training entry/HOLD only from behavior-policy outcomes.
 - Forecast and policy promotion use paired token-level bootstrap evidence.

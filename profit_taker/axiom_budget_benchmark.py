@@ -79,6 +79,7 @@ def _cycle_v24(
             raise RuntimeError("Benchmark is not initialized. Run the init command first.")
         bid = str(acct["benchmark_id"])
         config = _config_from_saved_json(acct["config_json"])
+        _validate_munger_config(config)
         entry_fee_rate, exit_fee_rate = _entry_exit_rates(config)
         _backfill_closed_execution_columns(conn, bid, config)
         last_snapshot = _to_ts(acct["last_snapshot_at"]) if acct["last_snapshot_at"] else None
@@ -100,6 +101,35 @@ def _cycle_v24(
             "SELECT * FROM benchmark_pending_entries_v24 WHERE benchmark_id=? AND status='pending' ORDER BY decision_at",
             (bid,),
         ).fetchall()
+        pre_fill_positions = conn.execute(
+            "SELECT * FROM benchmark_positions_v22 WHERE benchmark_id=? AND status='open'",
+            (bid,),
+        ).fetchall()
+        fill_tokens = {str(p["token_key"]) for p in pre_fill_positions} | {
+            str(p["token_key"]) for p in pending
+        }
+        fill_buckets = _correlation_buckets(source_db, fill_tokens, snapshot, config)
+        fill_committed_total = sum(float(p["entry_cash_spent_usd"]) for p in pre_fill_positions)
+        fill_committed_by_bucket: dict[str, float] = {}
+        fill_open_value = 0.0
+        for pos in pre_fill_positions:
+            pos_token = str(pos["token_key"])
+            bucket = fill_buckets.get(pos_token, pos_token)
+            fill_committed_by_bucket[bucket] = (
+                fill_committed_by_bucket.get(bucket, 0.0) + float(pos["entry_cash_spent_usd"])
+            )
+            current_row = current_series.get(pos_token)
+            if current_row is not None:
+                fill_open_value += _liquidation_value(
+                    pos, float(current_row["market_cap_usd"]), exit_fee_rate
+                )
+            else:
+                fill_open_value += _liquidation_value(
+                    pos,
+                    _execution_proxy_mc(pos, float(pos["last_mc"]), config, unavailable=True),
+                    exit_fee_rate,
+                )
+        fill_effect_equity = execution_cash + fill_open_value
         for pen in pending:
             if snapshot <= _to_ts(pen["decision_at"]):
                 continue
@@ -114,10 +144,36 @@ def _cycle_v24(
                     )
                     cancelled.append({"token_key": token, "missing_minutes": mins})
                 continue
-            reserved = min(float(pen["reserved_cash_usd"]), cash, execution_cash)
+            other_reserved = float(conn.execute(
+                """
+                SELECT COALESCE(SUM(reserved_cash_usd),0)
+                FROM benchmark_pending_entries_v24
+                WHERE benchmark_id=? AND status='pending' AND pending_id<>?
+                """,
+                (bid, pen["pending_id"]),
+            ).fetchone()[0] or 0.0)
+            tier = str(pen["conviction_tier"] or "ordinary")
+            target_fraction = _finite_float(pen["target_position_fraction"])
+            if target_fraction is None:
+                target_fraction = _tier_fraction(tier, config)
+            target_fraction = min(float(target_fraction), config.exceptional_position_fraction)
+            bucket = fill_buckets.get(token, str(pen["risk_bucket"] or token))
+            spendable_cash = max(0.0, min(cash, execution_cash) - other_reserved)
+            reserved = _allocation_amount(
+                target_cash=min(
+                    float(pen["reserved_cash_usd"]),
+                    fill_effect_equity * target_fraction,
+                ),
+                available_cash=spendable_cash,
+                current_cash=spendable_cash,
+                execution_equity=fill_effect_equity,
+                committed_total=fill_committed_total,
+                committed_bucket=fill_committed_by_bucket.get(bucket, 0.0),
+                config=config,
+            )
             if reserved < 1.0:
                 conn.execute(
-                    "UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason='insufficient_cash_at_fill' WHERE pending_id=?",
+                    "UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason='exposure_or_cash_cap_at_fill' WHERE pending_id=?",
                     (snapshot.isoformat(), pen["pending_id"]),
                 )
                 continue
@@ -130,27 +186,36 @@ def _cycle_v24(
                 """INSERT INTO benchmark_positions_v22
                 (position_id,benchmark_id,token_key,opened_at,entry_mc,entry_notional_usd,entry_fee_usd,entry_cash_spent_usd,
                  exposure_units,entry_score,entry_score_kind,entry_state_json,forecast_model_hash,policy_model_hash,policy_version,status,
-                 last_seen_at,last_mc,last_mark_value_usd,mfe_pct,mae_pct,entry_decision_at,entry_fill_kind)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,0,0,?,'next_observable')""",
+                 last_seen_at,last_mc,last_mark_value_usd,mfe_pct,mae_pct,entry_decision_at,entry_fill_kind,
+                 conviction_tier,target_position_fraction,risk_bucket)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,0,0,?,'next_observable',?,?,?)""",
                 (
                     pid, bid, token, snapshot.isoformat(), mc, notional, fee, reserved, units,
                     pen["entry_score"], pen["entry_score_kind"], pen["entry_state_json"],
                     pen["forecast_model_hash"], pen["policy_model_hash"], pen["policy_version"],
                     snapshot.isoformat(), mc, notional * (1 - exit_fee_rate), pen["decision_at"],
+                    tier, target_fraction, bucket,
                 ),
             )
             conn.execute(
-                "UPDATE benchmark_pending_entries_v24 SET status='filled',filled_at=?,fill_mc=? WHERE pending_id=?",
-                (snapshot.isoformat(), mc, pen["pending_id"]),
+                """UPDATE benchmark_pending_entries_v24
+                   SET status='filled',filled_at=?,fill_mc=?,reserved_cash_usd=?,risk_bucket=?
+                   WHERE pending_id=?""",
+                (snapshot.isoformat(), mc, reserved, bucket, pen["pending_id"]),
             )
             cash -= reserved
             execution_cash -= reserved
+            fill_committed_total += reserved
+            fill_committed_by_bucket[bucket] = fill_committed_by_bucket.get(bucket, 0.0) + reserved
             entries.append({
                 "position_id": pid,
                 "token_key": token,
                 "decision_mc": float(pen["decision_mc"]),
                 "entry_mc": mc,
                 "cash_spent_usd": reserved,
+                "conviction_tier": tier,
+                "target_position_fraction": target_fraction,
+                "risk_bucket": bucket,
                 "fill_kind": "next_observable",
             })
 
@@ -282,50 +347,124 @@ def _cycle_v24(
                 })
         candidates.sort(key=lambda x: x["score"], reverse=True)
         slots = max(0, config.max_open_positions - len(open_positions) - len(pending_tokens))
+        risk_buckets = _correlation_buckets(
+            source_db,
+            open_tokens | pending_tokens | {str(c["token_key"]) for c in candidates},
+            snapshot,
+            config,
+        )
+        threshold_cache: dict[str, tuple[float, float] | None] = {}
         eligible = []
         for c in candidates:
+            c["chosen"] = False
+            c["conviction_tier"] = "pass"
+            c["target_fraction"] = 0.0
+            c["target_cash"] = 0.0
+            c["reserved_cash"] = 0.0
+            c["risk_bucket"] = risk_buckets.get(c["token_key"], c["token_key"])
             if c["score"] <= config.min_entry_score:
+                c["selection_reason"] = "score_not_above_entry_threshold"
                 continue
             lc = _last_closed_at(conn, bid, c["token_key"])
             if lc is not None and (snapshot - lc).total_seconds() < config.reentry_cooldown_minutes * 60:
+                c["selection_reason"] = "reentry_cooldown"
                 continue
+            if c["kind"] not in threshold_cache:
+                threshold_cache[c["kind"]] = _conviction_thresholds(
+                    conn, bid, c["kind"], snapshot, config
+                )
+            tier = _conviction_tier(c["score"], threshold_cache[c["kind"]])
+            c["conviction_tier"] = tier
+            c["target_fraction"] = _tier_fraction(tier, config)
+            c["target_cash"] = effect_equity * c["target_fraction"]
+            c["selection_reason"] = "eligible"
             eligible.append(c)
-        selected = eligible[:slots]
-        selected_keys = {c["token_key"] for c in selected}
+
+        committed_total = sum(float(p["entry_cash_spent_usd"]) for p in open_positions) + reserved
+        committed_by_bucket: dict[str, float] = {}
+        for pos in open_positions:
+            token = str(pos["token_key"])
+            bucket = risk_buckets.get(token, token)
+            committed_by_bucket[bucket] = (
+                committed_by_bucket.get(bucket, 0.0) + float(pos["entry_cash_spent_usd"])
+            )
+        for pen in conn.execute(
+            """SELECT token_key,reserved_cash_usd FROM benchmark_pending_entries_v24
+               WHERE benchmark_id=? AND status='pending'""",
+            (bid,),
+        ).fetchall():
+            token = str(pen["token_key"])
+            bucket = risk_buckets.get(token, token)
+            committed_by_bucket[bucket] = (
+                committed_by_bucket.get(bucket, 0.0) + float(pen["reserved_cash_usd"])
+            )
+
+        cash_after_reservations = max(0.0, min(cash, execution_cash) - reserved)
+        selected = []
+        for c in eligible:
+            if len(selected) >= slots:
+                c["selection_reason"] = "position_slot_limit"
+                continue
+            bucket = c["risk_bucket"]
+            reserve = _allocation_amount(
+                target_cash=c["target_cash"],
+                available_cash=cash_after_reservations,
+                current_cash=cash_after_reservations,
+                execution_equity=effect_equity,
+                committed_total=committed_total,
+                committed_bucket=committed_by_bucket.get(bucket, 0.0),
+                config=config,
+            )
+            if reserve < 1.0:
+                c["selection_reason"] = "exposure_or_cash_cap"
+                continue
+            c["chosen"] = True
+            c["reserved_cash"] = reserve
+            c["selection_reason"] = "selected"
+            selected.append(c)
+            cash_after_reservations -= reserve
+            committed_total += reserve
+            committed_by_bucket[bucket] = committed_by_bucket.get(bucket, 0.0) + reserve
+
         for c in candidates:
             conn.execute(
                 """INSERT OR REPLACE INTO benchmark_candidates_v22
-                (benchmark_id,snapshot_at,token_key,market_cap_usd,entry_score,score_kind,chosen,state_json,forecast_model_hash,policy_model_hash)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (benchmark_id,snapshot_at,token_key,market_cap_usd,entry_score,score_kind,chosen,state_json,
+                 forecast_model_hash,policy_model_hash,conviction_tier,target_position_fraction,target_cash_usd,
+                 risk_bucket,selection_reason)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     bid, snapshot.isoformat(), c["token_key"], c["market_cap_usd"], c["score"], c["kind"],
-                    int(c["token_key"] in selected_keys), _json(c["state"]), forecast_hash, policy_hash,
+                    int(c["chosen"]), _json(c["state"]), forecast_hash, policy_hash,
+                    c["conviction_tier"], c["target_fraction"], c["target_cash"],
+                    c["risk_bucket"], c["selection_reason"],
                 ),
             )
+
         pending_created = []
-        available_cash = max(0.0, min(cash, execution_cash) - reserved)
         for c in selected:
-            target = max(0.0, effect_equity * config.position_fraction)
-            reserve = min(available_cash, target)
-            if reserve < 1.0:
-                break
             pid = str(uuid.uuid4())
             conn.execute(
                 """INSERT INTO benchmark_pending_entries_v24
-                (pending_id,benchmark_id,token_key,decision_at,decision_mc,reserved_cash_usd,entry_score,entry_score_kind,entry_state_json,forecast_model_hash,policy_model_hash,policy_version,status)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'pending')""",
+                (pending_id,benchmark_id,token_key,decision_at,decision_mc,reserved_cash_usd,entry_score,
+                 entry_score_kind,entry_state_json,forecast_model_hash,policy_model_hash,policy_version,status,
+                 conviction_tier,target_position_fraction,risk_bucket)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'pending',?,?,?)""",
                 (
-                    pid, bid, c["token_key"], snapshot.isoformat(), c["market_cap_usd"], reserve,
+                    pid, bid, c["token_key"], snapshot.isoformat(), c["market_cap_usd"], c["reserved_cash"],
                     c["score"], c["kind"], _json(c["state"]), forecast_hash, policy_hash, policy_version,
+                    c["conviction_tier"], c["target_fraction"], c["risk_bucket"],
                 ),
             )
             pending_created.append({
                 "pending_id": pid,
                 "token_key": c["token_key"],
-                "reserved_cash_usd": reserve,
+                "reserved_cash_usd": c["reserved_cash"],
                 "decision_mc": c["market_cap_usd"],
+                "conviction_tier": c["conviction_tier"],
+                "target_position_fraction": c["target_fraction"],
+                "risk_bucket": c["risk_bucket"],
             })
-            available_cash -= reserve
 
         open_positions = conn.execute(
             "SELECT * FROM benchmark_positions_v22 WHERE benchmark_id=? AND status='open'", (bid,)
@@ -386,6 +525,12 @@ def _cycle_v24(
         "pending_entries": pending_created,
         "cancelled_pending": cancelled,
         "exits": exits,
+        "committed_exposure_usd": committed_total,
+        "committed_exposure_fraction": (
+            committed_total / execution_equity if execution_equity > 0 else None
+        ),
+        "max_total_exposure_fraction": config.max_total_exposure_fraction,
+        "min_cash_reserve_fraction": config.min_cash_reserve_fraction,
         "forecast_model_hash": forecast_hash,
         "policy_model_hash": policy_hash,
         "policy_version": policy_version,
