@@ -1625,6 +1625,26 @@ def _encode_sequence_keys(
     sequence_challenger: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Decode and transform one token at a time, retaining only compact embeddings."""
+    # In-memory sources are already bounded (live inference contains one row per
+    # currently visible token). Transforming those rows together avoids hundreds
+    # of tiny DataFrame.apply/to_numeric calls. The challenger remains causal:
+    # apply_ts2vec_style_encoder still groups and orders every token separately.
+    if isinstance(source, pd.DataFrame):
+        raw = _sequence_raw_for_keys(source, keys)
+        if raw.empty:
+            return pd.DataFrame(columns=["token_key", "snapshot_at"])
+        encoded = apply_sequence_encoder(raw, encoder)
+        if sequence_challenger:
+            challenger = apply_ts2vec_style_encoder(raw, sequence_challenger)
+            extra = [c for c in challenger.columns if c.startswith("ts2enc__")]
+            if extra:
+                encoded = pd.concat(
+                    [encoded.reset_index(drop=True), challenger[extra].reset_index(drop=True)],
+                    axis=1,
+                    copy=False,
+                )
+        return encoded
+
     parts: list[pd.DataFrame] = []
     challenger_model = None
     if sequence_challenger and torch is not None:
@@ -3209,7 +3229,22 @@ def _atomic_write_prediction_csv(frame: pd.DataFrame, out_path: str) -> None:
             pass
 
 
-def predict_current(db:str,model_path:str,out_path:str,cfg:V24Config)->pd.DataFrame:
+def predict_current(
+    db: str,
+    model_path: str,
+    out_path: str,
+    cfg: V24Config,
+    *,
+    persist_source: bool = True,
+) -> pd.DataFrame:
+    """Predict the exact latest capture and atomically publish its CSV.
+
+    ``persist_source=False`` is reserved for isolated paper benchmarks. Those
+    runs deliberately have training feedback disabled, so writing their
+    prediction ledger, cohort assignments or heartbeat into the collector DB is
+    both unnecessary and a source of writer-lock contention. Ordinary V24
+    prediction commands retain source-provenance persistence by default.
+    """
     bundle=joblib.load(model_path)
     if bundle.get("schema_version")!=SCHEMA_VERSION: raise RuntimeError("V24 model schema mismatch")
 
@@ -3240,20 +3275,21 @@ def predict_current(db:str,model_path:str,out_path:str,cfg:V24Config)->pd.DataFr
         })
         out = pd.concat([out.reset_index(drop=True), metadata], axis=1, copy=False)
 
-        def persist(conn: sqlite3.Connection) -> int:
-            _ensure_live_token_assignments(conn, current.token_key.astype(str), cfg)
-            _ensure_live_cohorts_through(conn, latest, cfg)
-            _upsert_capture_heartbeat(
-                conn,
-                latest,
-                valid_capture=True,
-                row_count=len(current),
-                source="live_prediction",
-                details={"label_free_current_inference": True},
-            )
-            return record_live_prediction_frame(conn, out, model_path, bundle, cfg)
+        if persist_source:
+            def persist(conn: sqlite3.Connection) -> int:
+                _ensure_live_token_assignments(conn, current.token_key.astype(str), cfg)
+                _ensure_live_cohorts_through(conn, latest, cfg)
+                _upsert_capture_heartbeat(
+                    conn,
+                    latest,
+                    valid_capture=True,
+                    row_count=len(current),
+                    source="live_prediction",
+                    details={"label_free_current_inference": True},
+                )
+                return record_live_prediction_frame(conn, out, model_path, bundle, cfg)
 
-        _run_live_write_with_retry(db, persist)
+            _run_live_write_with_retry(db, persist)
         newest = _latest_observation_timestamp(db)
         if newest != latest:
             if attempt + 1 < LIVE_PREDICTION_SNAPSHOT_RETRIES:

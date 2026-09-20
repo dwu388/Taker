@@ -78,6 +78,7 @@ remain unsampled and use every eligible evaluation row.
 - Prediction CSV publication is atomic. A failed or interrupted write cannot expose a partial CSV to paper trading.
 - The benchmark keeps its independent stale-prediction guard and does not write duplicate capture heartbeats into the source database. Repeated loop iterations skip model inference when the current frozen model already has predictions for the newest capture.
 - Adaptive calibration learning remains label-dependent maintenance work. Live prediction applies the latest durable calibration state; `maintain` resolves and records new calibration evidence after refreshing mature labels.
+- The isolated budget benchmark has training feedback disabled and calls live prediction with `persist_source=False`. Its refresh is completely read-only against the collector database; decisions and provenance stay in the separate benchmark database. Ordinary V24 prediction commands keep source-ledger persistence enabled by default.
 
 ## Adaptation, calibration and full-model graduation
 
