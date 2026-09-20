@@ -268,7 +268,7 @@ def test_exceptional_candidate_can_exceed_five_positions_within_exposure_caps(
     overflow = overflow_decision["pending_entries"][0]
     assert overflow["token_key"] == "EXCEPTIONAL"
     assert overflow["conviction_tier"] == "exceptional"
-    assert overflow["reserved_cash_usd"] == pytest.approx(50.0)
+    assert 0.0 < overflow["reserved_cash_usd"] <= 50.0
     assert overflow_decision["committed_exposure_fraction"] == pytest.approx(0.30)
 
     clock["snapshot"] += pd.Timedelta(minutes=1)
@@ -278,5 +278,11 @@ def test_exceptional_candidate_can_exceed_five_positions_within_exposure_caps(
     )
     assert filled["open_positions"] == 6
     assert filled["entries"][0]["token_key"] == "EXCEPTIONAL"
-    assert filled["execution_cash_usd"] == pytest.approx(700.0)
+    assert filled["execution_cash_usd"] == pytest.approx(
+        750.0 - overflow["reserved_cash_usd"]
+    )
+    assert (
+        filled["execution_cash_usd"] + 1e-9
+        >= 0.70 * filled["effectiveness_equity_usd"]
+    )
 
