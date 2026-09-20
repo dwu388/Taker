@@ -68,6 +68,30 @@ def test_latest_only_feature_builder_matches_full_causal_builder():
     pd.testing.assert_frame_equal(actual, expected)
 
 
+def test_in_memory_sequence_encoding_batches_all_current_tokens(monkeypatch):
+    timestamp = pd.Timestamp("2026-09-19T20:02:06.873000Z")
+    raw = pd.DataFrame({
+        "token_key": ["A", "B"],
+        "snapshot_at": [timestamp, timestamp],
+        "seqraw__market_cap_usd__60m__change": [0.25, -0.10],
+    })
+    calls = []
+
+    def fake_encoder(frame, _encoder):
+        calls.append(len(frame))
+        return frame[["token_key", "snapshot_at"]].assign(seqenc__00=[1.0, 2.0])
+
+    monkeypatch.setattr(impl, "apply_sequence_encoder", fake_encoder)
+    encoded = impl._encode_sequence_keys(
+        raw,
+        raw[["token_key", "snapshot_at"]],
+        {"columns": ["seqraw__market_cap_usd__60m__change"]},
+    )
+
+    assert calls == [2]
+    assert list(encoded.token_key) == ["A", "B"]
+
+
 def test_predict_current_never_enters_training_frame_and_publishes_atomically(
     tmp_path, monkeypatch
 ):
@@ -153,6 +177,69 @@ def test_atomic_prediction_publish_preserves_last_good_file_on_failure(tmp_path,
 
     assert output.read_text(encoding="utf-8") == "last-known-good\n"
     assert not list(tmp_path.glob(".predictions.csv.*.tmp"))
+
+
+def test_isolated_prediction_stays_read_only_while_collector_holds_writer_lock(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "raw.sqlite"
+    _live_db(db)
+    model = tmp_path / "champion.joblib"
+    output = tmp_path / "predictions.csv"
+    joblib.dump({
+        "schema_version": impl.SCHEMA_VERSION,
+        "stable_training_cutoff": "2026-09-09T00:00:00+00:00",
+        "sequence_encoder": {
+            "columns": [], "components": 0, "scaler": None, "pca": None, "impute": {}
+        },
+    }, model)
+
+    def fake_predict(_conn, _bundle, current, _sequence, _cfg):
+        return current[["token_key", "snapshot_at"]].assign(p_first_peak_by_240m=0.5)
+
+    def forbidden_write(*_args, **_kwargs):
+        raise AssertionError("isolated benchmark attempted to write the source database")
+
+    monkeypatch.setattr(impl, "predict_frame", fake_predict)
+    monkeypatch.setattr(impl, "_run_live_write_with_retry", forbidden_write)
+
+    writer = sqlite3.connect(db)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        out = impl.predict_current(
+            str(db),
+            str(model),
+            str(output),
+            impl.V24Config(sequence_windows_minutes=(60,), sequence_segments=1),
+            persist_source=False,
+        )
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert len(out) == 2
+    assert output.exists()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(f"SELECT COUNT(*) FROM {impl.PREDICTION_LEDGER}").fetchone()[0] == 0
+        assert conn.execute(f"SELECT COUNT(*) FROM {impl.TOKEN_ASSIGNMENT_TABLE}").fetchone()[0] == 0
+
+
+def test_benchmark_refresh_explicitly_disables_source_persistence(tmp_path, monkeypatch):
+    model = tmp_path / "champion.joblib"
+    output = tmp_path / "predictions.csv"
+    joblib.dump({"schema_version": impl.SCHEMA_VERSION}, model)
+    captured = {}
+
+    def fake_predict(_db, _model, _output, _cfg, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame({"token_key": ["A"], "snapshot_at": [pd.Timestamp.now(tz="UTC")]})
+
+    monkeypatch.setattr(benchmark.v24, "predict_current", fake_predict)
+    result = benchmark.refresh_predictions(str(tmp_path / "raw.sqlite"), str(model), str(output))
+
+    assert captured == {"persist_source": False}
+    assert result["source_db_writes"] is False
+    assert result["training_feedback"] == "disabled"
 
 
 def test_live_write_waits_for_collector_lock_then_commits(tmp_path):

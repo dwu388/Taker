@@ -1450,12 +1450,23 @@ def refresh_predictions(source_db: str, forecast_model: str, predictions_path: s
                     "reason": "prediction_already_current_for_frozen_model",
                 }
         cfg = v24.V24Config()
-        rows = v24.predict_current(source_db, forecast_model, predictions_path, cfg)
+        # This isolated benchmark has training feedback disabled. Its prediction
+        # refresh must therefore remain read-only against the collector database;
+        # cycle() records benchmark decisions in benchmark_db instead.
+        rows = v24.predict_current(
+            source_db,
+            forecast_model,
+            predictions_path,
+            cfg,
+            persist_source=False,
+        )
         return {
             "rows": len(rows),
             "out": predictions_path,
             "forecaster": "v24",
             "skipped": False,
+            "source_db_writes": False,
+            "training_feedback": "disabled",
         }
     return selfteach.refresh_current_predictions(source_db, forecast_model, predictions_path, None)
 
