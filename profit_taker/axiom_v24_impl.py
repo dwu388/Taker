@@ -9,6 +9,7 @@ import math
 import os
 import shutil
 import sqlite3
+import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -53,6 +54,15 @@ CHAMPION_DEFAULT = "models/axiom_v24/champion.joblib"
 POLICY_ROOT_DEFAULT = "models/axiom_policy_v24"
 POLICY_CHAMPION_DEFAULT = "models/axiom_policy_v24/champion.joblib"
 PREDICTIONS_DEFAULT = "data/axiom_predictions_v24.csv"
+
+# Live inference is deliberately read-mostly.  The collector owns the canonical
+# raw write path; prediction waits briefly and retries only its small provenance
+# transaction instead of running training-frame refreshes while collection is
+# active.
+LIVE_SQLITE_BUSY_TIMEOUT_MS = 750
+LIVE_SQLITE_WRITE_RETRIES = 8
+LIVE_SQLITE_RETRY_BASE_SECONDS = 0.20
+LIVE_PREDICTION_SNAPSHOT_RETRIES = 3
 
 COHORT_TABLE = "axiom_v24_calendar_cohorts"
 LIFETIME_TABLE = "axiom_v24_token_lifetimes"
@@ -587,6 +597,27 @@ def refresh_capture_heartbeats(conn: sqlite3.Connection, observations: pd.DataFr
     return {"inserted": inserted, "total": int(conn.execute(f"SELECT COUNT(*) FROM {CAPTURE_HEARTBEAT_TABLE}").fetchone()[0])}
 
 
+def _upsert_capture_heartbeat(
+    conn: sqlite3.Connection,
+    capture_at: Any,
+    *,
+    valid_capture: bool,
+    row_count: int,
+    source: str = "collector",
+    details: dict[str, Any] | None = None,
+) -> None:
+    now = _now_iso()
+    conn.execute(
+        f"""INSERT INTO {CAPTURE_HEARTBEAT_TABLE}
+            (capture_at,completed_at,valid_capture,row_count,source,details_json,first_ingested_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(capture_at) DO UPDATE SET
+              completed_at=excluded.completed_at,valid_capture=excluded.valid_capture,
+              row_count=excluded.row_count,source=excluded.source,details_json=excluded.details_json""",
+        (_iso(capture_at), now, int(valid_capture), int(row_count), source, _json(details or {}), now),
+    )
+
+
 def record_capture_heartbeat(
     conn: sqlite3.Connection,
     capture_at: Any,
@@ -597,15 +628,13 @@ def record_capture_heartbeat(
     details: dict[str, Any] | None = None,
 ) -> None:
     migrate(conn)
-    now = _now_iso()
-    conn.execute(
-        f"""INSERT INTO {CAPTURE_HEARTBEAT_TABLE}
-            (capture_at,completed_at,valid_capture,row_count,source,details_json,first_ingested_at)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(capture_at) DO UPDATE SET
-              completed_at=excluded.completed_at,valid_capture=excluded.valid_capture,
-              row_count=excluded.row_count,source=excluded.source,details_json=excluded.details_json""",
-        (_iso(capture_at), now, int(valid_capture), int(row_count), source, _json(details or {}), now),
+    _upsert_capture_heartbeat(
+        conn,
+        capture_at,
+        valid_capture=valid_capture,
+        row_count=row_count,
+        source=source,
+        details=details,
     )
     conn.commit()
 
@@ -810,6 +839,34 @@ def _block_floor(ts: pd.Timestamp, hours: int) -> pd.Timestamp:
     return pd.Timestamp(block * 3600, unit="s", tz="UTC")
 
 
+def _forecast_cohort_role_status(ordinal: int, cfg: V24Config) -> tuple[str, str]:
+    if ordinal < cfg.warmup_blocks:
+        return "train", "available"
+    post = ordinal - cfg.warmup_blocks + 1
+    is_eval = cfg.promotion_every_n_blocks <= 1 or post % cfg.promotion_every_n_blocks == 0
+    if not is_eval:
+        return "train", "available"
+    eval_no = max(1, post // max(1, cfg.promotion_every_n_blocks))
+    if cfg.audit_every_n_blocks > 0 and eval_no % cfg.audit_every_n_blocks == 0:
+        return "audit", "sealed"
+    return "promotion", "available"
+
+
+def _policy_cohort_role_status(
+    ordinal: int,
+    forecast_role: str,
+    cfg: V24Config,
+) -> tuple[str, str]:
+    if ordinal < cfg.warmup_blocks:
+        return "train", "available"
+    if forecast_role == "audit":
+        return "audit", "sealed"
+    n = max(1, int(cfg.promotion_every_n_blocks))
+    offset = max(1, n // 2)
+    post = ordinal - cfg.warmup_blocks + 1
+    return ("promotion", "available") if (post % n) == offset else ("train", "available")
+
+
 def refresh_calendar_cohorts(conn: sqlite3.Connection, cfg: V24Config) -> dict[str, int]:
     """Create immutable calendar cohort roles.
 
@@ -839,19 +896,7 @@ def refresh_calendar_cohorts(conn: sqlite3.Connection, cfg: V24Config) -> dict[s
     while cur <= last:
         end = cur + pd.Timedelta(hours=cfg.cohort_hours)
         if ordinal not in existing:
-            if ordinal < cfg.warmup_blocks:
-                role, status = "train", "available"
-            else:
-                post = ordinal - cfg.warmup_blocks + 1
-                is_eval = cfg.promotion_every_n_blocks <= 1 or post % cfg.promotion_every_n_blocks == 0
-                if not is_eval:
-                    role, status = "train", "available"
-                else:
-                    eval_no = max(1, post // max(1, cfg.promotion_every_n_blocks))
-                    if cfg.audit_every_n_blocks > 0 and eval_no % cfg.audit_every_n_blocks == 0:
-                        role, status = "audit", "sealed"
-                    else:
-                        role, status = "promotion", "available"
+            role, status = _forecast_cohort_role_status(ordinal, cfg)
             cohort_id = f"c{ordinal:06d}_{cur.strftime('%Y%m%dT%H%M%SZ')}"
             conn.execute(
                 f"""INSERT INTO {COHORT_TABLE}
@@ -875,19 +920,11 @@ def refresh_policy_cohorts(conn: sqlite3.Connection, cfg: V24Config) -> dict[str
         return {"created": 0, "total": 0}
     existing = {int(r[0]) for r in conn.execute(f"SELECT ordinal FROM {POLICY_COHORT_TABLE}").fetchall()}
     created = 0
-    n=max(1,int(cfg.promotion_every_n_blocks)); offset=max(1,n//2)
     for r in forecast.itertuples(index=False):
         ordinal=int(r.ordinal)
         if ordinal in existing:
             continue
-        if ordinal < cfg.warmup_blocks:
-            role,status="train","available"
-        elif str(r.role)=="audit":
-            role,status="audit","sealed"
-        else:
-            post=ordinal-cfg.warmup_blocks+1
-            is_eval=(post % n)==offset
-            role,status=("promotion","available") if is_eval else ("train","available")
+        role, status = _policy_cohort_role_status(ordinal, str(r.role), cfg)
         cid=f"p{ordinal:06d}_{_utc(r.start_at).strftime('%Y%m%dT%H%M%SZ')}"
         conn.execute(
             f"""INSERT INTO {POLICY_COHORT_TABLE}
@@ -928,6 +965,137 @@ def refresh_token_assignments(conn: sqlite3.Connection, cfg: V24Config) -> dict[
         ); assigned+=1
     conn.commit()
     return {"assigned":assigned,"total":int(conn.execute(f"SELECT COUNT(*) FROM {TOKEN_ASSIGNMENT_TABLE}").fetchone()[0])}
+
+
+def _ensure_live_cohorts_through(
+    conn: sqlite3.Connection,
+    timestamp: pd.Timestamp,
+    cfg: V24Config,
+) -> None:
+    """Extend immutable cohort schedules without requiring current labels."""
+    first = conn.execute(
+        f"SELECT ordinal,start_at FROM {COHORT_TABLE} ORDER BY ordinal LIMIT 1"
+    ).fetchone()
+    if first is None:
+        start = _block_floor(timestamp, cfg.cohort_hours)
+        first_ordinal = 0
+    else:
+        first_ordinal = int(first[0])
+        start = _utc(first[1])
+    if first_ordinal != 0:
+        raise RuntimeError("V24 calendar cohort schedule does not begin at ordinal zero.")
+
+    target = _block_floor(timestamp, cfg.cohort_hours)
+    ordinal = int((target - start).total_seconds() // (cfg.cohort_hours * 3600))
+    if ordinal < 0:
+        raise RuntimeError("Live token predates the immutable V24 cohort schedule.")
+    now = _now_iso()
+    for number in range(ordinal + 1):
+        block_start = start + pd.Timedelta(hours=number * cfg.cohort_hours)
+        block_end = block_start + pd.Timedelta(hours=cfg.cohort_hours)
+        forecast_role, forecast_status = _forecast_cohort_role_status(number, cfg)
+        forecast_id = f"c{number:06d}_{block_start.strftime('%Y%m%dT%H%M%SZ')}"
+        conn.execute(
+            f"""INSERT OR IGNORE INTO {COHORT_TABLE}
+                (cohort_id,ordinal,start_at,end_at,role,status,created_at)
+                VALUES(?,?,?,?,?,?,?)""",
+            (
+                forecast_id,
+                number,
+                block_start.isoformat(),
+                block_end.isoformat(),
+                forecast_role,
+                forecast_status,
+                now,
+            ),
+        )
+        policy_role, policy_status = _policy_cohort_role_status(number, forecast_role, cfg)
+        policy_id = f"p{number:06d}_{block_start.strftime('%Y%m%dT%H%M%SZ')}"
+        conn.execute(
+            f"""INSERT OR IGNORE INTO {POLICY_COHORT_TABLE}
+                (cohort_id,ordinal,start_at,end_at,role,status,created_at)
+                VALUES(?,?,?,?,?,?,?)""",
+            (
+                policy_id,
+                number,
+                block_start.isoformat(),
+                block_end.isoformat(),
+                policy_role,
+                policy_status,
+                now,
+            ),
+        )
+
+
+def _ensure_live_token_assignments(
+    conn: sqlite3.Connection,
+    token_keys: Iterable[str],
+    cfg: V24Config,
+) -> int:
+    """Assign current tokens once using raw first-seen time and immutable roles."""
+    tokens = sorted(set(map(str, token_keys)))
+    if not tokens:
+        return 0
+    source = peak.discover_observation_source(conn)
+    quote = lambda value: '"' + str(value).replace('"', '""') + '"'
+    first_seen: dict[str, pd.Timestamp] = {}
+    for offset in range(0, len(tokens), 500):
+        batch = tokens[offset: offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT {quote(source['token'])},MIN({quote(source['time'])}) "
+            f"FROM {quote(source['table'])} "
+            f"WHERE {quote(source['token'])} IN ({placeholders}) "
+            f"GROUP BY {quote(source['token'])}",
+            batch,
+        ).fetchall()
+        first_seen.update({str(row[0]): _utc(row[1]) for row in rows if row[1]})
+    if not first_seen:
+        return 0
+
+    if conn.execute(f"SELECT 1 FROM {COHORT_TABLE} LIMIT 1").fetchone() is None:
+        _ensure_live_cohorts_through(conn, min(first_seen.values()), cfg)
+    _ensure_live_cohorts_through(conn, max(first_seen.values()), cfg)
+    forecast = _cohort_rows(conn)
+    policy = pd.read_sql_query(
+        f"SELECT * FROM {POLICY_COHORT_TABLE} ORDER BY ordinal", conn
+    )
+    forecast_start = pd.to_datetime(forecast.start_at, format="ISO8601", utc=True)
+    forecast_end = pd.to_datetime(forecast.end_at, format="ISO8601", utc=True)
+    policy_start = pd.to_datetime(policy.start_at, format="ISO8601", utc=True)
+    policy_end = pd.to_datetime(policy.end_at, format="ISO8601", utc=True)
+    assigned = 0
+    now = _now_iso()
+    for token, timestamp in first_seen.items():
+        if conn.execute(
+            f"SELECT 1 FROM {TOKEN_ASSIGNMENT_TABLE} WHERE token_key=?", (token,)
+        ).fetchone():
+            continue
+        forecast_match = forecast[(forecast_start <= timestamp) & (forecast_end > timestamp)]
+        policy_match = policy[(policy_start <= timestamp) & (policy_end > timestamp)]
+        if forecast_match.empty or policy_match.empty:
+            raise RuntimeError(
+                f"Could not assign live token {token!r} to the immutable V24 cohort schedule."
+            )
+        fr = forecast_match.iloc[-1]
+        pr = policy_match.iloc[-1]
+        conn.execute(
+            f"""INSERT INTO {TOKEN_ASSIGNMENT_TABLE}
+                (token_key,first_seen_at,birth_ordinal,forecast_cohort_id,forecast_role,
+                 policy_cohort_id,policy_role,assigned_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                token,
+                timestamp.isoformat(),
+                int(fr.ordinal),
+                str(fr.cohort_id),
+                str(fr.role),
+                str(pr.cohort_id),
+                str(pr.role),
+                now,
+            ),
+        )
+        assigned += 1
+    return assigned
 
 
 def _token_assignments(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -2408,6 +2576,7 @@ def _prepare_model_frame(
     sequence_challenger: dict[str, Any] | None = None,
     fit_encoder_on: pd.DataFrame | None = None,
     as_of: pd.Timestamp | None = None,
+    include_targets: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if encoder is None:
         if fit_encoder_on is None:
@@ -2420,8 +2589,9 @@ def _prepare_model_frame(
         sequence_challenger=sequence_challenger,
     )
     out = frame.merge(enc, on=["token_key", "snapshot_at"], how="left")
-    out = add_recurrent_targets(conn, out, cfg, as_of=as_of)
-    out = add_barrier_targets(conn, out, cfg, as_of=as_of)
+    if include_targets:
+        out = add_recurrent_targets(conn, out, cfg, as_of=as_of)
+        out = add_barrier_targets(conn, out, cfg, as_of=as_of)
     return out, encoder
 
 
@@ -2782,7 +2952,13 @@ def predict_frame(
     cfg: V24Config,
 ) -> pd.DataFrame:
     model_frame, _ = _prepare_model_frame(
-        conn, base_frame, seqraw, cfg, encoder=bundle["sequence_encoder"], sequence_challenger=bundle.get("sequence_challenger")
+        conn,
+        base_frame,
+        seqraw,
+        cfg,
+        encoder=bundle["sequence_encoder"],
+        sequence_challenger=bundle.get("sequence_challenger"),
+        include_targets=False,
     )
     stable = _predict_bundle_parts(bundle, model_frame)
     adapter_bundle = bundle.get("adapter")
@@ -2807,9 +2983,14 @@ def predict_frame(
                 for hi,h in enumerate(cfg.probability_horizons_minutes):
                     key=f"p_hit_plus{_threshold_tag(thr)}_by_{h}m"
                     if key in pred and np.isfinite(mat[ti,hi]): pred[key][i]=proj[ti,hi]
-    result = model_frame[["token_key", "snapshot_at"]].copy()
-    for k, v in pred.items():
-        result[k] = v
+    result = pd.concat(
+        [
+            model_frame[["token_key", "snapshot_at"]].reset_index(drop=True),
+            pd.DataFrame({k: np.asarray(v) for k, v in pred.items()}),
+        ],
+        axis=1,
+        copy=False,
+    )
     # Direct marked higher-peak probabilities; no Poisson count proxy.
     margins=list(cfg.higher_peak_mark_margins); horizons=(240,720,1440,4320)
     for i in range(len(result)):
@@ -2825,7 +3006,11 @@ def predict_frame(
                     key=f"p_later_higher_{int(round(m*100))}pct_by_{h}m"
                     if key in result and np.isfinite(mat[mi,hi]): result.at[result.index[i],key]=proj[mi,hi]
     liquidity_model = bundle.get("liquidity_model") or {"active": False, "fallback_round_trip_bps": cfg.fallback_round_trip_bps}
-    result["liquidity_model_active"] = 1.0 if liquidity_model.get("active") else 0.0
+    extra_columns: dict[str, Any] = {
+        "liquidity_model_active": np.full(
+            len(result), 1.0 if liquidity_model.get("active") else 0.0
+        )
+    }
     for size in (100.0, 200.0, 500.0):
         vals = []
         for _, r in model_frame.iterrows():
@@ -2839,28 +3024,248 @@ def predict_frame(
             vals.append(estimate_slippage_bps(
                 liquidity_model, size, rv("liquidity_usd"), rv("volume_usd"), rv("market_cap_usd")
             ))
-        result[f"pred_one_way_slippage_bps_{int(size)}usd"] = vals
-    result["v24_adapter_weight_max"] = weight
-    for fam,w in (adapter_bundle or {}).get("weights",{}).items(): result[f"v24_adapter_weight_{fam}"]=float(w)
-    result["v24_stable_training_cutoff"] = bundle["stable_training_cutoff"]
-    result["v24_adaptive_calibration_radius_mean"] = calibration_meta.get("adaptive_calibration_radius_mean")
+        extra_columns[f"pred_one_way_slippage_bps_{int(size)}usd"] = vals
+    extra_columns["v24_adapter_weight_max"] = np.full(len(result), weight)
+    for fam, w in (adapter_bundle or {}).get("weights", {}).items():
+        extra_columns[f"v24_adapter_weight_{fam}"] = np.full(len(result), float(w))
+    extra_columns["v24_stable_training_cutoff"] = np.full(
+        len(result), bundle["stable_training_cutoff"], dtype=object
+    )
+    extra_columns["v24_adaptive_calibration_radius_mean"] = np.full(
+        len(result), calibration_meta.get("adaptive_calibration_radius_mean")
+    )
+    result = pd.concat(
+        [result.reset_index(drop=True), pd.DataFrame(extra_columns)],
+        axis=1,
+        copy=False,
+    )
     return result
 
 
-def _current_feature_rows(conn: sqlite3.Connection, cfg: V24Config) -> tuple[pd.DataFrame, SequenceFingerprintSource]:
-    frame, seqraw, _ = load_v24_frame(conn, cfg)
-    latest = frame.snapshot_at.max()
-    return frame[frame.snapshot_at == latest].copy(), seqraw
+def _connect_live_read(db: str) -> sqlite3.Connection:
+    """Open a collector-friendly read connection for live inference."""
+    conn = sqlite3.connect(db, timeout=LIVE_SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={LIVE_SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def _latest_observation_timestamp(db: str) -> pd.Timestamp | None:
+    """Return the newest usable raw observation without materializing the table."""
+    with closing(_connect_live_read(db)) as conn:
+        source = peak.discover_observation_source(conn)
+        quote = lambda value: '"' + str(value).replace('"', '""') + '"'
+        row = conn.execute(
+            f"SELECT MAX({quote(source['time'])}) FROM {quote(source['table'])} "
+            f"WHERE {quote(source['token'])} IS NOT NULL "
+            f"AND {quote(source['mc'])} IS NOT NULL AND {quote(source['mc'])}>0"
+        ).fetchone()
+    return _utc(row[0]) if row and row[0] else None
+
+
+def _current_sequence_fingerprints(
+    observations: pd.DataFrame,
+    latest: pd.Timestamp,
+    cfg: V24Config,
+) -> pd.DataFrame:
+    """Calculate only the latest causal sequence rows, without cache writes."""
+    current_tokens = set(
+        observations.loc[observations.snapshot_at == latest, "token_key"].astype(str)
+    )
+    rows: list[dict[str, Any]] = []
+    bases = [c for c in _SEQUENCE_BASES if c in observations.columns]
+    active = observations[observations.token_key.astype(str).isin(current_tokens)]
+    for token, group in active.groupby("token_key", sort=False):
+        group = group.sort_values("snapshot_at").reset_index(drop=True)
+        positions = np.flatnonzero(
+            (
+                pd.to_datetime(group.snapshot_at, format="ISO8601", utc=True)
+                == latest
+            ).to_numpy()
+        )
+        if not len(positions):
+            continue
+        times = pd.to_datetime(group.snapshot_at, format="ISO8601", utc=True).astype("int64").to_numpy()
+        arrays = {c: _obs_numeric(group, c) for c in bases}
+        rows.append(
+            _fingerprint_for_index(str(token), group, times, arrays, int(positions[-1]), cfg)
+        )
+    return pd.DataFrame(rows, columns=None)
+
+
+def _current_inference_inputs(
+    conn: sqlite3.Connection,
+    cfg: V24Config,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
+    """Build label-free features for the newest durable raw capture.
+
+    Live inference must never inner-join against the training-label table.  New
+    observations are expected to be unlabeled, so using ``load_v24_frame`` here
+    silently selected an older labeled snapshot and produced stale predictions.
+    """
+    observations, _ = peak.load_observations(conn)
+    if observations.empty:
+        raise RuntimeError("No usable Axiom observations are available for V24 prediction.")
+    latest = _utc(observations.snapshot_at.max())
+    current_observations = observations[observations.snapshot_at == latest].copy()
+    expected_tokens = set(current_observations.token_key.astype(str))
+
+    features = peak.build_fallback_features(observations, emit_at=latest)
+    if features.empty:
+        raise RuntimeError(f"No causal features were produced for latest capture {latest.isoformat()}.")
+
+    # Preserve any safe external enrichment already cached for this exact capture,
+    # but never require the durable cache to be current for live prediction.
+    try:
+        cached = peak._load_cached_feature_frame(conn, current_at=latest)
+    except sqlite3.DatabaseError:
+        cached = pd.DataFrame()
+    if not cached.empty:
+        extra = [c for c in cached.columns if c not in features.columns]
+        if extra:
+            features = features.merge(
+                cached[["token_key", "snapshot_at", *extra]],
+                on=["token_key", "snapshot_at"],
+                how="left",
+            )
+
+    produced_tokens = set(features.token_key.astype(str))
+    missing = sorted(expected_tokens - produced_tokens)
+    if missing:
+        raise RuntimeError(
+            "Current-feature construction omitted latest-capture tokens; refusing "
+            f"partial prediction: missing={missing[:10]}"
+        )
+    features = features[features.token_key.astype(str).isin(expected_tokens)].copy()
+    if set(pd.to_datetime(features.snapshot_at, format="ISO8601", utc=True)) != {latest}:
+        raise RuntimeError("Current-feature construction returned a non-current snapshot.")
+
+    sequence = _current_sequence_fingerprints(observations, latest, cfg)
+    sequence_tokens = set(sequence.token_key.astype(str)) if not sequence.empty else set()
+    missing_sequence = sorted(expected_tokens - sequence_tokens)
+    if missing_sequence:
+        raise RuntimeError(
+            "Current sequence construction omitted latest-capture tokens; refusing "
+            f"partial prediction: missing={missing_sequence[:10]}"
+        )
+    return features.reset_index(drop=True), sequence.reset_index(drop=True), latest
+
+
+def _current_feature_rows(
+    conn: sqlite3.Connection,
+    cfg: V24Config,
+) -> tuple[pd.DataFrame, SequenceFingerprintSource]:
+    frame, sequence, _ = _current_inference_inputs(conn, cfg)
+    return frame, sequence
+
+
+def _is_sqlite_locked(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        marker in str(exc).lower()
+        for marker in ("database is locked", "database table is locked", "database is busy")
+    )
+
+
+def _run_live_write_with_retry(db: str, operation: Any) -> Any:
+    """Run one short write transaction while giving the collector priority."""
+    last_error: BaseException | None = None
+    for attempt in range(LIVE_SQLITE_WRITE_RETRIES):
+        conn = sqlite3.connect(db, timeout=LIVE_SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={LIVE_SQLITE_BUSY_TIMEOUT_MS}")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = operation(conn)
+            conn.commit()
+            return result
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except sqlite3.DatabaseError:
+                pass
+            if not _is_sqlite_locked(exc) or attempt + 1 >= LIVE_SQLITE_WRITE_RETRIES:
+                raise
+            last_error = exc
+        finally:
+            conn.close()
+        time.sleep(min(2.0, LIVE_SQLITE_RETRY_BASE_SECONDS * (2 ** attempt)))
+    if last_error is not None:  # pragma: no cover - loop always returns or raises
+        raise last_error
+    raise RuntimeError("Live SQLite write retry loop exited unexpectedly.")
+
+
+def _atomic_write_prediction_csv(frame: pd.DataFrame, out_path: str) -> None:
+    output = Path(out_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        frame.to_csv(temporary, index=False)
+        os.replace(temporary, output)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def predict_current(db:str,model_path:str,out_path:str,cfg:V24Config)->pd.DataFrame:
     bundle=joblib.load(model_path)
     if bundle.get("schema_version")!=SCHEMA_VERSION: raise RuntimeError("V24 model schema mismatch")
-    with closing(sqlite3.connect(db)) as conn, conn:
-        migrate(conn); frame,seqraw,_=load_v24_frame(conn,cfg); update_adaptive_calibration(conn,frame,cfg)
-        latest=frame.snapshot_at.max(); current=frame[frame.snapshot_at==latest].copy(); out=predict_frame(conn,bundle,current,seqraw,cfg)
-        out["v24_model_hash"]=_hash_file(model_path); out["v24_model_training_cutoff"]=_model_training_cutoff_from_bundle(bundle).isoformat(); Path(out_path).parent.mkdir(parents=True,exist_ok=True); out.to_csv(out_path,index=False); record_live_prediction_frame(conn,out,model_path,bundle,cfg); conn.commit()
-    return out
+
+    for attempt in range(LIVE_PREDICTION_SNAPSHOT_RETRIES):
+        with closing(_connect_live_read(db)) as conn:
+            current, sequence, latest = _current_inference_inputs(conn, cfg)
+            out = predict_frame(conn, bundle, current, sequence, cfg)
+
+        observed_snapshots = set(pd.to_datetime(out.snapshot_at, format="ISO8601", utc=True))
+        if observed_snapshots != {latest}:
+            raise RuntimeError(
+                "V24 prediction output did not preserve the exact latest-capture timestamp."
+            )
+        newest = _latest_observation_timestamp(db)
+        if newest != latest:
+            if attempt + 1 < LIVE_PREDICTION_SNAPSHOT_RETRIES:
+                continue
+            raise RuntimeError(
+                "Raw collection advanced while V24 prediction was being calculated; "
+                "refusing to publish a stale prediction CSV. Retry on the next cycle."
+            )
+
+        metadata = pd.DataFrame({
+            "v24_model_hash": np.full(len(out), _hash_file(model_path), dtype=object),
+            "v24_model_training_cutoff": np.full(
+                len(out), _model_training_cutoff_from_bundle(bundle).isoformat(), dtype=object
+            ),
+        })
+        out = pd.concat([out.reset_index(drop=True), metadata], axis=1, copy=False)
+
+        def persist(conn: sqlite3.Connection) -> int:
+            _ensure_live_token_assignments(conn, current.token_key.astype(str), cfg)
+            _ensure_live_cohorts_through(conn, latest, cfg)
+            _upsert_capture_heartbeat(
+                conn,
+                latest,
+                valid_capture=True,
+                row_count=len(current),
+                source="live_prediction",
+                details={"label_free_current_inference": True},
+            )
+            return record_live_prediction_frame(conn, out, model_path, bundle, cfg)
+
+        _run_live_write_with_retry(db, persist)
+        newest = _latest_observation_timestamp(db)
+        if newest != latest:
+            if attempt + 1 < LIVE_PREDICTION_SNAPSHOT_RETRIES:
+                continue
+            raise RuntimeError(
+                "Raw collection advanced before V24 prediction publication; "
+                "refusing to replace the last known-good prediction CSV."
+            )
+        _atomic_write_prediction_csv(out, out_path)
+        return out
+
+    raise RuntimeError("V24 prediction could not stabilize on one raw capture snapshot.")
 
 
 # ---------------------------------------------------------------------------
@@ -3141,6 +3546,10 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
         )
         peak.refresh_labels(db, peak_cfg)
         frame, seqraw, _ = load_v24_frame(conn, cfg)
+        # Calibration learning is label-dependent maintenance work.  Keep it out
+        # of the minute-sensitive live prediction path so collection retains
+        # priority and current inference never depends on label freshness.
+        update_adaptive_calibration(conn, frame, cfg)
         cohort = next_one_use_promotion_cohort(conn, cfg)
         if cohort is None:
             return {"trained": False, "reason": "no fully matured unused promotion cohort"}

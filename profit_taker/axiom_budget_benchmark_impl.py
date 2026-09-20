@@ -616,7 +616,9 @@ def _state_with_position(state: dict[str, float], pos: sqlite3.Row, mc: float, s
 def _read_current(source_db: str, predictions_path: str) -> tuple[pd.Timestamp, pd.DataFrame]:
     _require_v21()
     preds = _load_predictions(predictions_path)
-    with sqlite3.connect(source_db) as src:
+    with sqlite3.connect(source_db, timeout=10.0) as src:
+        src.execute("PRAGMA busy_timeout=10000")
+        src.execute("PRAGMA query_only=ON")
         observations, _ = peak.load_observations(src)
     if observations.empty:
         raise RuntimeError("No Axiom observations are available in the source database.")
@@ -1425,9 +1427,36 @@ def refresh_predictions(source_db: str, forecast_model: str, predictions_path: s
     except Exception:
         bundle = {}
     if v24 is not None and str(bundle.get("schema_version", "")) == v24.SCHEMA_VERSION:
+        prediction_file = Path(predictions_path)
+        if prediction_file.exists():
+            existing = _load_predictions(predictions_path)
+            predicted_at = _prediction_snapshot(existing)
+            current_at = v24._latest_observation_timestamp(source_db)
+            expected_hash = _hash_file(forecast_model)
+            stored_hashes = set(
+                existing.get("v24_model_hash", pd.Series(dtype=object)).dropna().astype(str)
+            )
+            if (
+                predicted_at is not None
+                and current_at is not None
+                and predicted_at == current_at
+                and stored_hashes == {str(expected_hash)}
+            ):
+                return {
+                    "rows": len(existing),
+                    "out": predictions_path,
+                    "forecaster": "v24",
+                    "skipped": True,
+                    "reason": "prediction_already_current_for_frozen_model",
+                }
         cfg = v24.V24Config()
         rows = v24.predict_current(source_db, forecast_model, predictions_path, cfg)
-        return {"rows": len(rows), "out": predictions_path, "forecaster": "v24"}
+        return {
+            "rows": len(rows),
+            "out": predictions_path,
+            "forecaster": "v24",
+            "skipped": False,
+        }
     return selfteach.refresh_current_predictions(source_db, forecast_model, predictions_path, None)
 
 

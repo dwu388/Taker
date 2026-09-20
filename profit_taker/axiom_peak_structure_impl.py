@@ -936,9 +936,27 @@ def _nearest_past_value(times_ns: np.ndarray, vals: np.ndarray, target_ns: int) 
     return float(vals[idx]) if np.isfinite(vals[idx]) else np.nan
 
 
-def build_fallback_features(observations: pd.DataFrame) -> pd.DataFrame:
+def build_fallback_features(
+    observations: pd.DataFrame,
+    *,
+    emit_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Build causal observation features.
+
+    ``emit_at`` keeps the normal training behavior unchanged while allowing the
+    live inference path to calculate only the newest rows.  Historical rows are
+    still scanned to preserve lifetime highs, first values and trailing-window
+    lookups, but their wide feature dictionaries are never materialized.  This is
+    important for minute-by-minute prediction on a mature database.
+    """
     obs = observations.copy()
+    emit_timestamp = _to_timestamp(pd.Series([emit_at])).iloc[0] if emit_at is not None else None
     numeric_cols = _numeric_observation_columns(obs)
+    if emit_timestamp is not None:
+        active_tokens = set(
+            obs.loc[obs["snapshot_at"] == emit_timestamp, "token_key"].astype(str)
+        )
+        obs = obs[obs["token_key"].astype(str).isin(active_tokens)].copy()
     # Prefer core market/trader series for trajectory engineering; retain all numeric
     # current-state fields as well.
     trajectory_bases = [
@@ -959,11 +977,6 @@ def build_fallback_features(observations: pd.DataFrame) -> pd.DataFrame:
         running_high: dict[str, float] = {c: -np.inf for c in trajectory_bases}
 
         for i, src in g.iterrows():
-            feat: dict[str, Any] = {"token_key": token, "snapshot_at": src.snapshot_at}
-            for c in numeric_cols:
-                v = pd.to_numeric(pd.Series([src[c]]), errors="coerce").iloc[0]
-                feat[f"raw__{c}"] = float(v) if pd.notna(v) else np.nan
-
             now_ns = int(times_ns[i])
             for c in trajectory_bases:
                 cur = arrays[c][i]
@@ -971,6 +984,17 @@ def build_fallback_features(observations: pd.DataFrame) -> pd.DataFrame:
                     running_high[c] = max(running_high[c], cur)
                     if not np.isfinite(first_vals[c]) and cur != 0:
                         first_vals[c] = float(cur)
+
+            if emit_timestamp is not None and pd.Timestamp(src.snapshot_at) != emit_timestamp:
+                continue
+
+            feat: dict[str, Any] = {"token_key": token, "snapshot_at": src.snapshot_at}
+            for c in numeric_cols:
+                v = pd.to_numeric(pd.Series([src[c]]), errors="coerce").iloc[0]
+                feat[f"raw__{c}"] = float(v) if pd.notna(v) else np.nan
+
+            for c in trajectory_bases:
+                cur = arrays[c][i]
                 first = first_vals[c]
                 feat[f"life__{c}__multiple_from_first"] = cur / first if np.isfinite(cur) and np.isfinite(first) and first != 0 else np.nan
                 feat[f"life__{c}__fraction_of_high"] = cur / running_high[c] if np.isfinite(cur) and running_high[c] > 0 else np.nan

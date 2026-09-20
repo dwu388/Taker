@@ -70,6 +70,15 @@ remain unsampled and use every eligible evaluation row.
 - Forecast and policy promotion use paired token-level bootstrap evidence.
 - A policy champion whose target/execution/schema hashes do not match the active 24h generation is excluded rather than compared as if equivalent.
 
+## Live inference and collector concurrency
+
+- Live prediction is label-free. It calculates causal current-state and sequence features directly from the newest durable raw capture; it never selects the newest row from the label-dependent training frame.
+- Every published prediction frame must contain exactly the latest usable raw `snapshot_at`. If collection advances during calculation, prediction retries and refuses to replace the last known-good CSV unless it catches up.
+- Feature and sequence calculations are read-only. Token-first cohort assignment, capture heartbeat and prediction-ledger provenance are committed together in one short, bounded-retry transaction so the collector retains write priority.
+- Prediction CSV publication is atomic. A failed or interrupted write cannot expose a partial CSV to paper trading.
+- The benchmark keeps its independent stale-prediction guard and does not write duplicate capture heartbeats into the source database. Repeated loop iterations skip model inference when the current frozen model already has predictions for the newest capture.
+- Adaptive calibration learning remains label-dependent maintenance work. Live prediction applies the latest durable calibration state; `maintain` resolves and records new calibration evidence after refreshing mature labels.
+
 ## Adaptation, calibration and full-model graduation
 
 - Probability calibration is based on out-of-fold/online-safe predictions.
