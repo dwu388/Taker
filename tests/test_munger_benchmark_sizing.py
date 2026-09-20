@@ -175,3 +175,108 @@ def test_v24_cycle_reserves_five_percent_without_retraining(tmp_path, monkeypatc
             "SELECT conviction_tier,target_position_fraction FROM benchmark_positions_v22"
         ).fetchall()
     assert tiers == [("ordinary", 0.05)] * 5
+
+def test_current_board_read_uses_only_latest_snapshot(tmp_path, monkeypatch):
+    source = tmp_path / "raw.sqlite"
+    predictions = tmp_path / "predictions.csv"
+    migrate_raw(source)
+    old = pd.Timestamp("2026-09-20T12:00:00Z")
+    latest = old + pd.Timedelta(minutes=1)
+    with sqlite3.connect(source) as conn:
+        conn.executemany(
+            """INSERT INTO axiom_observations
+            (cycle_id,token_key,name,snapshot_at,market_cap_usd,field_confidence_json,raw_ocr_json,source_json)
+            VALUES(NULL,?,?,?,?,'{}','{}','{}')""",
+            [
+                ("OLD", "Old", old.isoformat(), 10.0),
+                ("A", "Alpha", latest.isoformat(), 100.0),
+                ("B", "Beta", latest.isoformat(), 200.0),
+            ],
+        )
+        conn.commit()
+    pd.DataFrame({
+        "token_key": ["A", "B"],
+        "snapshot_at": [latest.isoformat(), latest.isoformat()],
+        "p_first_peak_by_720m": [0.8, 0.9],
+    }).to_csv(predictions, index=False)
+
+    def fail_full_history_load(*_args, **_kwargs):
+        raise AssertionError("full observation history must not be loaded")
+
+    monkeypatch.setattr(benchmark.peak, "load_observations", fail_full_history_load)
+    snapshot, current = benchmark._read_current(str(source), str(predictions))
+
+    assert snapshot == latest
+    assert current["token_key"].tolist() == ["A", "B"]
+    assert current["market_cap_usd"].tolist() == [100.0, 200.0]
+    assert "OLD" not in set(current["token_key"])
+
+
+def test_exceptional_candidate_can_exceed_five_positions_within_exposure_caps(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "raw.sqlite"
+    benchmark_db = tmp_path / "benchmark.sqlite"
+    model = tmp_path / "champion.joblib"
+    predictions = tmp_path / "predictions.csv"
+    migrate_raw(source)
+    joblib.dump({"schema_version": v24.SCHEMA_VERSION}, model)
+    predictions.write_text("token_key,v24_model_hash\n", encoding="utf-8")
+    cfg = benchmark.BenchmarkConfig(conviction_calibration_min_scores=5)
+    benchmark.init_benchmark(str(benchmark_db), cfg)
+
+    clock = {"snapshot": pd.Timestamp("2026-09-20T12:00:00Z"), "exceptional": False}
+
+    def current_frame():
+        tokens = [f"T{i}" for i in range(5)]
+        scores = [0.10, 0.20, 0.30, 0.40, 0.50]
+        if clock["exceptional"]:
+            tokens.append("EXCEPTIONAL")
+            scores.append(0.90)
+        return pd.DataFrame({
+            "token_key": tokens,
+            "market_cap_usd": [100.0] * len(tokens),
+            "pred_test_score": scores,
+            "v24_model_hash": ["frozen"] * len(tokens),
+        })
+
+    monkeypatch.setattr(
+        benchmark,
+        "_read_current",
+        lambda *_args: (clock["snapshot"], current_frame()),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "_entry_score",
+        lambda state, _policy: (float(state["pred_test_score"]), "bootstrap"),
+    )
+
+    first = benchmark.cycle(
+        str(source), str(benchmark_db), str(predictions), str(model),
+        str(tmp_path / "no-policy.joblib"), cfg,
+    )
+    assert len(first["pending_entries"]) == 5
+
+    clock["snapshot"] += pd.Timedelta(minutes=1)
+    clock["exceptional"] = True
+    overflow_decision = benchmark.cycle(
+        str(source), str(benchmark_db), str(predictions), str(model),
+        str(tmp_path / "no-policy.joblib"), cfg,
+    )
+    assert len(overflow_decision["entries"]) == 5
+    assert len(overflow_decision["pending_entries"]) == 1
+    overflow = overflow_decision["pending_entries"][0]
+    assert overflow["token_key"] == "EXCEPTIONAL"
+    assert overflow["conviction_tier"] == "exceptional"
+    assert overflow["reserved_cash_usd"] == pytest.approx(50.0)
+    assert overflow_decision["committed_exposure_fraction"] == pytest.approx(0.30)
+
+    clock["snapshot"] += pd.Timedelta(minutes=1)
+    filled = benchmark.cycle(
+        str(source), str(benchmark_db), str(predictions), str(model),
+        str(tmp_path / "no-policy.joblib"), cfg,
+    )
+    assert filled["open_positions"] == 6
+    assert filled["entries"][0]["token_key"] == "EXCEPTIONAL"
+    assert filled["execution_cash_usd"] == pytest.approx(700.0)
+

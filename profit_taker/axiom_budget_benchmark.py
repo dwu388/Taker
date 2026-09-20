@@ -346,7 +346,11 @@ def _cycle_v24(
                     "kind": kind,
                 })
         candidates.sort(key=lambda x: x["score"], reverse=True)
-        slots = max(0, config.max_open_positions - len(open_positions) - len(pending_tokens))
+        # Five positions is the normal diversification limit. Candidates that
+        # causally qualify for the exceptional tier may exceed that count, but
+        # never the portfolio, cash-reserve, per-position, or risk-bucket caps.
+        occupied_positions = len(open_positions) + len(pending_tokens)
+        base_slots = max(0, config.max_open_positions - occupied_positions)
         risk_buckets = _correlation_buckets(
             source_db,
             open_tokens | pending_tokens | {str(c["token_key"]) for c in candidates},
@@ -402,7 +406,11 @@ def _cycle_v24(
         cash_after_reservations = max(0.0, min(cash, execution_cash) - reserved)
         selected = []
         for c in eligible:
-            if len(selected) >= slots:
+            within_base_limit = len(selected) < base_slots
+            exceptional_overflow = (
+                not within_base_limit and c["conviction_tier"] == "exceptional"
+            )
+            if not within_base_limit and not exceptional_overflow:
                 c["selection_reason"] = "position_slot_limit"
                 continue
             bucket = c["risk_bucket"]
@@ -420,7 +428,9 @@ def _cycle_v24(
                 continue
             c["chosen"] = True
             c["reserved_cash"] = reserve
-            c["selection_reason"] = "selected"
+            c["selection_reason"] = (
+                "selected_exceptional_overflow" if exceptional_overflow else "selected"
+            )
             selected.append(c)
             cash_after_reservations -= reserve
             committed_total += reserve

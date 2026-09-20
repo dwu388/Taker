@@ -826,19 +826,47 @@ def _state_with_position(state: dict[str, float], pos: sqlite3.Row, mc: float, s
 
 
 def _read_current(source_db: str, predictions_path: str) -> tuple[pd.Timestamp, pd.DataFrame]:
+    """Read only the newest observable board before joining frozen predictions.
+
+    The trading decision consumes current visibility and prices; historical
+    features have already been incorporated into the prediction file.  Avoid
+    materializing the entire observation history a second time on every cycle.
+    """
     _require_v21()
     preds = _load_predictions(predictions_path)
     with sqlite3.connect(source_db, timeout=10.0) as src:
         src.execute("PRAGMA busy_timeout=10000")
         src.execute("PRAGMA query_only=ON")
-        observations, _ = peak.load_observations(src)
-    if observations.empty:
-        raise RuntimeError("No Axiom observations are available in the source database.")
-    snapshot = observations["snapshot_at"].max()
-    current_obs = observations[observations["snapshot_at"] == snapshot].copy()
-    current_obs = current_obs.sort_values("token_key").drop_duplicates("token_key", keep="last")
-    keep = ["token_key", "market_cap_usd"] + (["name"] if "name" in current_obs.columns else [])
-    current_obs = current_obs[keep]
+        latest = src.execute(
+            "SELECT snapshot_at FROM axiom_observations "
+            "ORDER BY snapshot_at DESC LIMIT 1"
+        ).fetchone()
+        if latest is None:
+            raise RuntimeError("No Axiom observations are available in the source database.")
+        latest_snapshot_raw = str(latest[0])
+        current_obs = pd.read_sql_query(
+            """
+            SELECT observation_id,token_key,market_cap_usd,name
+            FROM axiom_observations
+            WHERE snapshot_at=?
+            ORDER BY observation_id
+            """,
+            src,
+            params=(latest_snapshot_raw,),
+        )
+
+    if current_obs.empty:
+        raise RuntimeError("No Axiom observations are available in the newest source snapshot.")
+    snapshot = _to_ts(latest_snapshot_raw)
+    current_obs["market_cap_usd"] = pd.to_numeric(
+        current_obs["market_cap_usd"], errors="coerce"
+    )
+    current_obs = (
+        current_obs.sort_values("observation_id")
+        .drop_duplicates("token_key", keep="last")
+        .sort_values("token_key")
+    )
+    current_obs = current_obs[["token_key", "market_cap_usd", "name"]]
     pred_snapshot = _prediction_snapshot(preds)
     if pred_snapshot is not None and abs((pred_snapshot - snapshot).total_seconds()) > 180:
         raise RuntimeError(
