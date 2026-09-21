@@ -90,6 +90,7 @@ def process_rows(
     raw_clipboard_text: str | None = None,
     attempt_started_at: str | None = None,
     attempt_source: str = "interactive_clipboard",
+    write_review_artifacts: bool = True,
 ) -> dict[str, Any]:
     """Persist one complete capture or roll back the entire capture."""
     detected = len(rows) if screenshot_rows_detected is None else int(screenshot_rows_detected)
@@ -127,6 +128,7 @@ def process_rows(
         raw_clipboard_text=raw_clipboard_text,
         attempt_started_at=attempt_started_at,
         attempt_source=attempt_source,
+        write_review_artifacts=write_review_artifacts,
     )
     if int(result.get("rows_inserted", -1)) != len(rows) or int(result.get("rows_stored", -1)) != len(rows):
         raise RuntimeError(

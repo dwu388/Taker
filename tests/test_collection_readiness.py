@@ -62,6 +62,31 @@ def test_post_commit_artifact_failure_is_nonfatal(tmp_path):
         assert con.execute("SELECT COUNT(*) FROM capture_payloads").fetchone()[0] == 1
 
 
+def test_database_only_capture_writes_no_manual_review_files(tmp_path):
+    db = tmp_path / "raw.sqlite"
+    artifacts = tmp_path / "artifacts"
+    initialize_collection(str(db))
+    out = process_rows(
+        str(db),
+        "2026-08-29T12:00:00.000+00:00",
+        None,
+        [_row()],
+        True,
+        artifacts,
+        screenshot_rows_detected=1,
+        raw_clipboard_text="raw",
+        write_review_artifacts=False,
+    )
+
+    assert db.is_file()
+    assert not artifacts.exists()
+    assert out["database"] == str(db)
+    assert out["artifact_mode"] == "database_only"
+    assert out["artifact_write_errors"] == []
+    assert "json" not in out
+    assert "csv" not in out
+
+
 def test_failed_attempt_keeps_debug_payload_out_of_observations(tmp_path):
     db = tmp_path / "raw.sqlite"; initialize_collection(str(db))
     attempt_id = record_failed_capture_attempt(str(db), started_at="2026-08-29T12:00:00+00:00", clipboard_valid=True, rows_detected=2, error_type="RuntimeError", error_message="parse incomplete", raw_clipboard_text="failed raw text", details={"candidate_cards": 3})

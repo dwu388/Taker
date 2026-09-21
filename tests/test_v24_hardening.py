@@ -156,6 +156,54 @@ def test_runner_passes_actual_rows_detected(tmp_path, monkeypatch):
     assert result["rows_stored"] == len(rows)
 
 
+def test_loop_database_only_mode_skips_per_cycle_review_files(tmp_path, monkeypatch):
+    selection = tmp_path / "capture.txt"
+    selection.write_text("synthetic", encoding="utf-8")
+    rows = [{"token_key": "a", "market_cap_usd": 1.0}]
+    captured = {}
+
+    monkeypatch.setattr(runner, "clipboard_looks_like_axiom", lambda text: True)
+    monkeypatch.setattr(runner, "rows_from_clipboard", lambda text: list(rows))
+    monkeypatch.setattr(runner, "clipboard_diagnostics", lambda text, parsed: {"observations": len(parsed)})
+
+    def fake_process(
+        db,
+        snapshot,
+        source,
+        parsed,
+        valid,
+        output_dir,
+        *,
+        screenshot_rows_detected=None,
+        write_review_artifacts=True,
+    ):
+        captured["source"] = source
+        captured["write_review_artifacts"] = write_review_artifacts
+        return {"rows_stored": len(parsed), "artifact_write_errors": []}
+
+    monkeypatch.setattr(runner, "process_rows", fake_process)
+    artifacts = tmp_path / "artifacts"
+    args = SimpleNamespace(
+        config=str(tmp_path / "missing.json"),
+        clipboard_file=str(selection),
+        output_dir=str(artifacts),
+        db=str(tmp_path / "live.sqlite"),
+        database_only=True,
+    )
+    result = runner.run_once(args, 1)
+
+    assert captured["source"] == str(selection)
+    assert captured["write_review_artifacts"] is False
+    assert result["artifact_mode"] == "database_only"
+    assert result["artifact_cleanup"] == {"skipped": True, "reason": "database_only"}
+    assert not artifacts.exists()
+
+
+def test_run_axiom_loop_enforces_database_only_mode():
+    launcher = Path(__file__).resolve().parents[1] / "run_axiom_loop.bat"
+    assert "--database-only" in launcher.read_text(encoding="utf-8")
+
+
 def test_artifact_pruning_is_best_effort(tmp_path, monkeypatch):
     out = tmp_path / "artifacts"
     out.mkdir()
