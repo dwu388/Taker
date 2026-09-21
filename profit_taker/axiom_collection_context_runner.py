@@ -97,7 +97,7 @@ def _record_context(db: str, cycle_id: int, post_ms: float) -> dict[str, Any]:
         details = {
             "latency_semantics": {
                 "capture_control_latency_ms": "wall clock inside browser/clipboard capture macro including configured waits",
-                "post_capture_processing_latency_ms": "wall clock after clipboard return through parsing, atomic persistence and best-effort artifacts",
+                "post_capture_processing_latency_ms": "wall clock after clipboard return through parsing, atomic persistence and optional manual-review artifacts",
             },
             "rows_detected": int(cycle["rows_detected"]),
         }

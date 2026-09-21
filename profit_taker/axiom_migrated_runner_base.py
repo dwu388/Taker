@@ -279,12 +279,16 @@ def run_once(args, cycle_count: int, *, attempt_started_at: str | None = None) -
     invalid_market_cap = [i for i, row in enumerate(rows) if row.get("market_cap_usd") is None or float(row.get("market_cap_usd") or 0.0) <= 0.0]
     if invalid_market_cap:
         raise _capture_error(f"Clipboard rows lack positive market cap at indexes {invalid_market_cap}; partial capture was rejected", text=clipboard_text, valid=True, rows=len(rows), candidates=candidate_cards)
+    database_only = bool(getattr(args, "database_only", False))
     out_dir = Path(args.output_dir)
     stem = _safe_capture_stem(snapshot_at)
     selection_path = out_dir / f"{stem}.selection.txt"
+    source_path = args.clipboard_file if database_only and args.clipboard_file else (
+        None if database_only else str(selection_path)
+    )
     diag = clipboard_diagnostics(clipboard_text, rows)
     diag["snapshot_at"] = snapshot_at
-    diag["selection_path"] = str(selection_path)
+    diag["selection_path"] = source_path
     diag["candidate_mc_blocks"] = candidate_cards
     diag["parse_complete"] = True
     try:
@@ -296,15 +300,23 @@ def run_once(args, cycle_count: int, *, attempt_started_at: str | None = None) -
             process_kwargs["attempt_started_at"] = attempt_started_at or snapshot_at
         if "attempt_source" in process_parameters:
             process_kwargs["attempt_source"] = attempt_source
-        result = process_rows(args.db, snapshot_at, str(selection_path), rows, True, args.output_dir, **process_kwargs)
+        if "write_review_artifacts" in process_parameters:
+            process_kwargs["write_review_artifacts"] = not database_only
+        result = process_rows(args.db, snapshot_at, source_path, rows, True, args.output_dir, **process_kwargs)
     except Exception as exc:
         _attach_capture_context(exc, clipboard_text=clipboard_text, clipboard_valid=True, rows_detected=len(rows), candidate_cards=candidate_cards)
         raise
     artifact_errors = list(result.get("artifact_write_errors") or [])
-    artifact_errors.extend(_best_effort_selection_artifacts(args.output_dir, stem, clipboard_text, diag))
+    if not database_only:
+        artifact_errors.extend(_best_effort_selection_artifacts(args.output_dir, stem, clipboard_text, diag))
+        result["artifact_cleanup"] = _prune_cycle_artifacts(
+            args.output_dir, keep_cycles=ARTIFACT_RETENTION_CYCLES
+        )
+    else:
+        result["artifact_cleanup"] = {"skipped": True, "reason": "database_only"}
     result["artifact_write_errors"] = artifact_errors
+    result["artifact_mode"] = "database_only" if database_only else "manual_review"
     result["clipboard_report"] = diag
-    result["artifact_cleanup"] = _prune_cycle_artifacts(args.output_dir, keep_cycles=ARTIFACT_RETENTION_CYCLES)
     return result
 
 
@@ -313,6 +325,11 @@ def main() -> None:
     ap.add_argument("--db", default=RAW_DB_DEFAULT)
     ap.add_argument("--config", default="axiom_migrated_config.json")
     ap.add_argument("--output-dir", default="data/axiom_migrated")
+    ap.add_argument(
+        "--database-only",
+        action="store_true",
+        help="Store the durable SQLite capture only; skip per-cycle TXT/JSON/CSV review files",
+    )
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--clipboard-file", help="Replay a saved Axiom .selection.txt instead of controlling the browser")
     args = ap.parse_args()

@@ -38,6 +38,7 @@ old 72h forecaster/policy champions are not warm-promoted into the new generatio
 - `profit_taker/axiom_migrated_runner.py`: production-hardened one-minute clipboard-only Axiom capture. No screenshots or OCR.
 - `profit_taker/axiom_clipboard.py`: Axiom clipboard parsing, complete-card validation and full-mint matching.
 - `profit_taker/axiom_migrated_process.py`: atomic raw observation + exact-payload persistence; silent duplicate loss is forbidden.
+- `run_axiom_loop.bat`: production collection is database-only. It stores parsed rows and the compressed, hashed raw clipboard payload in SQLite without writing four per-cycle manual-review files.
 - `profit_taker/collection_admin.py`: fresh-session initialization and end-to-end raw collection integrity audit.
 - `profit_taker/axiom_peak_structure.py`: 24h confirmation-safe recurrent peak structure, natural-age-out protection and causal feature cache; operational DB IDs are excluded from model inputs.
 - `profit_taker/axiom_self_teach.py`: paper-policy compatibility substrate, including next-observable fills and behavior-policy accounting.

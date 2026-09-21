@@ -141,6 +141,7 @@ def process_rows(
     raw_clipboard_text: str | None = None,
     attempt_started_at: str | None = None,
     attempt_source: str = "interactive_clipboard",
+    write_review_artifacts: bool = True,
 ) -> dict[str, Any]:
     migrate(db_path)
     con = connect(db_path)
@@ -226,42 +227,47 @@ def process_rows(
     finally:
         con.close()
 
-    stem = Path(source_path).stem if source_path else snapshot_at.replace(":", "-")
-    outdir = Path(output_dir)
-    json_path = outdir / f"{stem}.rows.json"
-    csv_path = outdir / f"{stem}.rows.csv"
     artifact_errors: list[str] = []
-    try:
-        outdir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        artifact_errors.append(f"mkdir {outdir}: {type(exc).__name__}: {exc}")
-    else:
+    review_paths: dict[str, str] = {}
+    if write_review_artifacts:
+        stem = Path(source_path).stem if source_path else snapshot_at.replace(":", "-")
+        outdir = Path(output_dir)
+        json_path = outdir / f"{stem}.rows.json"
+        csv_path = outdir / f"{stem}.rows.csv"
+        review_paths = {"json": str(json_path), "csv": str(csv_path)}
         try:
-            json_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            outdir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            artifact_errors.append(f"write {json_path}: {type(exc).__name__}: {exc}")
-        flat_fields = [
-            "token_key","token_address","name","short_address_hint","data_origin","training_eligible","age_minutes",
-            "market_cap_usd","volume_usd","fees_sol","txns","holders","pro_traders","kols",
-            "dev_migrations","dev_creations","recent_visitors","top10_holders_pct","funding_time_minutes",
-            "sniper_pct","insider_pct","bundler_pct","dex_paid",
-        ]
-        try:
-            with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=flat_fields)
-                writer.writeheader()
-                writer.writerows([{k: r.get(k) for k in flat_fields} for r in rows])
-        except OSError as exc:
-            artifact_errors.append(f"write {csv_path}: {type(exc).__name__}: {exc}")
-    return {
+            artifact_errors.append(f"mkdir {outdir}: {type(exc).__name__}: {exc}")
+        else:
+            try:
+                json_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            except OSError as exc:
+                artifact_errors.append(f"write {json_path}: {type(exc).__name__}: {exc}")
+            flat_fields = [
+                "token_key","token_address","name","short_address_hint","data_origin","training_eligible","age_minutes",
+                "market_cap_usd","volume_usd","fees_sol","txns","holders","pro_traders","kols",
+                "dev_migrations","dev_creations","recent_visitors","top10_holders_pct","funding_time_minutes",
+                "sniper_pct","insider_pct","bundler_pct","dex_paid",
+            ]
+            try:
+                with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.DictWriter(f, fieldnames=flat_fields)
+                    writer.writeheader()
+                    writer.writerows([{k: r.get(k) for k in flat_fields} for r in rows])
+            except OSError as exc:
+                artifact_errors.append(f"write {csv_path}: {type(exc).__name__}: {exc}")
+    result = {
         "cycle_id": cycle_id,
         "rows_input": len(rows),
         "rows_inserted": rows_inserted,
         "rows_stored": len(stored),
         "collection_mode": "clipboard_only",
+        "database": str(db_path),
+        "artifact_mode": "manual_review" if write_review_artifacts else "database_only",
         "raw_payload_sha256": payload_sha,
         "raw_payload_bytes": payload_bytes,
-        "json": str(json_path),
-        "csv": str(csv_path),
         "artifact_write_errors": artifact_errors,
     }
+    result.update(review_paths)
+    return result
