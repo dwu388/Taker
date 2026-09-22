@@ -52,6 +52,29 @@ are capped at 30%, at least 70% remains unreserved cash, and empirically highly
 correlated tokens share a 15% risk-bucket cap. Existing benchmark databases gain
 these defaults through the additive migration; no model retraining is required.
 
+The paper wallet also treats each token as a recurrent swing lifecycle. When the
+minute-sensitive heads are present, a new entry must have a positive, friction-
+adjusted setup across the 5/10/15/30/60-minute peak probabilities, next-occurrence
+quantiles and next-peak magnitude. Broader later-higher, second-peak, downside and
+death forecasts provide lifecycle context rather than substituting for a timely
+entry signal.
+
+An approaching first peak is a decision boundary, not an automatic sale. The
+wallet compares remaining hold-through value with the value of selling, releasing
+capital and retaining an option to re-enter. Strong, nearby second-peak evidence
+keeps the position open. A swing sale creates a durable watch record. Before the
+normal 20-minute cooldown expires, the same token can re-enter only after all of
+these are observed causally: a minimum three-minute wait, enough retracement to
+cover at least twice modeled round-trip friction, lifecycle evidence for another
+peak, and a newly recomputed qualifying short-term setup. This prevents immediate
+SELL/BUY churn while allowing an early second swing when the evidence supports it.
+
+The strategy remains next-observation executable and paper-only. It does not alter
+V24 training labels, retrain a champion, feed benchmark results into training, or
+use future data. `v24_benchmark.bat status` reports active watches, completed
+re-entries, tokens with multiple swings and the highest swing sequence; benchmark
+exports include the swing-watch ledger.
+
 V24 model outputs default to `models/axiom_v24`, policy artifacts to
 `models/axiom_policy_v24`, and predictions to `data/axiom_predictions_v24.csv`.
 

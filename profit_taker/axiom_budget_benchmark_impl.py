@@ -64,6 +64,24 @@ class BenchmarkConfig:
     missing_close_minutes: float = 50.0
     reentry_cooldown_minutes: float = 20.0
     friction_bps_round_trip: float = 100.0
+    # Recurrent swing overlay. Short-horizon heads answer "buy now"; recurrent
+    # lifecycle heads decide whether an approaching peak should be held through
+    # or converted into a watched, retracement-gated re-entry opportunity.
+    recurrent_swing_enabled: bool = True
+    swing_entry_min_probability: float = 0.55
+    swing_entry_max_occurrence_minutes: float = 60.0
+    swing_entry_min_net_upside: float = 0.02
+    swing_peak_boundary_minutes: float = 10.0
+    swing_peak_boundary_probability: float = 0.55
+    swing_exit_min_return: float = 0.03
+    swing_hold_later_probability: float = 0.65
+    swing_hold_min_second_upside: float = 0.05
+    swing_hold_max_second_gap_minutes: float = 30.0
+    swing_reentry_min_minutes: float = 3.0
+    swing_reentry_min_retrace: float = 0.03
+    swing_watch_min_later_probability: float = 0.35
+    swing_watch_min_second_upside: float = 0.03
+    swing_watch_max_minutes: float = 240.0
     # For unavailable/disappeared tokens, preserve all observed downside but only
     # recognize this fraction of positive MC movement in the execution ledger.
     # 0.0 means a stale/disappearance mark can never create paper profit.
@@ -346,6 +364,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         "execution_realized_pnl_usd REAL",
         "observed_realized_return_pct REAL",
         "execution_realized_return_pct REAL",
+        "swing_watch_id TEXT",
+        "swing_sequence INTEGER NOT NULL DEFAULT 1",
     ):
         _ensure_column(conn, "benchmark_positions_v22", definition)
 
@@ -361,6 +381,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         "target_position_fraction REAL",
         "target_cash_usd REAL",
         "risk_bucket TEXT",
+        "swing_watch_id TEXT",
         "selection_reason TEXT",
     ):
         _ensure_column(conn, "benchmark_candidates_v22", definition)
@@ -369,6 +390,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         "conviction_tier TEXT",
         "target_position_fraction REAL",
         "risk_bucket TEXT",
+        "swing_watch_id TEXT",
     ):
         _ensure_column(conn, "benchmark_pending_entries_v24", definition)
 
@@ -469,6 +491,30 @@ def _validate_munger_config(config: BenchmarkConfig) -> None:
         raise ValueError("Correlation threshold must be between 0 and 1.")
     if config.correlation_min_overlap < 2 or config.correlation_lookback_minutes <= 0:
         raise ValueError("Correlation lookback and overlap must be positive.")
+    probabilities = (
+        config.swing_entry_min_probability,
+        config.swing_peak_boundary_probability,
+        config.swing_hold_later_probability,
+        config.swing_watch_min_later_probability,
+    )
+    if any(not (0.0 <= float(value) <= 1.0) for value in probabilities):
+        raise ValueError("Recurrent swing probability thresholds must be between 0 and 1.")
+    if any(float(value) < 0.0 for value in (
+        config.swing_entry_min_net_upside,
+        config.swing_exit_min_return,
+        config.swing_hold_min_second_upside,
+        config.swing_reentry_min_retrace,
+        config.swing_watch_min_second_upside,
+    )):
+        raise ValueError("Recurrent swing return/retrace thresholds cannot be negative.")
+    if any(float(value) <= 0.0 for value in (
+        config.swing_entry_max_occurrence_minutes,
+        config.swing_peak_boundary_minutes,
+        config.swing_hold_max_second_gap_minutes,
+        config.swing_reentry_min_minutes,
+        config.swing_watch_max_minutes,
+    )):
+        raise ValueError("Recurrent swing timing thresholds must be positive.")
 
 
 def _conviction_thresholds(
@@ -1584,6 +1630,39 @@ def status(db: str) -> dict[str, Any]:
         )
         committed_exposure = open_cost_exposure + pending_exposure
         committed_fraction = committed_exposure / execution_equity if execution_equity > 0 else None
+        swing_summary = {
+            "enabled": bool(config.recurrent_swing_enabled),
+            "active_watches": 0,
+            "reentries_completed": 0,
+            "tokens_with_multiple_swings": 0,
+            "maximum_swing_sequence": 1,
+        }
+        watch_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='benchmark_swing_watch_v24'"
+        ).fetchone()
+        if watch_exists:
+            watch_counts = dict(conn.execute(
+                """SELECT status,COUNT(*) FROM benchmark_swing_watch_v24
+                WHERE benchmark_id=? GROUP BY status""",
+                (bid,),
+            ).fetchall())
+            swing_summary["active_watches"] = int(watch_counts.get("active", 0))
+            swing_summary["reentries_completed"] = int(watch_counts.get("reentered", 0))
+        if "swing_sequence" in open_.columns or "swing_sequence" in closed.columns:
+            sequences = pd.concat([
+                pd.to_numeric(open_.get("swing_sequence", pd.Series(dtype=float)), errors="coerce"),
+                pd.to_numeric(closed.get("swing_sequence", pd.Series(dtype=float)), errors="coerce"),
+            ]).dropna()
+            if not sequences.empty:
+                swing_summary["maximum_swing_sequence"] = int(sequences.max())
+            repeated = conn.execute(
+                """SELECT COUNT(*) FROM (
+                    SELECT token_key FROM benchmark_positions_v22
+                    WHERE benchmark_id=? GROUP BY token_key HAVING MAX(swing_sequence)>1
+                )""",
+                (bid,),
+            ).fetchone()
+            swing_summary["tokens_with_multiple_swings"] = int(repeated[0] if repeated else 0)
 
         return {
             "initialized": True,
@@ -1643,6 +1722,7 @@ def status(db: str) -> dict[str, Any]:
                 "committed_exposure_usd": committed_exposure,
                 "committed_exposure_fraction": committed_fraction,
             },
+            "recurrent_swing_policy": swing_summary,
             "friction_stress_fixed_trade_replay": friction_stress,
             "closed_trades": int(len(closed)),
             "disappearance_terminal_trades": disappearance_count,
@@ -1670,6 +1750,10 @@ def export(db: str, out_dir: str) -> dict[str, str]:
             "marks": "benchmark_marks_v22",
             "candidates": "benchmark_candidates_v22",
         }
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='benchmark_swing_watch_v24'"
+        ).fetchone():
+            tables["swing_watches"] = "benchmark_swing_watch_v24"
         paths: dict[str, str] = {}
         for name, table in tables.items():
             df = pd.read_sql_query(f"SELECT * FROM {table} WHERE benchmark_id=?", conn, params=(bid,))
@@ -1792,6 +1876,24 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--missing-close-minutes", type=float, default=d.missing_close_minutes)
     p.add_argument("--reentry-cooldown-minutes", type=float, default=d.reentry_cooldown_minutes)
     p.add_argument("--friction-bps-round-trip", type=float, default=d.friction_bps_round_trip)
+    p.add_argument(
+        "--no-recurrent-swing", dest="recurrent_swing_enabled", action="store_false",
+        default=d.recurrent_swing_enabled,
+    )
+    p.add_argument("--swing-entry-min-probability", type=float, default=d.swing_entry_min_probability)
+    p.add_argument("--swing-entry-max-occurrence-minutes", type=float, default=d.swing_entry_max_occurrence_minutes)
+    p.add_argument("--swing-entry-min-net-upside", type=float, default=d.swing_entry_min_net_upside)
+    p.add_argument("--swing-peak-boundary-minutes", type=float, default=d.swing_peak_boundary_minutes)
+    p.add_argument("--swing-peak-boundary-probability", type=float, default=d.swing_peak_boundary_probability)
+    p.add_argument("--swing-exit-min-return", type=float, default=d.swing_exit_min_return)
+    p.add_argument("--swing-hold-later-probability", type=float, default=d.swing_hold_later_probability)
+    p.add_argument("--swing-hold-min-second-upside", type=float, default=d.swing_hold_min_second_upside)
+    p.add_argument("--swing-hold-max-second-gap-minutes", type=float, default=d.swing_hold_max_second_gap_minutes)
+    p.add_argument("--swing-reentry-min-minutes", type=float, default=d.swing_reentry_min_minutes)
+    p.add_argument("--swing-reentry-min-retrace", type=float, default=d.swing_reentry_min_retrace)
+    p.add_argument("--swing-watch-min-later-probability", type=float, default=d.swing_watch_min_later_probability)
+    p.add_argument("--swing-watch-min-second-upside", type=float, default=d.swing_watch_min_second_upside)
+    p.add_argument("--swing-watch-max-minutes", type=float, default=d.swing_watch_max_minutes)
     p.add_argument(
         "--disappearance-profit-recognition-fraction", type=float,
         default=d.disappearance_profit_recognition_fraction,
