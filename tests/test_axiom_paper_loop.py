@@ -1,5 +1,4 @@
 from contextlib import closing
-from datetime import datetime
 import multiprocessing as mp
 from pathlib import Path
 import sqlite3
@@ -174,8 +173,11 @@ def test_capture_continues_while_spawned_worker_is_blocked(tmp_path, monkeypatch
         worker.join(10)
     assert worker.exitcode == 0
     assert len(messages) == 4
-    assert all(message['seconds_until_next_capture'] >= 0 for message in messages)
-    assert all(datetime.fromisoformat(message['next_capture_at']) for message in messages)
+    assert all(
+        message['next_capture_at_pacific'].endswith((' PST', ' PDT'))
+        for message in messages
+    )
+    assert all('seconds_until_next_capture' not in message for message in messages)
 
 
 def test_paper_cycle_reports_current_observed_equity(tmp_path, monkeypatch):
