@@ -871,22 +871,46 @@ def _state_with_position(state: dict[str, float], pos: sqlite3.Row, mc: float, s
     return out
 
 
-def _read_current(source_db: str, predictions_path: str) -> tuple[pd.Timestamp, pd.DataFrame]:
-    """Read only the newest observable board before joining frozen predictions.
+def _read_current(
+    source_db: str,
+    predictions_path: str,
+    *,
+    exact_prediction_snapshot: bool = False,
+) -> tuple[pd.Timestamp, pd.DataFrame]:
+    """Read the selected observable board before joining frozen predictions.
 
-    The trading decision consumes current visibility and prices; historical
-    features have already been incorporated into the prediction file.  Avoid
-    materializing the entire observation history a second time on every cycle.
+    Normal callers select the newest board. Live paper decisions select the
+    prediction frame's exact board so concurrent collection cannot mix an older
+    forecast with newer prices. Historical features have already been
+    incorporated into the prediction file, so this avoids materializing the
+    entire observation history a second time on every cycle.
     """
     _require_v21()
     preds = _load_predictions(predictions_path)
+    pred_snapshot = _prediction_snapshot(preds)
     with sqlite3.connect(source_db, timeout=10.0) as src:
         src.execute("PRAGMA busy_timeout=10000")
         src.execute("PRAGMA query_only=ON")
-        latest = src.execute(
-            "SELECT snapshot_at FROM axiom_observations "
-            "ORDER BY snapshot_at DESC LIMIT 1"
-        ).fetchone()
+        if exact_prediction_snapshot and pred_snapshot is not None:
+            # SQLite stores the collector's original ISO spelling, while pandas
+            # may normalize ``Z``/``+00:00`` or remove trailing zero fractions.
+            # Narrow to the second, then compare parsed instants exactly.
+            candidates = src.execute(
+                "SELECT DISTINCT snapshot_at FROM axiom_observations "
+                "WHERE snapshot_at LIKE ? ORDER BY snapshot_at",
+                (pred_snapshot.strftime("%Y-%m-%dT%H:%M:%S") + "%",),
+            ).fetchall()
+            matches = [row for row in candidates if _to_ts(row[0]) == pred_snapshot]
+            latest = matches[0] if len(matches) == 1 else None
+        else:
+            latest = src.execute(
+                "SELECT snapshot_at FROM axiom_observations "
+                "ORDER BY snapshot_at DESC LIMIT 1"
+            ).fetchone()
+        if latest is None and exact_prediction_snapshot:
+            raise RuntimeError(
+                "Prediction snapshot does not identify exactly one durable Axiom board."
+            )
         if latest is None:
             raise RuntimeError("No Axiom observations are available in the source database.")
         latest_snapshot_raw = str(latest[0])
@@ -913,7 +937,6 @@ def _read_current(source_db: str, predictions_path: str) -> tuple[pd.Timestamp, 
         .sort_values("token_key")
     )
     current_obs = current_obs[["token_key", "market_cap_usd", "name"]]
-    pred_snapshot = _prediction_snapshot(preds)
     if pred_snapshot is not None and abs((pred_snapshot - snapshot).total_seconds()) > 180:
         raise RuntimeError(
             f"Prediction CSV is stale: predictions={pred_snapshot.isoformat()}, latest_capture={snapshot.isoformat()}"
@@ -1766,7 +1789,13 @@ def export(db: str, out_dir: str) -> dict[str, str]:
         return paths
 
 
-def refresh_predictions(source_db: str, forecast_model: str, predictions_path: str) -> dict[str, Any]:
+def refresh_predictions(
+    source_db: str,
+    forecast_model: str,
+    predictions_path: str,
+    *,
+    require_latest: bool = True,
+) -> dict[str, Any]:
     _require_v21()
     if not Path(forecast_model).exists():
         raise RuntimeError(f"Forecast champion does not exist: {forecast_model}")
@@ -1796,23 +1825,27 @@ def refresh_predictions(source_db: str, forecast_model: str, predictions_path: s
                     "forecaster": "v24",
                     "skipped": True,
                     "reason": "prediction_already_current_for_frozen_model",
+                    "snapshot_at": predicted_at.isoformat(),
                 }
         cfg = v24.V24Config()
         # This isolated benchmark has training feedback disabled. Its prediction
         # refresh must therefore remain read-only against the collector database;
         # cycle() records benchmark decisions in benchmark_db instead.
+        prediction_kwargs = {"persist_source": False}
+        if not require_latest:
+            prediction_kwargs["require_latest"] = False
         rows = v24.predict_current(
-            source_db,
-            forecast_model,
-            predictions_path,
-            cfg,
-            persist_source=False,
+            source_db, forecast_model, predictions_path, cfg, **prediction_kwargs,
         )
+        snapshots = set(pd.to_datetime(rows["snapshot_at"], format="ISO8601", utc=True))
+        if len(snapshots) != 1:
+            raise RuntimeError("V24 prediction did not produce exactly one snapshot.")
         return {
             "rows": len(rows),
             "out": predictions_path,
             "forecaster": "v24",
             "skipped": False,
+            "snapshot_at": next(iter(snapshots)).isoformat(),
             "source_db_writes": False,
             "training_feedback": "disabled",
         }

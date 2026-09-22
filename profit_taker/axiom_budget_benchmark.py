@@ -25,7 +25,14 @@ def _cycle_v24(
     *, live_decisions: bool = False,
 ) -> dict[str, Any]:
     _require_v21()
-    snapshot, current = _read_current(source_db, predictions_path)
+    if live_decisions:
+        snapshot, current = _read_current(
+            source_db,
+            predictions_path,
+            exact_prediction_snapshot=True,
+        )
+    else:
+        snapshot, current = _read_current(source_db, predictions_path)
     loaded_policy = _load_bundle(policy_model)
     forecast_bundle = _load_bundle(forecast_model)
     available_policy_hash = _hash_file(policy_model)

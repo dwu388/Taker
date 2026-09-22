@@ -77,7 +77,7 @@ remain unsampled and use every eligible evaluation row.
 ## Live inference and collector concurrency
 
 - Live prediction is label-free. It calculates causal current-state and sequence features directly from the newest durable raw capture; it never selects the newest row from the label-dependent training frame.
-- Every published prediction frame must contain exactly the latest usable raw `snapshot_at`. If collection advances during calculation, prediction retries and refuses to replace the last known-good CSV unless it catches up.
+- Ordinary live prediction frames must contain exactly the latest usable raw `snapshot_at`. If collection advances during calculation, prediction retries and refuses to replace the last known-good CSV unless it catches up. The isolated paper loop is deliberately different: its read-only predictor may publish the exact consistent snapshot on which inference began while the independent ingester advances, then the wallet evaluates that same board and coalesces its next decision to the newest durable board.
 - Feature and sequence calculations are read-only. Token-first cohort assignment, capture heartbeat and prediction-ledger provenance are committed together in one short, bounded-retry transaction so the collector retains write priority.
 - Prediction CSV publication is atomic. A failed or interrupted write cannot expose a partial CSV to paper trading.
 - The benchmark keeps its independent stale-prediction guard and does not write duplicate capture heartbeats into the source database. Repeated loop iterations skip model inference when the current frozen model already has predictions for the newest capture.

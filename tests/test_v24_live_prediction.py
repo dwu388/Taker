@@ -242,6 +242,51 @@ def test_benchmark_refresh_explicitly_disables_source_persistence(tmp_path, monk
     assert result["training_feedback"] == "disabled"
 
 
+def test_isolated_prediction_can_publish_consistent_snapshot_after_source_advances(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "raw.sqlite"
+    _live_db(db)
+    model = tmp_path / "champion.joblib"
+    output = tmp_path / "predictions.csv"
+    joblib.dump({
+        "schema_version": impl.SCHEMA_VERSION,
+        "stable_training_cutoff": "2026-09-09T00:00:00+00:00",
+    }, model)
+    original_inputs = impl._current_inference_inputs
+    advanced = False
+
+    def advancing_inputs(conn, cfg):
+        nonlocal advanced
+        result = original_inputs(conn, cfg)
+        if not advanced:
+            advanced = True
+            with sqlite3.connect(db) as writer:
+                _insert_observation(
+                    writer, "C", "2026-09-19T20:03:06.873000+00:00", 300.0
+                )
+                writer.commit()
+        return result
+
+    def fake_predict(_conn, _bundle, current, _sequence, _cfg):
+        return current[["token_key", "snapshot_at"]].assign(p_first_peak_by_240m=0.5)
+
+    monkeypatch.setattr(impl, "_current_inference_inputs", advancing_inputs)
+    monkeypatch.setattr(impl, "predict_frame", fake_predict)
+    out = impl.predict_current(
+        str(db), str(model), str(output),
+        impl.V24Config(sequence_windows_minutes=(60,), sequence_segments=1),
+        persist_source=False, require_latest=False,
+    )
+
+    assert set(pd.to_datetime(out.snapshot_at, utc=True)) == {
+        pd.Timestamp("2026-09-19T20:02:06.873000Z")
+    }
+    assert impl._latest_observation_timestamp(str(db)) == pd.Timestamp(
+        "2026-09-19T20:03:06.873000Z"
+    )
+
+
 def test_live_write_waits_for_collector_lock_then_commits(tmp_path):
     db = tmp_path / "lock.sqlite"
     with sqlite3.connect(db) as conn:

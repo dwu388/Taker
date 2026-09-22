@@ -145,7 +145,7 @@ def test_shutdown_suppresses_wallet_and_snapshot_age_is_rechecked(tmp_path, monk
     loop.collector.process_capture(args, 'MC', loop.now_iso())
     calls = []
     stop = threading.Event()
-    def refresh(*_args):
+    def refresh(*_args, **_kwargs):
         calls.append('predict')
         stop.set()
         return {}
@@ -154,7 +154,7 @@ def test_shutdown_suppresses_wallet_and_snapshot_age_is_rechecked(tmp_path, monk
     loop.predict_and_trade(args, fake, stop)
     assert calls == ['predict']
     stop.clear()
-    def slow(*_args):
+    def slow(*_args, **_kwargs):
         calls.append('predict')
         args.max_snapshot_age_seconds = 0
         return {}
@@ -172,7 +172,7 @@ def test_live_orders_cannot_fill_on_boards_copied_during_prediction(tmp_path, mo
         'p_first_peak_by_720m': [0.9], 'pred_next_substantial_peak_multiple_q50': [2.0],
         'pred_time_to_next_substantial_peak_minutes_q50': [10.0],
         'p_death_by_720m': [0.0], 'p_hit_minus50_by_720m': [0.0], 'v24_model_hash': ['frozen']})
-    monkeypatch.setattr(benchmark, '_read_current', lambda *_: (snapshot, frame))
+    monkeypatch.setattr(benchmark, '_read_current', lambda *_, **_kw: (snapshot, frame))
     def cycle():
         return benchmark._cycle_v24(args.db, args.benchmark_db, args.predictions,
             args.forecast_model, args.policy_model, benchmark.BenchmarkConfig(), live_decisions=True)
@@ -207,12 +207,12 @@ def test_live_orders_cannot_fill_on_boards_copied_during_prediction(tmp_path, mo
     assert len(cycle()['exits']) == 1
 
 
-def test_spawned_worker_drains_on_stop_and_closes_run(tmp_path):
+def test_spawned_ingester_drains_on_stop_and_closes_run(tmp_path):
     args = args_for(tmp_path)
     joblib.dump({'schema_version': v24.SCHEMA_VERSION}, args.forecast_model)
     context = mp.get_context('spawn')
     stop, ready = context.Event(), context.Event()
-    worker = context.Process(target=loop.worker_main, args=(args, stop, ready))
+    worker = context.Process(target=loop.ingestion_worker_main, args=(args, stop, ready))
     worker.start()
     try:
         assert ready.wait(20)
@@ -231,3 +231,44 @@ def test_spawned_worker_drains_on_stop_and_closes_run(tmp_path):
         if worker.is_alive():
             worker.terminate()
             worker.join()
+
+
+def test_live_board_read_is_pinned_to_prediction_snapshot(tmp_path, monkeypatch):
+    args = args_for(tmp_path)
+    mock_parser(monkeypatch)
+    older = '2026-09-22T12:00:00.000+00:00'
+    newer = '2026-09-22T12:01:00.000+00:00'
+    loop.collector.process_capture(args, 'MC', older)
+    loop.collector.process_capture(args, 'MC', newer)
+    pd.DataFrame({
+        'token_key': ['abc...pump'],
+        'snapshot_at': [older],
+        'p_first_peak_by_720m': [0.5],
+    }).to_csv(args.predictions, index=False)
+
+    snapshot, current = benchmark._read_current(
+        args.db, args.predictions, exact_prediction_snapshot=True,
+    )
+
+    assert snapshot == pd.Timestamp(older)
+    assert set(current.token_key) == {'abc...pump'}
+
+
+def test_paper_prediction_allows_ingestion_to_advance(tmp_path, monkeypatch):
+    args = args_for(tmp_path)
+    mock_parser(monkeypatch)
+    loop.collector.process_capture(args, 'MC', loop.now_iso())
+    stop = threading.Event()
+    captured = {}
+
+    def refresh(*_args, **kwargs):
+        captured.update(kwargs)
+        return {'snapshot_at': loop.latest_snapshot(args.db)}
+
+    fake = SimpleNamespace(
+        refresh_predictions=refresh,
+        _cycle_v24=lambda *_a, **_kw: {'processed': True},
+        BenchmarkConfig=lambda: None,
+    )
+    assert loop.predict_and_trade(args, fake, stop) == loop.latest_snapshot(args.db)
+    assert captured == {'require_latest': False}

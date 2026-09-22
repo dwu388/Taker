@@ -1,7 +1,10 @@
-"""Independent clipboard producer and serial raw/prediction/paper-wallet worker.
+"""Independent clipboard producer, raw ingester and latest-state paper trader.
 
-The producer only copies and journals text. The worker alone advances raw data,
-so collection cannot invalidate a prediction halfway through computation.
+The producer only copies and journals text.  A dedicated ingestion process
+persists every capture in FIFO order while an independent trading process
+coalesces superseded boards and evaluates the newest durable snapshot.  Paper
+prediction is pinned to one SQLite read snapshot, so raw collection may advance
+without changing the board on which that decision is evaluated.
 """
 from __future__ import annotations
 
@@ -67,6 +70,15 @@ def pending_ids(path: str) -> list[int]:
     with closing(sqlite3.connect(path, timeout=2)) as conn:
         # Finite batch: new captures cannot make the worker drain forever.
         return [int(row[0]) for row in conn.execute("SELECT id FROM pending ORDER BY id")]
+
+
+def latest_snapshot(db: str) -> str | None:
+    with closing(sqlite3.connect(db, timeout=10)) as conn:
+        conn.execute("PRAGMA busy_timeout=10000")
+        row = conn.execute(
+            "SELECT snapshot_at FROM axiom_observations ORDER BY snapshot_at DESC LIMIT 1"
+        ).fetchone()
+    return str(row[0]) if row else None
 
 
 def persisted_cycle(db: str, timestamp: str, text: str) -> int | None:
@@ -135,33 +147,63 @@ def ingest_one(args, item_id: int) -> bool:
     return success
 
 
-def predict_and_trade(args, benchmark, stop) -> None:
-    with closing(sqlite3.connect(args.db)) as conn:
-        row = conn.execute("SELECT MAX(snapshot_at) FROM axiom_observations").fetchone()
-    if not row or not row[0]:
-        return
-    timestamp = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+def predict_and_trade(args, benchmark, stop) -> str | None:
+    requested_snapshot = latest_snapshot(args.db)
+    if requested_snapshot is None:
+        return None
+    timestamp = datetime.fromisoformat(requested_snapshot.replace("Z", "+00:00"))
     def age():
         return (datetime.now(timezone.utc) - timestamp).total_seconds()
     if age() > args.max_snapshot_age_seconds:
-        emit(wallet_skipped="capture_too_old", snapshot_at=row[0])
-        return
-    emit(processing="prediction", snapshot_at=row[0])
-    predictions = benchmark.refresh_predictions(args.db, args.forecast_model, args.predictions)
+        emit(wallet_skipped="capture_too_old", snapshot_at=requested_snapshot)
+        return requested_snapshot
+    emit(processing="prediction", snapshot_at=requested_snapshot)
+    predictions = benchmark.refresh_predictions(
+        args.db, args.forecast_model, args.predictions, require_latest=False,
+    )
+    predicted_snapshot = str(predictions.get("snapshot_at") or requested_snapshot)
+    timestamp = datetime.fromisoformat(predicted_snapshot.replace("Z", "+00:00"))
     if stop.is_set() or age() > args.max_snapshot_age_seconds:
-        emit(wallet_skipped="stopping_or_prediction_too_old", snapshot_at=row[0])
-        return
-    # This worker is the sole writer of raw observations. No queue ingestion can
-    # occur between refresh and cycle, retaining next-observable-fill semantics.
+        emit(wallet_skipped="stopping_or_prediction_too_old", snapshot_at=predicted_snapshot)
+        return predicted_snapshot
+    # live_decisions pins the board read to the prediction timestamp. Captures
+    # persisted during inference therefore become the next coalesced decision,
+    # never an accidental same-board fill or a reason to retry stale work.
     result = benchmark._cycle_v24(
         args.db, args.benchmark_db, args.predictions, args.forecast_model,
         args.policy_model, benchmark.BenchmarkConfig(), live_decisions=True,
     )
     emit(predictions=predictions, benchmark=result)
+    return predicted_snapshot
 
 
-def worker_main(args, stop, ready) -> None:
+def ingestion_worker_main(args, stop, ready) -> None:
     # Ctrl+C belongs to the producer, which stops capture and requests a drain.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    initialize_collection(args.db, purpose="v24_production_raw_collection")
+    # Recover interrupted ingestion before establishing the new run boundary.
+    for item_id in pending_ids(args.queue_db):
+        ingest_one(args, item_id)
+    run_id = manual_stop.start_collection_session(args.db, source="axiom_paper_loop")
+    try:
+        ready.set()
+        while True:
+            for item_id in pending_ids(args.queue_db):
+                ingest_one(args, item_id)
+            if stop.is_set():
+                if not pending_ids(args.queue_db):
+                    break
+                continue
+            stop.wait(0.2)
+    finally:
+        # Unexpected worker failures retain both pending data and the active run
+        # so recovery can ingest first, then establish the unclean-stop boundary.
+        if stop.is_set() and not pending_ids(args.queue_db):
+            emit(collection_stop=manual_stop.stop_collection_session(args.db, run_id))
+
+
+def trading_worker_main(args, stop, ingestion_ready, ready) -> None:
+    """Evaluate newest durable snapshots without consuming the capture queue."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     from . import axiom_budget_benchmark as benchmark
     import joblib
@@ -172,43 +214,41 @@ def worker_main(args, stop, ready) -> None:
         raise RuntimeError("Paper loop requires a V24 forecast champion")
     if Path(args.policy_model).exists():
         joblib.load(args.policy_model)  # Fail early for a corrupt policy file.
-    initialize_collection(args.db, purpose="v24_production_raw_collection")
-    # Recover interrupted ingestion before closing the old run; never trade on
-    # historical queued boards at startup.
-    for item_id in pending_ids(args.queue_db):
-        ingest_one(args, item_id)
-    run_id = manual_stop.start_collection_session(args.db, source="axiom_paper_loop")
-    try:
-        emit(wallet=benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig()))
-        ready.set()
-        while True:
-            changed = False
-            for item_id in pending_ids(args.queue_db):
-                changed = ingest_one(args, item_id) or changed
-            if stop.is_set():
-                if not pending_ids(args.queue_db):
-                    break
-                continue
-            if changed:
-                try:
-                    predict_and_trade(args, benchmark, stop)
-                except Exception as exc:
-                    emit(processing_error=type(exc).__name__, message=str(exc))
+    while not ingestion_ready.wait(0.2):
+        if stop.is_set():
+            return
+    emit(wallet=benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig()))
+    last_attempted = latest_snapshot(args.db)  # Recovery history is collection-only.
+    ready.set()
+    while not stop.is_set():
+        newest = latest_snapshot(args.db)
+        if newest is None or newest == last_attempted:
             stop.wait(0.2)
-    finally:
-        # Unexpected worker failures retain both pending data and the active run
-        # so recovery can ingest first, then establish the unclean-stop boundary.
-        if stop.is_set() and not pending_ids(args.queue_db):
-            emit(collection_stop=manual_stop.stop_collection_session(args.db, run_id))
+            continue
+        # Claim before expensive work. A failure is retried on the next durable
+        # board rather than hot-looping and starving collection resources.
+        last_attempted = newest
+        try:
+            processed = predict_and_trade(args, benchmark, stop)
+            if processed is not None:
+                last_attempted = processed
+        except Exception as exc:
+            emit(processing_error=type(exc).__name__, message=str(exc), snapshot_at=newest)
 
 
-def capture_forever(args, worker, stop) -> None:
+def capture_forever(args, workers, stop) -> None:
+    if hasattr(workers, "is_alive"):
+        workers = (workers,)
     cfg = load_json(args.config, {})
     count = 0
     deadline = time.monotonic()
     while not stop.is_set():
-        if not worker.is_alive():
-            raise RuntimeError(f"Processing worker exited ({worker.exitcode}); queued captures retained")
+        failed = [worker for worker in workers if not worker.is_alive()]
+        if failed:
+            worker = failed[0]
+            raise RuntimeError(
+                f"{worker.name} exited ({worker.exitcode}); queued captures retained"
+            )
         remaining = deadline - time.monotonic()
         if remaining > 0:
             stop.wait(min(1.0, remaining))
@@ -267,27 +307,45 @@ def main(argv=None) -> None:
     with collector_lock(args.db):
         init_queue(args.queue_db, args.db)
         context = mp.get_context("spawn")
-        stop, ready = context.Event(), context.Event()
-        worker = context.Process(target=worker_main, args=(args, stop, ready), name="axiom-paper-worker")
-        worker.start()
+        stop = context.Event()
+        ingestion_ready, trading_ready = context.Event(), context.Event()
+        ingester = context.Process(
+            target=ingestion_worker_main, args=(args, stop, ingestion_ready),
+            name="axiom-paper-ingester",
+        )
+        trader = context.Process(
+            target=trading_worker_main,
+            args=(args, stop, ingestion_ready, trading_ready),
+            name="axiom-paper-trader",
+        )
+        workers = (ingester, trader)
+        for worker in workers:
+            worker.start()
         try:
-            while not ready.wait(0.2):
-                if not worker.is_alive():
-                    raise RuntimeError(f"Paper worker startup failed ({worker.exitcode})")
+            while not trading_ready.wait(0.2):
+                failed = [worker for worker in workers if not worker.is_alive()]
+                if failed:
+                    worker = failed[0]
+                    raise RuntimeError(f"{worker.name} startup failed ({worker.exitcode})")
             emit(mode="independent_paper_loop", capture_interval_seconds=args.interval_seconds)
-            capture_forever(args, worker, stop)
+            capture_forever(args, workers, stop)
         except KeyboardInterrupt:
             emit(stopping="Capture stopped; finishing current work and saving queued captures")
         finally:
             stop.set()
             # Remain responsive while waiting; never terminate an in-flight commit.
-            while worker.is_alive():
+            while any(worker.is_alive() for worker in workers):
                 try:
-                    worker.join(0.5)
+                    for worker in workers:
+                        worker.join(0.25)
                 except KeyboardInterrupt:
                     emit(stopping="Still draining; closing this window leaves durable queue for restart")
-            if worker.exitcode:
-                raise RuntimeError(f"Paper worker failed ({worker.exitcode}); queue retained for restart")
+            failed = [worker for worker in workers if worker.exitcode]
+            if failed:
+                worker = failed[0]
+                raise RuntimeError(
+                    f"{worker.name} failed ({worker.exitcode}); queue retained for restart"
+                )
 
 
 if __name__ == "__main__":
