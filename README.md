@@ -123,13 +123,13 @@ Default model paths are `models/axiom_v24/champion.joblib` and
 `models/axiom_policy_v24/champion.joblib`; an absent policy uses the existing
 bootstrap rules. A valid V24 forecast model is required before capture starts.
 
-Clipboard copying runs in the foreground every 60 seconds, independently of a
-separate processing process. It reuses the production click coordinates, verified
+Clipboard copying runs in the foreground every 60 seconds, independently of two
+separate processing processes. It reuses the production click coordinates, verified
 clipboard sentinel, Ctrl+A / Ctrl+C retries and 601-cycle refresh. It journals only
 compressed clipboard text and capture timestamps to
-`data/axiom_v24_raw.sqlite.paper_queue.sqlite`. The worker validates and saves all
-queued observations and exact payloads into the usual raw database, then predicts
-on the newest ingested board and updates the paper wallet. The queue deletes
+`data/axiom_v24_raw.sqlite.paper_queue.sqlite`. The ingester validates and saves all
+queued observations and exact payloads into the usual raw database. Independently,
+the trader predicts on the newest durable board and updates the paper wallet. The queue deletes
 acknowledged items and reuses its space; it survives interruption. SQLite can also
 create temporary WAL/SHM sidecars, and a small ownership marker prevents two
 updated collectors from controlling the same source database simultaneously.
@@ -138,11 +138,13 @@ This mode skips per-capture TXT/JSON/CSV review exports, the hourly performance
 report and capture-context diagnostics. It keeps the required prediction CSV and
 wallet database. Use `performance_report.bat` when a manual report is needed.
 
-If processing takes longer than a minute, clipboard capture continues and the
-worker catches up on queued history before its next prediction. Decisions are
-therefore slower than capture, and intermediate boards may not get individual
-wallet decisions. Pending entries/exits can fill only on a board captured after
-the decision became available, including when boards accumulated during inference.
+If prediction takes longer than a minute, clipboard capture and durable raw
+ingestion continue without waiting for it. When inference completes, the trader
+immediately advances to the newest durable board instead of replaying a FIFO
+decision backlog; superseded intermediate boards remain in raw history but may not
+receive individual wallet decisions. Each forecast is pinned to the exact board
+read at inference start, even if ingestion advances concurrently. Pending
+entries/exits can fill only on a board captured after the decision became available.
 Wallet activity is skipped if its snapshot is older than 180 seconds, checked both
 before and after prediction (`--max-snapshot-age-seconds` overrides this limit).
 Desktop stalls and resource exhaustion can still delay capture; this is not a
@@ -151,7 +153,7 @@ hard real-time scheduler.
 Press Ctrl+C once to stop new captures, finish in-flight work, drain the queue and
 record a neutral collection-stop boundary. Allow that shutdown to complete. On an
 unclean restart, pending captures are recovered before a new collection run starts;
-old queued boards are not traded at startup. Storage failures stop the worker and
+old queued boards are not traded at startup. Storage failures stop the ingester and
 leave unacknowledged captures queued for recovery. Do not run another collector,
 benchmark loop or training/maintenance writer against these files concurrently.
 

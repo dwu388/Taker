@@ -3236,6 +3236,7 @@ def predict_current(
     cfg: V24Config,
     *,
     persist_source: bool = True,
+    require_latest: bool = True,
 ) -> pd.DataFrame:
     """Predict the exact latest capture and atomically publish its CSV.
 
@@ -3244,6 +3245,12 @@ def predict_current(
     prediction ledger, cohort assignments or heartbeat into the collector DB is
     both unnecessary and a source of writer-lock contention. Ordinary V24
     prediction commands retain source-provenance persistence by default.
+
+    ``require_latest=False`` lets the paper trader finish inference against the
+    consistent SQLite read snapshot it opened even when the independent raw
+    ingester commits a newer board. The resulting timestamp remains explicit,
+    and the wallet evaluates that exact board before coalescing to the newest
+    durable state. All other callers retain latest-only publication.
     """
     bundle=joblib.load(model_path)
     if bundle.get("schema_version")!=SCHEMA_VERSION: raise RuntimeError("V24 model schema mismatch")
@@ -3259,7 +3266,7 @@ def predict_current(
                 "V24 prediction output did not preserve the exact latest-capture timestamp."
             )
         newest = _latest_observation_timestamp(db)
-        if newest != latest:
+        if require_latest and newest != latest:
             if attempt + 1 < LIVE_PREDICTION_SNAPSHOT_RETRIES:
                 continue
             raise RuntimeError(
@@ -3291,7 +3298,7 @@ def predict_current(
 
             _run_live_write_with_retry(db, persist)
         newest = _latest_observation_timestamp(db)
-        if newest != latest:
+        if require_latest and newest != latest:
             if attempt + 1 < LIVE_PREDICTION_SNAPSHOT_RETRIES:
                 continue
             raise RuntimeError(
