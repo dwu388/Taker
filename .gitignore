@@ -33,3 +33,6 @@ api_handoff_*.csv
 *.tmp
 *.bak
 identity_audit.py
+
+# Collector ownership markers
+*.collector.lock

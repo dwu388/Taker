@@ -21,6 +21,7 @@ def _cycle_v24(
     forecast_model: str,
     policy_model: str,
     config: BenchmarkConfig,
+    *, live_decisions: bool = False,
 ) -> dict[str, Any]:
     _require_v21()
     snapshot, current = _read_current(source_db, predictions_path)
@@ -300,7 +301,7 @@ def _cycle_v24(
                     ret, mfe, mae, hold_score, action, _json(mark_state), forecast_hash, policy_hash, liq,
                 ),
             )
-            if action == "EXIT_DECISION":
+            if action == "EXIT_DECISION" and pending_exit is None:
                 conn.execute(
                     "UPDATE benchmark_positions_v22 SET pending_exit_at=?,pending_exit_reason=? WHERE position_id=?",
                     (snapshot.isoformat(), reason, pos["position_id"]),
@@ -519,6 +520,20 @@ def _cycle_v24(
             "UPDATE benchmark_account_v22 SET cash_usd=?,execution_cash_usd=?,last_snapshot_at=? WHERE benchmark_id=?",
             (cash, execution_cash, snapshot.isoformat(), bid),
         )
+        if live_decisions:
+            # A queued board may have been copied while prediction was running.
+            # Such a board must never fill an order before it actually existed.
+            available_at = max(snapshot, pd.Timestamp.now(tz="UTC")).isoformat()
+            conn.execute(
+                """UPDATE benchmark_pending_entries_v24 SET decision_at=?
+                WHERE benchmark_id=? AND status='pending' AND decision_at=?""",
+                (available_at, bid, snapshot.isoformat()),
+            )
+            conn.execute(
+                """UPDATE benchmark_positions_v22 SET pending_exit_at=?
+                WHERE benchmark_id=? AND status='open' AND pending_exit_at=?""",
+                (available_at, bid, snapshot.isoformat()),
+            )
         conn.commit()
     return {
         "processed": True,
