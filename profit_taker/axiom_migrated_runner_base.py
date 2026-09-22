@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .axiom_clipboard import (
+    candidate_mc_card_count,
     clipboard_diagnostics,
     clipboard_looks_like_axiom,
     diagnostics_json,
@@ -50,7 +51,7 @@ def _capture_error(message: str, *, text: str = "", valid: bool = False, rows: i
 
 
 def _raw_mc_card_count(text: str) -> int:
-    return sum(1 for line in text.splitlines() if line.strip().upper() == "MC")
+    return candidate_mc_card_count(text)
 
 
 def _capture_seconds(cap: dict, key: str, default: float, *, minimum: float, maximum: float) -> float:
