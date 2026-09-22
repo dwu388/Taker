@@ -45,6 +45,51 @@ def test_paper_loop_uses_same_hardened_collector_as_standard_loop():
     assert loop.collector is production_collector
 
 
+def test_equivalent_snapshot_formats_trigger_one_trading_attempt(tmp_path, monkeypatch):
+    args = args_for(tmp_path)
+    joblib.dump({'schema_version': v24.SCHEMA_VERSION}, args.forecast_model)
+    stamps = iter([
+        '2026-09-22T16:19:51Z',                  # Recovery boundary.
+        '2026-09-22T16:20:51.704+00:00',         # New durable snapshot.
+        '2026-09-22T16:20:51.704000Z',           # Same instant from Pandas.
+        '2026-09-22T16:20:51.704000+00:00',      # Same instant, explicit UTC.
+        '2026-09-22T16:20:51.704+00:00',         # Same raw SQLite spelling.
+    ])
+    latest = '2026-09-22T16:20:51.704+00:00'
+    monkeypatch.setattr(loop, 'latest_snapshot', lambda _db: next(stamps, latest))
+    attempts = []
+    monkeypatch.setattr(
+        loop, 'predict_and_trade',
+        lambda *_args: attempts.append(latest) or '2026-09-22T16:20:51.704000+00:00',
+    )
+    monkeypatch.setattr(loop.signal, 'signal', lambda *_args: None)
+    monkeypatch.setattr(benchmark, '_require_v21', lambda: None)
+    monkeypatch.setattr(benchmark, 'init_benchmark', lambda *_args: {})
+
+    class StopAfterEquivalentPolls:
+        stopped = False
+        idle_polls = 0
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            # The three equivalent timestamp spellings must reach this idle
+            # path. A hot loop would call predict_and_trade instead.
+            self.idle_polls += 1
+            self.stopped = self.idle_polls == 3
+            return self.stopped
+
+    ready = SimpleNamespace(set=lambda: None)
+    ingestion_ready = SimpleNamespace(wait=lambda _seconds: True)
+    loop.trading_worker_main(args, StopAfterEquivalentPolls(), ingestion_ready, ready)
+
+    assert attempts == [latest]
+    assert loop.canonical_snapshot('2026-09-22T16:20:51.704Z') == (
+        '2026-09-22T16:20:51.704000+00:00'
+    )
+
+
 def test_queue_ingestion_retains_exact_payload_time_and_no_review_files(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     mock_parser(monkeypatch)

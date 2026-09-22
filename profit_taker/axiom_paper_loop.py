@@ -72,6 +72,14 @@ def pending_ids(path: str) -> list[int]:
         return [int(row[0]) for row in conn.execute("SELECT id FROM pending ORDER BY id")]
 
 
+def canonical_snapshot(value: str) -> str:
+    """Return one UTC identity for equivalent ISO-8601 snapshot timestamps."""
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 def latest_snapshot(db: str) -> str | None:
     with closing(sqlite3.connect(db, timeout=10)) as conn:
         conn.execute("PRAGMA busy_timeout=10000")
@@ -218,20 +226,25 @@ def trading_worker_main(args, stop, ingestion_ready, ready) -> None:
         if stop.is_set():
             return
     emit(wallet=benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig()))
-    last_attempted = latest_snapshot(args.db)  # Recovery history is collection-only.
+    recovered = latest_snapshot(args.db)
+    # Recovery history is collection-only. Snapshot identity is temporal rather
+    # than textual because SQLite and Pandas may serialize the same instant with
+    # different fractional precision or UTC suffixes.
+    last_attempted = canonical_snapshot(recovered) if recovered is not None else None
     ready.set()
     while not stop.is_set():
         newest = latest_snapshot(args.db)
-        if newest is None or newest == last_attempted:
+        newest_identity = canonical_snapshot(newest) if newest is not None else None
+        if newest_identity is None or newest_identity == last_attempted:
             stop.wait(0.2)
             continue
         # Claim before expensive work. A failure is retried on the next durable
         # board rather than hot-looping and starving collection resources.
-        last_attempted = newest
+        last_attempted = newest_identity
         try:
             processed = predict_and_trade(args, benchmark, stop)
             if processed is not None:
-                last_attempted = processed
+                last_attempted = canonical_snapshot(processed)
         except Exception as exc:
             emit(processing_error=type(exc).__name__, message=str(exc), snapshot_at=newest)
 
