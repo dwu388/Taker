@@ -11,4 +11,4 @@ if not exist .venv\Scripts\python.exe python -m venv .venv
 .venv\Scripts\python.exe -m pytest || exit /b 1
 
 echo V24 setup and regression tests completed successfully.
-echo Start or resume the marked production raw dataset with run_axiom_loop.bat.
+echo Start or resume collection and gated V24 training with run_axiom_loop.bat.

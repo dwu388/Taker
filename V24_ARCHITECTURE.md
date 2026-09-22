@@ -76,6 +76,9 @@ remain unsampled and use every eligible evaluation row.
 
 ## Live inference and collector concurrency
 
+- `run_axiom_loop.bat` owns research collection and learning. The clipboard producer journals each minute to a separate durable queue, so forecast or policy fitting cannot erase collection minutes. Raw ingestion and official V24 training share an explicit cross-process database gate; queued boards drain in order when training releases it.
+- The learning cycle runs the official runtime only: missing-champion bootstrap or ordinary maintenance, rolling-origin policy cross-fit, then policy training. A failed upstream stage blocks downstream policy promotion for that cycle. Existing maturity, one-use cohort, leakage and paired-token promotion rules are unchanged.
+- `run_paper_loop.bat` owns execution. It loads the resulting champions and updates the isolated wallet, but never trains or promotes either model family.
 - Live prediction is label-free. It calculates causal current-state and sequence features directly from the newest durable raw capture; it never selects the newest row from the label-dependent training frame.
 - Ordinary live prediction frames must contain exactly the latest usable raw `snapshot_at`. If collection advances during calculation, prediction retries and refuses to replace the last known-good CSV unless it catches up. The isolated paper loop is deliberately different: its read-only predictor may publish the exact consistent snapshot on which inference began while the independent ingester advances, then the wallet evaluates that same board and coalesces its next decision to the newest durable board.
 - Feature and sequence calculations are read-only. Token-first cohort assignment, capture heartbeat and prediction-ledger provenance are committed together in one short, bounded-retry transaction so the collector retains write priority.

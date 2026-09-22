@@ -38,7 +38,8 @@ old 72h forecaster/policy champions are not warm-promoted into the new generatio
 - `profit_taker/axiom_migrated_runner.py`: production-hardened one-minute clipboard-only Axiom capture. No screenshots or OCR.
 - `profit_taker/axiom_clipboard.py`: Axiom clipboard parsing, complete-card validation and full-mint matching.
 - `profit_taker/axiom_migrated_process.py`: atomic raw observation + exact-payload persistence; silent duplicate loss is forbidden.
-- `run_axiom_loop.bat`: production collection is database-only. It stores parsed rows and the compressed, hashed raw clipboard payload in SQLite without writing four per-cycle manual-review files.
+- `profit_taker/axiom_learning_loop.py`: lossless one-minute collection plus scheduled, gated V24 forecast and policy maintenance. Clipboard snapshots are durably queued while training owns the raw database, then ingested in order.
+- `run_axiom_loop.bat`: the single research-learning launcher. It collects database-only raw history, bootstraps or maintains the forecast champion when eligible, refreshes rolling-origin policy predictions, and trains/challenges the policy champion.
 - `profit_taker/collection_admin.py`: fresh-session initialization and end-to-end raw collection integrity audit.
 - `profit_taker/axiom_peak_structure.py`: 24h confirmation-safe recurrent peak structure, natural-age-out protection and causal feature cache; operational DB IDs are excluded from model inputs.
 - `profit_taker/axiom_self_teach.py`: paper-policy compatibility substrate, including next-observable fills and behavior-policy accounting.
@@ -100,25 +101,40 @@ If `ready_to_collect=true`, start/resume continuous collection:
 run_axiom_loop.bat
 ```
 
-The collector does **not** contain a hardcoded training-day trigger. Collection
-duration is an evidence/maturity decision, not a stop condition.
+This command attempts the complete gated forecast/policy maintenance pipeline at
+startup and every 24 hours thereafter. It never promotes on elapsed time alone:
+the existing readiness checks, mature one-use cohorts, leakage-safe evaluation and
+paired token-level promotion rules remain authoritative. If history is not ready,
+the attempt is reported and collection continues. Override only the check cadence,
+if needed, with `--training-interval-hours N`.
 
-## Collect and paper trade with one launcher
+Clipboard capture remains on its one-minute clock during a long fit. Captures are
+compressed into `data\axiom_v24_raw.sqlite.learning_queue.sqlite`; ingestion pauses
+while training writes, then drains every queued board in timestamp order. On
+restart, pending captures are recovered before a new collection session or training
+attempt begins. Existing raw data, candidates, and champions are never reset.
+
+Press Ctrl+C once to stop new captures. Allow active training to finish and the
+queue to drain so the neutral collection-stop boundary can be recorded cleanly.
+
+## Execute the trained strategy in the paper wallet
 
 Stop the existing collector and benchmark loops, then run:
 
 ```bat
-run_axiom_paper_loop.bat
+run_paper_loop.bat
 ```
 
 For the first-model baseline files, use:
 
 ```bat
-run_axiom_paper_loop.bat --forecast-model models\axiom_v24\baseline_first_champion.joblib --policy-model models\axiom_policy_v24\baseline_bootstrap_policy.joblib
+run_paper_loop.bat --forecast-model models\axiom_v24\baseline_first_champion.joblib --policy-model models\axiom_policy_v24\baseline_bootstrap_policy.joblib
 ```
 
 The launcher resumes the existing $1,000 benchmark wallet (or initializes one if
-absent). It does not reset balances, change sizing, train, or promote models.
+absent). This is the execution launcher: it does not reset balances, change sizing,
+train, or promote models. Stop `run_axiom_loop.bat` before starting it because both
+commands own the desktop clipboard collector and canonical raw database.
 Default model paths are `models/axiom_v24/champion.joblib` and
 `models/axiom_policy_v24/champion.joblib`; an absent policy uses the existing
 bootstrap rules. A valid V24 forecast model is required before capture starts.
