@@ -45,6 +45,21 @@ def test_paper_loop_uses_same_hardened_collector_as_standard_loop():
     assert loop.collector is production_collector
 
 
+def test_snapshot_identity_normalizes_fractional_precision_and_z_suffix(tmp_path, monkeypatch):
+    assert loop._canonical_snapshot("2026-09-22T16:20:51.704+00:00") == (
+        "2026-09-22T16:20:51.704000+00:00"
+    )
+    assert loop._canonical_snapshot("2026-09-22T16:20:51.704000Z") == (
+        "2026-09-22T16:20:51.704000+00:00"
+    )
+
+    args = args_for(tmp_path)
+    mock_parser(monkeypatch)
+    stored = "2026-09-22T16:20:51.704+00:00"
+    loop.collector.process_capture(args, "MC", stored)
+    assert loop.latest_snapshot(args.db) == "2026-09-22T16:20:51.704000+00:00"
+
+
 def test_queue_ingestion_retains_exact_payload_time_and_no_review_files(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     mock_parser(monkeypatch)

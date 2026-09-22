@@ -72,13 +72,23 @@ def pending_ids(path: str) -> list[int]:
         return [int(row[0]) for row in conn.execute("SELECT id FROM pending ORDER BY id")]
 
 
+def _canonical_snapshot(value: str | None) -> str | None:
+    """Normalize equivalent ISO timestamps before paper-loop identity checks."""
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 def latest_snapshot(db: str) -> str | None:
     with closing(sqlite3.connect(db, timeout=10)) as conn:
         conn.execute("PRAGMA busy_timeout=10000")
         row = conn.execute(
             "SELECT snapshot_at FROM axiom_observations ORDER BY snapshot_at DESC LIMIT 1"
         ).fetchone()
-    return str(row[0]) if row else None
+    return _canonical_snapshot(str(row[0])) if row else None
 
 
 def persisted_cycle(db: str, timestamp: str, text: str) -> int | None:
