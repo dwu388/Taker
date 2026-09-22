@@ -108,6 +108,58 @@ def test_runner_rejects_partial_clipboard_parse_before_persistence(tmp_path, mon
     assert not Path(args.db).exists()
 
 
+def _clipboard_card(address: str, market_cap: str) -> str:
+    return "\n".join((
+        "MC", market_cap, "V", "$10K", "TX 12", address,
+        "TICK", "Token", "1m", "10", "2", "1", "0/1", "3", "12%",
+    ))
+
+
+def test_standalone_mc_ui_label_is_not_mistaken_for_a_missing_card(tmp_path):
+    text = "\n".join((
+        "Pulse", "Migrated", "Axiom dashboard controls " * 5,
+        "MC",  # Sort/header label, not a token card.
+        _clipboard_card("abc...pump", "$100K"),
+        _clipboard_card("def...pump", "$90K"),
+    ))
+    rows = runner.rows_from_clipboard(text)
+
+    assert len(rows) == 2
+    assert runner._raw_mc_card_count(text) == 2
+
+    db = tmp_path / "raw.sqlite"
+    initialize_collection(str(db))
+    args = SimpleNamespace(
+        config=str(tmp_path / "missing.json"), clipboard_file=None,
+        output_dir=str(tmp_path / "artifacts"), db=str(db), database_only=True,
+    )
+    runner._sync_test_and_extension_hooks()
+    result = runner.process_capture(args, text, "2026-09-22T12:00:00.000+00:00")
+    assert result["rows_inserted"] == 2
+
+
+def test_structural_but_malformed_mc_card_still_fails_closed(tmp_path):
+    malformed = "\n".join((
+        "MC", "$80K", "V", "$5K", "TX 4", "missing", "token", "identity",
+    ))
+    text = "\n".join((
+        "Pulse", "Migrated", "Axiom dashboard controls " * 5,
+        _clipboard_card("abc...pump", "$100K"),
+        _clipboard_card("def...pump", "$90K"),
+        malformed,
+    ))
+    args = SimpleNamespace(
+        config=str(tmp_path / "missing.json"), clipboard_file=None,
+        output_dir=str(tmp_path / "artifacts"), db=str(tmp_path / "raw.sqlite"),
+        database_only=True,
+    )
+
+    assert runner._raw_mc_card_count(text) == 3
+    assert len(runner.rows_from_clipboard(text)) == 2
+    with pytest.raises(RuntimeError, match="3 MC card blocks but 2 parsed rows"):
+        runner.process_capture(args, text, "2026-09-22T12:00:00.000+00:00")
+
+
 def test_collection_status_detects_payload_coverage_gap(tmp_path):
     db = tmp_path / "raw.sqlite"; initialize_collection(str(db))
     with sqlite3.connect(db) as con:

@@ -332,7 +332,7 @@ def _parse_block(block: str) -> ClipboardCard | None:
 
 def _split_mc_blocks(text: str) -> list[str]:
     lines = _clean_lines(text)
-    starts = [i for i, line in enumerate(lines) if line.upper() == "MC"]
+    starts = _mc_card_starts(lines)
     blocks: list[str] = []
     for position, start in enumerate(starts):
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
@@ -340,6 +340,29 @@ def _split_mc_blocks(text: str) -> list[str]:
         if len(segment) >= 8:
             blocks.append("\n".join(segment))
     return blocks
+
+
+def _mc_card_starts(lines: list[str]) -> list[int]:
+    """Return MC labels that actually begin token cards.
+
+    Axiom can include a standalone ``MC`` sort/header label in the copied page.
+    Treating every exact ``MC`` line as a card made an otherwise complete
+    30-token board look like 31 candidates.  A real card begins with ``MC`` and
+    an immediately following compact dollar value.  This still counts a
+    truncated/malformed card once its market-cap header is present, so the
+    downstream completeness check continues to fail closed.
+    """
+    return [
+        i for i, line in enumerate(lines[:-1])
+        if line.upper() == "MC"
+        and lines[i + 1].startswith("$")
+        and _parse_compact_number(lines[i + 1]) is not None
+    ]
+
+
+def candidate_mc_card_count(text: str) -> int:
+    """Count structural token-card starts, excluding standalone UI labels."""
+    return len(_mc_card_starts(_clean_lines(text)))
 
 
 def parse_clipboard_cards(text: str) -> list[ClipboardCard]:

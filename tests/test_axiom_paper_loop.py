@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from profit_taker import axiom_paper_loop as loop
+from profit_taker import axiom_migrated_runner as production_collector
 from profit_taker import axiom_budget_benchmark as benchmark
 from profit_taker import axiom_v24 as v24
 from profit_taker.collection_admin import initialize_collection
@@ -38,6 +39,10 @@ def parsed_row():
 def mock_parser(monkeypatch):
     monkeypatch.setattr(loop.collector, 'clipboard_looks_like_axiom', lambda _: True)
     monkeypatch.setattr(loop.collector, 'rows_from_clipboard', lambda _: [parsed_row()])
+
+
+def test_paper_loop_uses_same_hardened_collector_as_standard_loop():
+    assert loop.collector is production_collector
 
 
 def test_queue_ingestion_retains_exact_payload_time_and_no_review_files(tmp_path, monkeypatch):
@@ -81,7 +86,7 @@ def test_partial_capture_and_copy_failure_are_logged_without_observations(tmp_pa
     args = args_for(tmp_path)
     mock_parser(monkeypatch)
     stamp = loop.now_iso()
-    partial = loop.enqueue(args.queue_db, stamp, stamp, 'MC\nMC')
+    partial = loop.enqueue(args.queue_db, stamp, stamp, 'MC\n$1K\nMC\n$2K')
     assert not loop.ingest_one(args, partial)
     failed = loop.enqueue(args.queue_db, stamp, stamp, '', {'type': 'RuntimeError', 'message': 'copy failed'})
     assert not loop.ingest_one(args, failed)

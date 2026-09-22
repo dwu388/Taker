@@ -17,7 +17,10 @@ import sqlite3
 import time
 import zlib
 
-from . import axiom_migrated_runner_base as collector
+# Use the same hardened public collector facade as run_axiom_loop.bat.  Importing
+# the base implementation directly allowed the independent paper loop to drift
+# from production clipboard sentinel and extension-hook behavior.
+from . import axiom_migrated_runner as collector
 from . import axiom_manual_stop as manual_stop
 from .collection_admin import initialize_collection
 from .common import load_json
@@ -108,6 +111,7 @@ def ingest_one(args, item_id: int) -> bool:
         cycle_id = persisted_cycle(args.db, captured_at, text)
         if cycle_id is None:
             try:
+                collector._sync_test_and_extension_hooks()
                 result = collector.process_capture(
                     args, text, captured_at, attempt_started_at=started_at,
                 )
