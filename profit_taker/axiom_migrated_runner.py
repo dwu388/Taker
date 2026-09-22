@@ -160,6 +160,12 @@ def _has_once(argv: list[str]) -> bool:
 
 
 def main() -> None:
+    from .collector_lock import collector_lock
+    with collector_lock(_db_from_argv(list(sys.argv[1:]))):
+        _main_locked()
+
+
+def _main_locked() -> None:
     global _active_manual_run_id, _active_manual_db
     argv = list(sys.argv[1:])
     replay = _has_clipboard_file(argv)

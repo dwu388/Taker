@@ -265,6 +265,17 @@ def run_once(args, cycle_count: int, *, attempt_started_at: str | None = None) -
     else:
         clipboard_text, snapshot_at = _capture_clipboard(cfg, cycle_count)
         attempt_source = "interactive_clipboard"
+    return process_capture(
+        args, clipboard_text, snapshot_at, attempt_source=attempt_source,
+        attempt_started_at=attempt_started_at,
+    )
+
+
+def process_capture(
+    args, clipboard_text: str, snapshot_at: str, *,
+    attempt_source: str = "interactive_clipboard", attempt_started_at: str | None = None,
+) -> dict:
+    """Validate and persist an already captured payload without touching the UI."""
     if not clipboard_looks_like_axiom(clipboard_text):
         raise _capture_error("Clipboard selection is not a valid Axiom capture; no observation was written", text=clipboard_text)
     rows = rows_from_clipboard(clipboard_text)
