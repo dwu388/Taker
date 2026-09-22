@@ -6,7 +6,19 @@ Windows:
   3. Configure the Axiom Migrated view to expose tokens through 25 hours.
   4. Run run_axiom_once.bat once as a smoke test.
   5. Run collection_status.bat and require ready_to_collect=true.
-  6. Start/resume continuous one-minute collection with run_axiom_loop.bat.
+  6. Start/resume lossless one-minute collection and gated model/policy maintenance
+     with run_axiom_loop.bat.
+
+run_axiom_loop.bat is the research-learning command. It attempts the official V24
+forecast bootstrap/maintenance, rolling-origin policy cross-fit, and policy
+training pipeline at startup and every 24 hours. Readiness and one-use promotion
+gates remain authoritative; insufficient evidence is a reported no-op, not a
+reason to stop collection. Clipboard payloads continue entering the durable
+learning queue while training runs and are ingested in order afterward.
+
+run_paper_loop.bat is the execution command. It consumes the current forecast and
+policy champions but never trains or promotes them. Stop one launcher before
+starting the other because both own the clipboard collector for the canonical DB.
 
 Active lifecycle contract:
   prediction horizon:       1440 minutes / 24 hours
