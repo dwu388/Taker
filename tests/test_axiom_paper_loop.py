@@ -153,12 +153,14 @@ def test_capture_continues_while_spawned_worker_is_blocked(tmp_path, monkeypatch
     worker = context.Process(target=_busy_worker, args=(entered, release))
     stop = threading.Event()
     counts = []
+    messages = []
     def capture(_cfg, count):
         counts.append(count)
         if count == 4:
             stop.set()
         return f'payload {count}', loop.now_iso()
     monkeypatch.setattr(loop.collector, '_capture_clipboard', capture)
+    monkeypatch.setattr(loop, 'emit', lambda **values: messages.append(values))
     worker.start()
     try:
         assert entered.wait(10)
@@ -170,6 +172,32 @@ def test_capture_continues_while_spawned_worker_is_blocked(tmp_path, monkeypatch
         release.set()
         worker.join(10)
     assert worker.exitcode == 0
+    assert len(messages) == 4
+    assert all(
+        message['next_capture_at_pacific'].endswith((' PST', ' PDT'))
+        for message in messages
+    )
+    assert all('seconds_until_next_capture' not in message for message in messages)
+
+
+def test_paper_cycle_reports_current_observed_equity(tmp_path, monkeypatch):
+    args = args_for(tmp_path)
+    mock_parser(monkeypatch)
+    loop.collector.process_capture(args, 'MC', loop.now_iso())
+    stop = threading.Event()
+    messages = []
+    result = {'observed_equity_usd': 1007.25, 'equity_usd': 1008.0}
+    fake = SimpleNamespace(
+        refresh_predictions=lambda *_args, **_kwargs: {},
+        _cycle_v24=lambda *_args, **_kwargs: result,
+        BenchmarkConfig=lambda: None,
+    )
+    monkeypatch.setattr(loop, 'emit', lambda **values: messages.append(values))
+
+    loop.predict_and_trade(args, fake, stop)
+
+    assert messages[-1]['current_equity_usd'] == 1007.25
+    assert messages[-1]['benchmark'] is result
 
 
 def test_collector_ownership_and_queue_source_binding(tmp_path):
