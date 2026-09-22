@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import multiprocessing as mp
@@ -37,6 +37,17 @@ def now_iso() -> str:
 
 def emit(**values) -> None:
     print(json.dumps(values, default=str), flush=True)
+
+
+def next_capture_status(deadline: float) -> dict[str, object]:
+    """Describe the next monotonic capture deadline in wall-clock UTC."""
+    seconds = max(0.0, deadline - time.monotonic())
+    return {
+        "next_capture_at": (
+            datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        ).isoformat(timespec="milliseconds"),
+        "seconds_until_next_capture": round(seconds, 1),
+    }
 
 
 def init_queue(path: str, source_db: str) -> None:
@@ -181,7 +192,12 @@ def predict_and_trade(args, benchmark, stop) -> str | None:
         args.db, args.benchmark_db, args.predictions, args.forecast_model,
         args.policy_model, benchmark.BenchmarkConfig(), live_decisions=True,
     )
-    emit(predictions=predictions, benchmark=result)
+    current_equity = result.get("observed_equity_usd", result.get("equity_usd"))
+    emit(
+        predictions=predictions,
+        benchmark=result,
+        current_equity_usd=current_equity,
+    )
     return predicted_snapshot
 
 
@@ -277,11 +293,16 @@ def capture_forever(args, workers, stop) -> None:
             text, captured_at = getattr(exc, "clipboard_text", ""), now_iso()
             error = {"type": type(exc).__name__, "message": str(exc)}
         item_id = enqueue(args.queue_db, started_at, captured_at, text, error)
-        emit(capture_queued=item_id, captured_at=captured_at, error=error)
         deadline += args.interval_seconds
         # Do not burst-copy missed slots if the desktop/disk itself stalls.
         while deadline <= time.monotonic():
             deadline += args.interval_seconds
+        emit(
+            capture_queued=item_id,
+            captured_at=captured_at,
+            error=error,
+            **next_capture_status(deadline),
+        )
 
 
 def parse_args(argv=None):
