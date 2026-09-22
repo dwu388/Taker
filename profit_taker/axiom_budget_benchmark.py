@@ -3,6 +3,7 @@ from __future__ import annotations
 """Hardened public facade for the retained isolated benchmark module."""
 
 from . import axiom_budget_benchmark_impl as _impl
+from . import recurrent_swing_policy as swing
 from .absence_utils import verified_absence_minutes
 
 for _name in dir(_impl):
@@ -75,6 +76,7 @@ def _cycle_v24(
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         migrate(conn)
+        swing.migrate(conn)
         acct = _account(conn)
         if acct is None:
             raise RuntimeError("Benchmark is not initialized. Run the init command first.")
@@ -144,6 +146,7 @@ def _cycle_v24(
                         (snapshot.isoformat(), "unavailable_before_next_observable_fill", pen["pending_id"]),
                     )
                     cancelled.append({"token_key": token, "missing_minutes": mins})
+                    swing.release_watch(conn, pen["swing_watch_id"])
                 continue
             other_reserved = float(conn.execute(
                 """
@@ -177,25 +180,30 @@ def _cycle_v24(
                     "UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason='exposure_or_cash_cap_at_fill' WHERE pending_id=?",
                     (snapshot.isoformat(), pen["pending_id"]),
                 )
+                swing.release_watch(conn, pen["swing_watch_id"])
                 continue
             notional = reserved / (1.0 + entry_fee_rate)
             fee = reserved - notional
             mc = float(row["market_cap_usd"])
             units = notional / mc
             pid = str(uuid.uuid4())
+            swing_sequence = int(conn.execute(
+                "SELECT COUNT(*) FROM benchmark_positions_v22 WHERE benchmark_id=? AND token_key=?",
+                (bid, token),
+            ).fetchone()[0]) + 1
             conn.execute(
                 """INSERT INTO benchmark_positions_v22
                 (position_id,benchmark_id,token_key,opened_at,entry_mc,entry_notional_usd,entry_fee_usd,entry_cash_spent_usd,
                  exposure_units,entry_score,entry_score_kind,entry_state_json,forecast_model_hash,policy_model_hash,policy_version,status,
                  last_seen_at,last_mc,last_mark_value_usd,mfe_pct,mae_pct,entry_decision_at,entry_fill_kind,
-                 conviction_tier,target_position_fraction,risk_bucket)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,0,0,?,'next_observable',?,?,?)""",
+                 conviction_tier,target_position_fraction,risk_bucket,swing_watch_id,swing_sequence)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,0,0,?,'next_observable',?,?,?,?,?)""",
                 (
                     pid, bid, token, snapshot.isoformat(), mc, notional, fee, reserved, units,
                     pen["entry_score"], pen["entry_score_kind"], pen["entry_state_json"],
                     pen["forecast_model_hash"], pen["policy_model_hash"], pen["policy_version"],
                     snapshot.isoformat(), mc, notional * (1 - exit_fee_rate), pen["decision_at"],
-                    tier, target_fraction, bucket,
+                    tier, target_fraction, bucket, pen["swing_watch_id"], swing_sequence,
                 ),
             )
             conn.execute(
@@ -204,6 +212,7 @@ def _cycle_v24(
                    WHERE pending_id=?""",
                 (snapshot.isoformat(), mc, reserved, bucket, pen["pending_id"]),
             )
+            swing.mark_watch_filled(conn, pen["swing_watch_id"], pid)
             cash -= reserved
             execution_cash -= reserved
             fill_committed_total += reserved
@@ -218,6 +227,7 @@ def _cycle_v24(
                 "target_position_fraction": target_fraction,
                 "risk_bucket": bucket,
                 "fill_kind": "next_observable",
+                "swing_sequence": swing_sequence,
             })
 
         open_positions = conn.execute(
@@ -269,6 +279,10 @@ def _cycle_v24(
                     str(pos["pending_exit_reason"] or "policy_exit_next_observable"),
                     exit_fee_rate, config, price_available=True,
                 )
+                if str(pos["pending_exit_reason"] or "") == "recurrent_swing_peak_boundary":
+                    swing.create_watch(
+                        conn, bid, fresh, snapshot, mc, _safe_state(row), config
+                    )
                 cash += closed["observed_proceeds_usd"]
                 execution_cash += closed["execution_proceeds_usd"]
                 exits.append(closed)
@@ -281,13 +295,33 @@ def _cycle_v24(
             mae = min(float(pos["mae_pct"]), ret)
             liq = _liquidation_value(pos, mc, exit_fee_rate)
             hold_score, kind = _hold_score(mark_state, policy)
+            swing_decision = (
+                swing.peak_boundary_decision(state, ret, config)
+                if config.recurrent_swing_enabled else None
+            )
+            if swing_decision is not None:
+                mark_state["recurrent_swing_at_peak_boundary"] = float(
+                    bool(swing_decision["at_peak_boundary"])
+                )
+                mark_state["recurrent_swing_hold_through_value"] = float(
+                    swing_decision["hold_through_value"]
+                )
+                mark_state["recurrent_swing_sell_reentry_value"] = float(
+                    swing_decision["sell_reentry_value"]
+                )
             held = max(0.0, (snapshot - _to_ts(pos["opened_at"])).total_seconds() / 60.0)
             action = "HOLD"
             reason = None
             if held >= config.max_hold_minutes:
                 action, reason = "EXIT_DECISION", "max_hold_72h"
-            elif held >= config.min_hold_minutes and hold_score <= 0:
-                action, reason = "EXIT_DECISION", f"{kind}_hold_value_nonpositive"
+            elif held >= config.min_hold_minutes:
+                if swing_decision is not None and swing_decision["sell"]:
+                    action, reason = "EXIT_DECISION", "recurrent_swing_peak_boundary"
+                elif not (
+                    swing_decision is not None
+                    and swing_decision["reason"] == "hold_strong_near_second_peak"
+                ) and hold_score <= 0:
+                    action, reason = "EXIT_DECISION", f"{kind}_hold_value_nonpositive"
             conn.execute(
                 "UPDATE benchmark_positions_v22 SET last_seen_at=?,last_mc=?,last_mark_value_usd=?,mfe_pct=?,mae_pct=? WHERE position_id=?",
                 (snapshot.isoformat(), mc, liq, mfe, mae, pos["position_id"]),
@@ -338,6 +372,14 @@ def _cycle_v24(
             if not state:
                 continue
             score, kind = _entry_score(state, policy)
+            if config.recurrent_swing_enabled:
+                setup, kind = swing.short_term_setup(state, config, score, kind)
+                score = setup.score
+                state["recurrent_swing_entry_probability"] = setup.probability
+                state["recurrent_swing_entry_net_edge"] = setup.net_edge
+                state["recurrent_swing_entry_qualifies"] = float(setup.qualifies)
+            else:
+                setup = None
             if math.isfinite(score):
                 candidates.append({
                     "token_key": token,
@@ -345,6 +387,7 @@ def _cycle_v24(
                     "state": state,
                     "score": score,
                     "kind": kind,
+                    "setup": setup,
                 })
         candidates.sort(key=lambda x: x["score"], reverse=True)
         # Five positions is the normal diversification limit. Candidates that
@@ -367,13 +410,27 @@ def _cycle_v24(
             c["target_cash"] = 0.0
             c["reserved_cash"] = 0.0
             c["risk_bucket"] = risk_buckets.get(c["token_key"], c["token_key"])
+            c["swing_watch_id"] = None
+            if c["setup"] is not None and not c["setup"].qualifies:
+                c["selection_reason"] = c["setup"].reason
+                continue
             if c["score"] <= config.min_entry_score:
                 c["selection_reason"] = "score_not_above_entry_threshold"
                 continue
-            lc = _last_closed_at(conn, bid, c["token_key"])
-            if lc is not None and (snapshot - lc).total_seconds() < config.reentry_cooldown_minutes * 60:
-                c["selection_reason"] = "reentry_cooldown"
-                continue
+            if config.recurrent_swing_enabled:
+                allowed, reentry_reason, watch_id = swing.reentry_eligibility(
+                    conn, bid, c["token_key"], snapshot, c["market_cap_usd"],
+                    c["setup"], config,
+                )
+                c["swing_watch_id"] = watch_id
+                if not allowed:
+                    c["selection_reason"] = reentry_reason
+                    continue
+            else:
+                lc = _last_closed_at(conn, bid, c["token_key"])
+                if lc is not None and (snapshot - lc).total_seconds() < config.reentry_cooldown_minutes * 60:
+                    c["selection_reason"] = "reentry_cooldown"
+                    continue
             if c["kind"] not in threshold_cache:
                 threshold_cache[c["kind"]] = _conviction_thresholds(
                     conn, bid, c["kind"], snapshot, config
@@ -442,13 +499,13 @@ def _cycle_v24(
                 """INSERT OR REPLACE INTO benchmark_candidates_v22
                 (benchmark_id,snapshot_at,token_key,market_cap_usd,entry_score,score_kind,chosen,state_json,
                  forecast_model_hash,policy_model_hash,conviction_tier,target_position_fraction,target_cash_usd,
-                 risk_bucket,selection_reason)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 risk_bucket,swing_watch_id,selection_reason)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     bid, snapshot.isoformat(), c["token_key"], c["market_cap_usd"], c["score"], c["kind"],
                     int(c["chosen"]), _json(c["state"]), forecast_hash, policy_hash,
                     c["conviction_tier"], c["target_fraction"], c["target_cash"],
-                    c["risk_bucket"], c["selection_reason"],
+                    c["risk_bucket"], c["swing_watch_id"], c["selection_reason"],
                 ),
             )
 
@@ -459,14 +516,16 @@ def _cycle_v24(
                 """INSERT INTO benchmark_pending_entries_v24
                 (pending_id,benchmark_id,token_key,decision_at,decision_mc,reserved_cash_usd,entry_score,
                  entry_score_kind,entry_state_json,forecast_model_hash,policy_model_hash,policy_version,status,
-                 conviction_tier,target_position_fraction,risk_bucket)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'pending',?,?,?)""",
+                 conviction_tier,target_position_fraction,risk_bucket,swing_watch_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'pending',?,?,?,?)""",
                 (
                     pid, bid, c["token_key"], snapshot.isoformat(), c["market_cap_usd"], c["reserved_cash"],
                     c["score"], c["kind"], _json(c["state"]), forecast_hash, policy_hash, policy_version,
                     c["conviction_tier"], c["target_fraction"], c["risk_bucket"],
+                    c["swing_watch_id"],
                 ),
             )
+            swing.mark_watch_pending(conn, c["swing_watch_id"], snapshot)
             pending_created.append({
                 "pending_id": pid,
                 "token_key": c["token_key"],
@@ -475,6 +534,7 @@ def _cycle_v24(
                 "conviction_tier": c["conviction_tier"],
                 "target_position_fraction": c["target_fraction"],
                 "risk_bucket": c["risk_bucket"],
+                "reentry_watch_id": c["swing_watch_id"],
             })
 
         open_positions = conn.execute(
