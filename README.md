@@ -190,6 +190,22 @@ raw DB unless an explicit `--db` is supplied.
 See `V24_ARCHITECTURE.md`, `INSTALL_V24.txt`, and `VALIDATION_V24.txt` for the
 hardening contract and release gate.
 
+
+## Android Fomo local recorder
+
+A standalone emulator-side notification recorder is available at
+`android/fomo-recorder`. It listens directly to `family.fomo.app`, keeps every
+`bought`/`sold` notification locally in an append-only SQLite event table, and
+can explicitly export the full local history to CSV. Capture does not depend on
+Tasker, Apps Script, Google Sheets, Windows, or a network round trip.
+
+The recorder retains Android notification identity and timing alongside the raw
+notification text and parsed convenience fields. It intentionally does not apply
+trading-selection rules; those belong downstream so the local history remains a
+complete source record.
+
+See `android/fomo-recorder/README.md` for emulator setup and export instructions.
+
 ## Scope
 
 Repository readiness for fresh research-data collection is not evidence that the
