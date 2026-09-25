@@ -1827,7 +1827,17 @@ def refresh_predictions(
                     "reason": "prediction_already_current_for_frozen_model",
                     "snapshot_at": predicted_at.isoformat(),
                 }
-        cfg = v24.V24Config()
+        raw_cfg = bundle.get("config") if isinstance(bundle, dict) else None
+        allowed = set(v24.V24Config.__dataclass_fields__)
+        fallback = v24.V24Config()
+        cfg_values = {}
+        for name, value in (raw_cfg.items() if isinstance(raw_cfg, dict) else ()):
+            if name not in allowed:
+                continue
+            if isinstance(getattr(fallback, name, None), tuple) and isinstance(value, list):
+                value = tuple(value)
+            cfg_values[name] = value
+        cfg = v24.V24Config(**cfg_values)
         # This isolated benchmark has training feedback disabled. Its prediction
         # refresh must therefore remain read-only against the collector database;
         # cycle() records benchmark decisions in benchmark_db instead.

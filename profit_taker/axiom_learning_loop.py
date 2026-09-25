@@ -46,10 +46,41 @@ RUNTIME_MODULE = "profit_taker.v24_contract_runtime_v4"
 DEFAULT_TRAINING_INTERVAL_HOURS = 24.0
 DEFAULT_POLICY_CROSSFIT_FOLDS = 5
 DEFAULT_STORAGE_RETRY_SECONDS = 2.0
+LEARNING_CYCLE_TABLE = "axiom_v24_learning_cycles"
 
 
 def emit(**values) -> None:
     print(json.dumps(values, default=str), flush=True)
+
+
+def initialize_learning_status(db: str) -> None:
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute(
+            f"""CREATE TABLE IF NOT EXISTS {LEARNING_CYCLE_TABLE} (
+                cycle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                completed INTEGER NOT NULL,
+                productive INTEGER NOT NULL,
+                result_json TEXT NOT NULL
+            )"""
+        )
+
+
+def record_learning_cycle(db: str, started_at: str, result: dict) -> None:
+    initialize_learning_status(db)
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute(
+            f"INSERT INTO {LEARNING_CYCLE_TABLE}"
+            "(started_at,finished_at,completed,productive,result_json) VALUES(?,?,?,?,?)",
+            (
+                started_at,
+                datetime.now(timezone.utc).isoformat(),
+                int(bool(result.get("completed"))),
+                int(bool(result.get("productive"))),
+                json.dumps(result, default=str, sort_keys=True),
+            ),
+        )
 
 
 def _utc(value: str) -> datetime:
@@ -230,7 +261,7 @@ def training_commands(args) -> list[tuple[str, list[str]]]:
 
 
 def _run_runtime_command(command, *, check=False):
-    kwargs = {"check": check}
+    kwargs = {"check": check, "capture_output": True, "text": True}
     if os.name == "nt":
         # Keep Ctrl+C on the producer/supervisor. The trainer finishes its current
         # model/SQLite operation before shutdown rather than interrupting a model
@@ -238,7 +269,49 @@ def _run_runtime_command(command, *, check=False):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    return subprocess.run(command, **kwargs)
+    completed = subprocess.run(command, **kwargs)
+    if completed.stdout:
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
+    if completed.stderr:
+        print(
+            completed.stderr,
+            end="" if completed.stderr.endswith("\n") else "\n",
+            file=sys.stderr,
+            flush=True,
+        )
+    return completed
+
+
+def _runtime_payload(completed) -> dict | None:
+    output = getattr(completed, "stdout", None)
+    if not output:
+        return None
+    try:
+        value = json.loads(str(output).strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _stage_semantics(stage: str, payload: dict | None) -> tuple[str, bool, str | None]:
+    if payload is None:
+        return "completed", False, None
+    if stage == "forecast_bootstrap":
+        productive = bool(payload.get("bootstrapped"))
+        return ("productive" if productive else "deferred", productive, payload.get("reason"))
+    if stage == "forecast_maintenance":
+        linked = bool((payload.get("champion_link") or {}).get("created"))
+        trained = bool(payload.get("trained"))
+        productive = linked or trained
+        state = "productive" if productive else "deferred"
+        return state, productive, payload.get("reason")
+    if stage == "policy_crossfit":
+        stored = int(payload.get("stored_oos_predictions") or 0)
+        return ("productive" if stored else "deferred", stored > 0, payload.get("reason"))
+    if stage == "policy_training":
+        trained = bool(payload.get("trained"))
+        return ("productive" if trained else "deferred", trained, payload.get("reason"))
+    return "completed", False, payload.get("reason")
 
 
 def run_training_cycle(args, stop=None, run_command=_run_runtime_command) -> dict:
@@ -251,9 +324,27 @@ def run_training_cycle(args, stop=None, run_command=_run_runtime_command) -> dic
         emit(training_stage=stage, state="starting", command=command)
         completed = run_command(command, check=False)
         code = int(completed.returncode)
-        result = {"stage": stage, "exit_code": code}
+        payload = _runtime_payload(completed)
+        semantic_state, productive, reason = _stage_semantics(stage, payload)
+        result = {
+            "stage": stage,
+            "exit_code": code,
+            "semantic_state": semantic_state,
+            "productive": productive,
+        }
+        if reason:
+            result["reason"] = reason
+        if payload is not None:
+            result["result"] = payload
         results.append(result)
-        emit(training_stage=stage, state="finished", exit_code=code)
+        emit(
+            training_stage=stage,
+            state="finished",
+            exit_code=code,
+            semantic_state=semantic_state,
+            productive=productive,
+            reason=reason,
+        )
         if code != 0:
             # Bootstrap/readiness failures are expected while history matures.
             # Do not cross-fit or train a policy after a failed forecast stage,
@@ -266,7 +357,14 @@ def run_training_cycle(args, stop=None, run_command=_run_runtime_command) -> dic
                 "reason": "forecast command returned success without a champion",
                 "stages": results,
             }
-    return {"completed": True, "stages": results}
+    return {
+        "completed": True,
+        "productive": any(bool(stage.get("productive")) for stage in results),
+        "deferred_stages": [
+            stage["stage"] for stage in results if stage.get("semantic_state") == "deferred"
+        ],
+        "stages": results,
+    }
 
 
 def training_worker_main(
@@ -282,6 +380,7 @@ def training_worker_main(
     while not stop.is_set():
         cycle += 1
         started = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
         training_active.set()
         try:
             with database_gate:
@@ -293,6 +392,13 @@ def training_worker_main(
                 "message": str(exc),
             }
         finally:
+            try:
+                record_learning_cycle(args.db, started_at, result)
+            except Exception as exc:
+                emit(
+                    learning_cycle_record_error=type(exc).__name__,
+                    message=str(exc),
+                )
             training_active.clear()
         emit(training_cycle=cycle, result=result)
 
@@ -371,6 +477,7 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     with collector_lock(args.db):
         queued_capture.init_queue(args.queue_db, args.db)
+        initialize_learning_status(args.db)
         context = mp.get_context("spawn")
         stop = context.Event()
         ingestion_ready = context.Event()

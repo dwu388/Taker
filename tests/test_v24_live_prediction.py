@@ -35,6 +35,79 @@ def _live_db(path) -> None:
         conn.commit()
 
 
+def test_preserved_champion_is_linked_once_without_fabricating_promotion(tmp_path):
+    db = tmp_path / "raw.sqlite"
+    model = tmp_path / "champion.joblib"
+    bundle = {
+        "stable_training_cutoff": "2026-09-18T00:00:00+00:00",
+        "stable_generation": 1,
+        "adapter_round": 0,
+        "target_definition_hash": "target",
+        "feature_definition_hash": "feature",
+        "execution_definition_hash": "execution",
+        "training_data_hash": "older-database",
+    }
+    joblib.dump(bundle, model)
+
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        impl.migrate(conn)
+        first = impl._link_existing_champion(conn, model, bundle)
+        second = impl._link_existing_champion(conn, model, bundle)
+        registry = conn.execute(
+            f"SELECT status,registration_source,metrics_json FROM {impl.MODEL_REGISTRY}"
+        ).fetchall()
+        promotions = conn.execute(f"SELECT COUNT(*) FROM {impl.PROMOTION_TABLE}").fetchone()[0]
+
+    assert first["created"] is True
+    assert second["created"] is False
+    assert len(registry) == 1
+    assert registry[0]["status"] == "champion"
+    assert registry[0]["registration_source"] == "preserved_artifact_link"
+    assert "trained_on_current_database\":false" in registry[0]["metrics_json"]
+    assert promotions == 0
+
+
+def test_young_database_maintenance_links_champion_and_exposes_current_rows(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "raw.sqlite"
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    model = model_root / "champion.joblib"
+    cfg = impl.V24Config()
+    bundle = {
+        "schema_version": impl.SCHEMA_VERSION,
+        "stable_training_cutoff": "2026-09-18T00:00:00+00:00",
+        "stable_generation": 1,
+        "adapter_round": 0,
+        "target_definition_hash": impl.target_definition_hash(cfg),
+        "feature_definition_hash": "feature",
+        "execution_definition_hash": impl.execution_definition_hash(cfg),
+        "training_data_hash": "older-database",
+    }
+    joblib.dump(bundle, model)
+    frame = pd.DataFrame({"token_key": ["A", "A", "B"]})
+
+    monkeypatch.setattr(impl.peak, "refresh_labels", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(impl, "load_v24_frame", lambda *_args: (frame, pd.DataFrame(), {}))
+    monkeypatch.setattr(impl, "update_adaptive_calibration", lambda *_args: {"updated": 0})
+    monkeypatch.setattr(impl, "next_one_use_promotion_cohort", lambda *_args: None)
+
+    result = impl.maintain_v24(str(db), str(model_root), cfg)
+
+    assert result["trained"] is False
+    assert result["champion_link"]["created"] is True
+    assert result["current_database_rows_available"] == 3
+    assert result["current_database_tokens_available"] == 2
+    assert "weight updates remain promotion-gated" in result["current_data_usage"]
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            f"SELECT status,registration_source FROM {impl.MODEL_REGISTRY}"
+        ).fetchone()
+    assert row == ("champion", "preserved_artifact_link")
+
+
 def test_current_inference_is_label_free_and_uses_exact_latest_capture(tmp_path):
     db = tmp_path / "raw.sqlite"
     _live_db(db)
@@ -227,17 +300,29 @@ def test_isolated_prediction_stays_read_only_while_collector_holds_writer_lock(
 def test_benchmark_refresh_explicitly_disables_source_persistence(tmp_path, monkeypatch):
     model = tmp_path / "champion.joblib"
     output = tmp_path / "predictions.csv"
-    joblib.dump({"schema_version": impl.SCHEMA_VERSION}, model)
+    joblib.dump({
+        "schema_version": impl.SCHEMA_VERSION,
+        "config": {
+            "stable_estimators": 123,
+            "sequence_windows_minutes": [60, 240],
+        },
+    }, model)
     captured = {}
 
-    def fake_predict(_db, _model, _output, _cfg, **kwargs):
+    def fake_predict(_db, _model, _output, cfg, **kwargs):
         captured.update(kwargs)
+        captured["stable_estimators"] = cfg.stable_estimators
+        captured["sequence_windows_minutes"] = cfg.sequence_windows_minutes
         return pd.DataFrame({"token_key": ["A"], "snapshot_at": [pd.Timestamp.now(tz="UTC")]})
 
     monkeypatch.setattr(benchmark.v24, "predict_current", fake_predict)
     result = benchmark.refresh_predictions(str(tmp_path / "raw.sqlite"), str(model), str(output))
 
-    assert captured == {"persist_source": False}
+    assert captured == {
+        "persist_source": False,
+        "stable_estimators": 123,
+        "sequence_windows_minutes": (60, 240),
+    }
     assert result["source_db_writes"] is False
     assert result["training_feedback"] == "disabled"
 

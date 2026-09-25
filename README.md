@@ -108,6 +108,16 @@ paired token-level promotion rules remain authoritative. If history is not ready
 the attempt is reported and collection continues. Override only the check cadence,
 if needed, with `--training-interval-hours N`.
 
+If a compatible `models/axiom_v24/champion.joblib` was intentionally preserved
+across a clean raw-database restart, maintenance links its hash and persisted
+training provenance into the new database without deleting, overwriting, or
+pretending to re-promote it. The new observations are immediately available to
+current-state/sequence inference and derived-label/calibration refreshes. Model
+weight changes remain protected by the normal mature one-use promotion gate.
+`CURRENT_MODEL_PERFORMANCE.txt` reports the preserved-artifact link separately
+from current-database promotion evidence and shows the latest semantic result of
+each learning stage.
+
 Clipboard capture remains on its one-minute clock during a long fit. Captures are
 compressed into `data\axiom_v24_raw.sqlite.learning_queue.sqlite`; ingestion pauses
 while training writes, then drains every queued board in timestamp order. On

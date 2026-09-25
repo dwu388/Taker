@@ -155,6 +155,26 @@ def test_report_generation_respects_configured_interval(tmp_path):
     assert due["generated"] is True
 
 
+def test_report_distinguishes_detached_preserved_artifact_from_database_evidence(tmp_path):
+    db = _ready_raw_db(tmp_path)
+    model = tmp_path / "champion.joblib"
+    model.write_bytes(b"preserved-trained-model")
+    out = tmp_path / "report.txt"
+
+    maybe_generate_report(
+        str(db),
+        output_path=str(out),
+        benchmark_db=str(tmp_path / "missing.sqlite"),
+        forecast_model=str(model),
+        force=True,
+    )
+    text = out.read_text(encoding="utf-8")
+
+    assert f"Champion artifact: PRESENT | path={model}" in text
+    assert "Artifact/registry state: DETACHED preserved artifact" in text
+    assert "Forecast promotions: no promotion table yet" in text
+
+
 def test_collector_calls_reporter_after_success_without_making_it_fatal(tmp_path, monkeypatch):
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({
