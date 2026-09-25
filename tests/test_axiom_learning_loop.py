@@ -2,6 +2,7 @@ from contextlib import closing
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
+import json
 
 from profit_taker import axiom_learning_loop as loop
 from profit_taker import axiom_migrated_runner as production_collector
@@ -113,6 +114,52 @@ def test_existing_champion_uses_maintenance_before_policy_training(tmp_path):
     assert [command[3] for command in calls] == [
         "maintain", "crossfit-policy-predictions", "train-policy"
     ]
+
+
+def test_semantic_noops_are_visible_and_champion_link_is_productive(tmp_path):
+    args = args_for(tmp_path, champion=True)
+    payloads = iter([
+        {
+            "trained": False,
+            "reason": "no fully matured unused promotion cohort",
+            "champion_link": {"created": True},
+        },
+        {
+            "stored_oos_predictions": 0,
+            "folds": 0,
+            "reason": "no calendar blocks at or beyond warmup_blocks=7 were eligible",
+        },
+        {"trained": False, "reason": "no mature unused policy-promotion cohort"},
+    ])
+
+    def run(_command, check):
+        assert check is False
+        return SimpleNamespace(returncode=0, stdout=json.dumps(next(payloads)))
+
+    result = loop.run_training_cycle(args, run_command=run)
+
+    assert result["completed"] is True
+    assert result["productive"] is True
+    assert result["deferred_stages"] == ["policy_crossfit", "policy_training"]
+    assert result["stages"][0]["semantic_state"] == "productive"
+    assert result["stages"][1]["reason"].startswith("no calendar blocks")
+
+
+def test_learning_cycle_result_is_persisted(tmp_path):
+    db = tmp_path / "raw.sqlite"
+    result = {
+        "completed": True,
+        "productive": False,
+        "stages": [{"stage": "policy_crossfit", "semantic_state": "deferred"}],
+    }
+    loop.record_learning_cycle(str(db), "2026-09-25T00:00:00+00:00", result)
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            f"SELECT completed,productive,result_json FROM {loop.LEARNING_CYCLE_TABLE}"
+        ).fetchone()
+    assert row[:2] == (1, 0)
+    assert json.loads(row[2]) == result
 
 
 def test_failed_forecast_stage_cannot_train_policy_from_stale_inputs(tmp_path):

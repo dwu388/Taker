@@ -544,6 +544,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         "feature_definition_hash TEXT",
         "execution_definition_hash TEXT",
         "training_data_hash TEXT",
+        "registration_source TEXT",
     ):
         _ensure_column(conn, MODEL_REGISTRY, definition)
     for definition in (
@@ -3508,19 +3509,89 @@ def _save_bundle(bundle: dict[str, Any], root: str, name: str) -> str:
     return str(path)
 
 
-def _register_model(conn:sqlite3.Connection,path:str,bundle:dict[str,Any],status:str,metrics:dict[str,Any],notes:str="")->str:
+def _register_model(
+    conn: sqlite3.Connection,
+    path: str,
+    bundle: dict[str, Any],
+    status: str,
+    metrics: dict[str, Any],
+    notes: str = "",
+    *,
+    registration_source: str = "trained_in_database",
+) -> str:
     version=str(uuid.uuid4())
     conn.execute(
         f"""INSERT INTO {MODEL_REGISTRY}
         (version_id,created_at,model_path,model_hash,status,stable_training_cutoff,stable_generation,adapter_round,
          adapter_training_start,adapter_training_cutoff,metrics_json,notes,stable_created_at,last_compaction_at,
-         target_definition_hash,feature_definition_hash,execution_definition_hash,training_data_hash)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         target_definition_hash,feature_definition_hash,execution_definition_hash,training_data_hash,registration_source)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (version,_now_iso(),path,_hash_file(path),status,bundle["stable_training_cutoff"],int(bundle.get("stable_generation",1)),
          int(bundle.get("adapter_round",0)),(bundle.get("adapter") or {}).get("training_start"),(bundle.get("adapter") or {}).get("training_cutoff"),
          _json(metrics),notes,bundle.get("stable_created_at"),bundle.get("last_compaction_at"),bundle.get("target_definition_hash"),
-         bundle.get("feature_definition_hash"),bundle.get("execution_definition_hash"),bundle.get("training_data_hash")),
+         bundle.get("feature_definition_hash"),bundle.get("execution_definition_hash"),bundle.get("training_data_hash"),registration_source),
     ); return version
+
+
+def _link_existing_champion(
+    conn: sqlite3.Connection,
+    champion_path: Path,
+    champion: dict[str, Any],
+) -> dict[str, Any]:
+    """Link a preserved compatible champion to a newly-created evidence DB.
+
+    Model artifacts intentionally outlive disposable raw/benchmark databases.  A
+    clean database therefore must not make a valid preserved champion invisible,
+    and it must never bootstrap over or delete that artifact.  Linking records
+    operational provenance only: it does not create a promotion event or claim
+    that the artifact was trained on the current database.
+    """
+    migrate(conn)
+    model_hash = _hash_file(champion_path)
+    linked = conn.execute(
+        f"SELECT version_id,registration_source FROM {MODEL_REGISTRY} "
+        "WHERE status='champion' AND model_hash=? ORDER BY created_at DESC LIMIT 1",
+        (model_hash,),
+    ).fetchone()
+    if linked is not None:
+        return {
+            "linked": True,
+            "created": False,
+            "model_hash": model_hash,
+            "registration_source": linked[1] or "legacy_registry_entry",
+        }
+
+    conflicting = conn.execute(
+        f"SELECT version_id,model_hash,model_path FROM {MODEL_REGISTRY} "
+        "WHERE status='champion' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if conflicting is not None:
+        raise RuntimeError(
+            "The database already records a different V24 champion; refusing to "
+            "silently relink or replace either model artifact."
+        )
+
+    version_id = _register_model(
+        conn,
+        str(champion_path),
+        champion,
+        "champion",
+        {
+            "registration": "preserved_artifact_link",
+            "trained_on_current_database": False,
+            "promotion_evidence_created": False,
+        },
+        "Preserved compatible champion linked after raw-database restart; no current-database training or promotion is claimed.",
+        registration_source="preserved_artifact_link",
+    )
+    conn.commit()
+    return {
+        "linked": True,
+        "created": True,
+        "version_id": version_id,
+        "model_hash": model_hash,
+        "registration_source": "preserved_artifact_link",
+    }
 
 
 def bootstrap_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool = False) -> dict[str, Any]:
@@ -3581,6 +3652,7 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
         raise RuntimeError("V24 execution-definition hash changed. Refusing warm adapter/promotion comparison; bootstrap a clean model generation.")
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory = sqlite3.Row
+        champion_link = _link_existing_champion(conn, champion_path, champion)
         peak_cfg = peak.PeakStructureConfig(
             horizon_minutes=cfg.horizon_minutes,
             death_gap_minutes=cfg.operational_gap_minutes,
@@ -3595,7 +3667,14 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
         update_adaptive_calibration(conn, frame, cfg)
         cohort = next_one_use_promotion_cohort(conn, cfg)
         if cohort is None:
-            return {"trained": False, "reason": "no fully matured unused promotion cohort"}
+            return {
+                "trained": False,
+                "reason": "no fully matured unused promotion cohort",
+                "champion_link": champion_link,
+                "current_database_rows_available": int(len(frame)),
+                "current_database_tokens_available": int(frame.token_key.astype(str).nunique()) if not frame.empty else 0,
+                "current_data_usage": "labels, current-state/sequence inference, and eligible calibration refresh; weight updates remain promotion-gated",
+            }
         cutoff = _utc(cohort["start_at"])
         if _model_training_cutoff_from_bundle(champion) >= cutoff:
             raise RuntimeError("Champion training cutoff is not earlier than the next promotion cohort; refusing adaptive holdout leakage.")
@@ -3654,6 +3733,7 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
             "trained": True, "mode": mode, "promoted": promoted,
             "cohort": cohort["cohort_id"], "candidate": candidate_path,
             "champion": str(champion_path), "reason": reason, "metrics": metrics,
+            "champion_link": champion_link,
         }
 
 
@@ -3663,27 +3743,40 @@ def maintain_v24(db: str, model_root: str, cfg: V24Config, *, allow_small: bool 
 
 def crossfit_policy_predictions(db:str,cfg:V24Config,*,max_folds:int=5,allow_small:bool=False)->dict[str,Any]:
     """Strict rolling-origin OOS forecasts with historical data-vintage enforcement."""
-    stored=folds_used=0
+    stored=folds_used=attempted=0
+    failures=[]
+    skipped={"no_assigned_tokens":0,"no_development_eligible_tokens":0,"no_vintage_eligible_rows":0}
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.row_factory=sqlite3.Row; frame,seqraw,_=load_v24_frame(conn,cfg); assignments=_token_assignments(conn)
         # Only blocks whose token roles are presently development-eligible may be replayed.
         blocks=[]
         for b in sorted(int(x) for x in frame.calendar_cohort_ordinal.unique() if int(x)>=cfg.warmup_blocks):
             toks=assignments[assignments.birth_ordinal==b].token_key.astype(str).tolist() if not assignments.empty else []
-            if not toks: continue
-            if any(_development_eligible_assignment(_token_assignment_status(conn,t))[0] for t in toks): blocks.append(b)
+            if not toks:
+                skipped["no_assigned_tokens"]+=1
+                continue
+            if any(_development_eligible_assignment(_token_assignment_status(conn,t))[0] for t in toks):
+                blocks.append(b)
+            else:
+                skipped["no_development_eligible_tokens"]+=1
         for b in blocks[-max_folds:]:
             te=frame[frame.calendar_cohort_ordinal==b].copy(); te=te[te.token_key.astype(str).map(lambda t:_development_eligible_assignment(_token_assignment_status(conn,t))[0])]
-            if te.empty: continue
+            if te.empty:
+                skipped["no_development_eligible_tokens"]+=1
+                continue
             cohort=conn.execute(f"SELECT * FROM {COHORT_TABLE} WHERE ordinal=?",(b,)).fetchone(); test_start=_utc(cohort['start_at']) if cohort else te.snapshot_at.min(); test_tokens=set(te.token_key.astype(str))
             # Historical values repaired after the test start cannot be used to recreate a past prediction.
             te=te[_vintage_known_by(te,test_start+pd.Timedelta(minutes=cfg.max_live_prediction_lag_minutes))].copy()
-            if te.empty: continue
+            if te.empty:
+                skipped["no_vintage_eligible_rows"]+=1
+                continue
+            attempted+=1
             try:
                 fold_bundle=fit_batch_bundle(conn,frame,seqraw,test_start,cfg,allow_small=allow_small,generation=0,exclude_tokens=test_tokens)
             except MemoryError:
                 raise
-            except Exception:
+            except Exception as exc:
+                failures.append({"block":int(b),"type":type(exc).__name__,"message":str(exc)})
                 continue
             pred=predict_frame(conn,fold_bundle,te,seqraw,cfg); model_hash=bundle_identity_hash(fold_bundle); fold_id=f"rolling_oos_birthblock_{b:06d}"
             for r in pred.to_dict('records'):
@@ -3691,7 +3784,24 @@ def crossfit_policy_predictions(db:str,cfg:V24Config,*,max_folds:int=5,allow_sma
                 if record_prediction(conn,token,decision,decision,model_hash,_model_training_cutoff_from_bundle(fold_bundle),r,'crossfit',cfg,fold_id=fold_id): stored+=1
             folds_used+=1
         conn.commit()
-    return {'stored_oos_predictions':stored,'folds':folds_used,'mode':'strict_rolling_origin_lifetime_vintage_locked'}
+    reason=None
+    if not blocks:
+        reason=f"no calendar blocks at or beyond warmup_blocks={cfg.warmup_blocks} were eligible"
+    elif attempted==0:
+        reason="eligible calendar blocks had no usable development/vintage rows"
+    elif folds_used==0:
+        reason="all attempted cross-fit folds failed"
+    return {
+        'stored_oos_predictions':stored,
+        'folds':folds_used,
+        'candidate_blocks':len(blocks),
+        'attempted_folds':attempted,
+        'failed_folds':len(failures),
+        'failures':failures,
+        'skipped_blocks':skipped,
+        'reason':reason,
+        'mode':'strict_rolling_origin_lifetime_vintage_locked',
+    }
 
 
 # ---------------------------------------------------------------------------

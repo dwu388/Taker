@@ -8,6 +8,7 @@ and writes a compact text report without creating a new performance score.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ REPORT_OUTPUT_DEFAULT = "data/CURRENT_MODEL_PERFORMANCE.txt"
 REPORT_INTERVAL_MINUTES_DEFAULT = 60
 BENCHMARK_DB_DEFAULT = "data/axiom_v24_1000_benchmark.sqlite"
 RECENT_EVENTS_DEFAULT = 8
+FORECAST_MODEL_DEFAULT = "models/axiom_v24/champion.joblib"
 
 
 def _now_utc() -> datetime:
@@ -75,6 +77,20 @@ def _safe_json(value: Any) -> Any:
         return json.loads(str(value))
     except Exception:
         return {}
+
+
+def _file_sha256(path: str | Path) -> str | None:
+    source = Path(path)
+    if not source.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with source.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def _flatten_json(value: Any, prefix: str = "", *, limit: int = 80) -> list[tuple[str, Any]]:
@@ -229,9 +245,23 @@ def _collection_section(db_path: str) -> tuple[list[str], dict[str, Any]]:
     return lines, {"ready": bool(status.get("ready_to_collect")), "status": status}
 
 
-def _forecast_section(con: sqlite3.Connection, recent: int) -> tuple[list[str], dict[str, Any]]:
+def _forecast_section(
+    con: sqlite3.Connection,
+    recent: int,
+    forecast_model: str = FORECAST_MODEL_DEFAULT,
+) -> tuple[list[str], dict[str, Any]]:
     lines = ["FORECAST MODEL", "--------------"]
     summary: dict[str, Any] = {}
+
+    artifact_hash = _file_sha256(forecast_model)
+    artifact_exists = artifact_hash is not None
+    summary["artifact_exists"] = artifact_exists
+    if artifact_exists:
+        lines.append(
+            f"Champion artifact: PRESENT | path={forecast_model} | sha256={artifact_hash}"
+        )
+    else:
+        lines.append(f"Champion artifact: MISSING | path={forecast_model}")
 
     registry = "axiom_v24_model_registry"
     if _table_exists(con, registry):
@@ -252,17 +282,76 @@ def _forecast_section(con: sqlite3.Connection, recent: int) -> tuple[list[str], 
                 lines.append("  Latest model metrics:")
                 lines.extend(_metric_lines(latest["metrics_json"], indent="    ", limit=50))
         if champion:
-            summary["champion"] = True
+            registered_hash = champion["model_hash"] if "model_hash" in champion.keys() else None
+            artifact_matches = bool(artifact_hash and registered_hash == artifact_hash)
+            summary["registry_champion"] = True
+            summary["artifact_registry_match"] = artifact_matches
             lines.append(
                 f"Current champion: {champion['created_at']} | model_hash={champion['model_hash'] or 'N/A'} | "
                 f"training_cutoff={champion['stable_training_cutoff'] if 'stable_training_cutoff' in champion.keys() else 'N/A'}"
             )
+            source = (
+                champion["registration_source"]
+                if "registration_source" in champion.keys() and champion["registration_source"]
+                else "legacy_registry_entry"
+            )
+            lines.append(
+                f"  Registration source: {source} | artifact hash match: {artifact_matches}"
+            )
+            if source == "preserved_artifact_link":
+                lines.append(
+                    "  Evidence note: preserved champion linked after database restart; "
+                    "this registration is not a current-database promotion."
+                )
         else:
-            summary["champion"] = False
+            summary["registry_champion"] = False
+            summary["artifact_registry_match"] = False
             lines.append("Current champion: NONE")
     else:
-        summary["champion"] = False
+        summary["registry_champion"] = False
+        summary["artifact_registry_match"] = False
         lines.append("Model registry: not created yet")
+    summary["champion"] = bool(artifact_exists or summary.get("registry_champion"))
+    if artifact_exists and not summary.get("registry_champion"):
+        lines.append(
+            "Artifact/registry state: DETACHED preserved artifact. Maintenance should link it without deleting or retraining it."
+        )
+
+    readiness = "axiom_v24_training_readiness"
+    if _table_exists(con, readiness):
+        latest_readiness = con.execute(
+            f"SELECT * FROM {readiness} ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if latest_readiness:
+            report = _safe_json(latest_readiness["report_json"])
+            lines.append(f"Latest first-training readiness: {bool(report.get('ready'))}")
+            gates = report.get("gates") if isinstance(report, dict) else None
+            if isinstance(gates, dict):
+                for name, gate in sorted(gates.items()):
+                    if not isinstance(gate, dict):
+                        continue
+                    lines.append(
+                        f"  Gate {name}: value={gate.get('value', 'N/A')} | "
+                        f"minimum={gate.get('minimum', 'N/A')} | pass={bool(gate.get('pass'))}"
+                    )
+
+    learning = "axiom_v24_learning_cycles"
+    if _table_exists(con, learning):
+        cycle = con.execute(
+            f"SELECT * FROM {learning} ORDER BY cycle_id DESC LIMIT 1"
+        ).fetchone()
+        if cycle:
+            result = _safe_json(cycle["result_json"])
+            lines.append(
+                f"Latest learning cycle: {cycle['finished_at']} | "
+                f"completed={bool(cycle['completed'])} | productive={bool(cycle['productive'])}"
+            )
+            for stage in result.get("stages", []) if isinstance(result, dict) else []:
+                if isinstance(stage, dict):
+                    lines.append(
+                        f"  {stage.get('stage')}: {stage.get('semantic_state', 'unknown')}"
+                        + (f" | {stage.get('reason')}" if stage.get("reason") else "")
+                    )
 
     promotions = "axiom_v24_promotions"
     promoted = rejected = total = 0
@@ -289,6 +378,7 @@ def _forecast_section(con: sqlite3.Connection, recent: int) -> tuple[list[str], 
         tokens = int(_scalar(con, f"SELECT COUNT(DISTINCT token_key) FROM {ledger}") or 0)
         by_prov = _rows(con, f"SELECT provenance,COUNT(*) AS n FROM {ledger} GROUP BY provenance ORDER BY n DESC")
         lines.append(f"Prediction ledger: {predictions:,} rows across {tokens:,} tokens")
+        lines.append("  Scope: training/OOS provenance only; isolated paper-loop predictions are intentionally read-only and excluded")
         lines.append("  Provenance: " + (", ".join(f"{r['provenance']}={r['n']}" for r in by_prov) or "none"))
         if "oos_valid" in cols:
             oos = int(_scalar(con, f"SELECT COUNT(*) FROM {ledger} WHERE oos_valid=1") or 0)
@@ -639,6 +729,7 @@ def build_report(
     db_path: str = RAW_DB_DEFAULT,
     *,
     benchmark_db: str = BENCHMARK_DB_DEFAULT,
+    forecast_model: str = FORECAST_MODEL_DEFAULT,
     generated_at: datetime | None = None,
     interval_minutes: int = REPORT_INTERVAL_MINUTES_DEFAULT,
     recent_events: int = RECENT_EVENTS_DEFAULT,
@@ -658,7 +749,9 @@ def build_report(
         paper_summary = {"closed": 0}
     else:
         try:
-            forecast_lines, forecast_summary = _forecast_section(con, recent_events)
+            forecast_lines, forecast_summary = _forecast_section(
+                con, recent_events, forecast_model
+            )
             policy_lines, policy_summary = _policy_section(con, recent_events)
             paper_lines, paper_summary = _paper_section(con, recent_events)
         finally:
@@ -722,6 +815,7 @@ def maybe_generate_report(
     *,
     output_path: str = REPORT_OUTPUT_DEFAULT,
     benchmark_db: str = BENCHMARK_DB_DEFAULT,
+    forecast_model: str = FORECAST_MODEL_DEFAULT,
     interval_minutes: int = REPORT_INTERVAL_MINUTES_DEFAULT,
     recent_events: int = RECENT_EVENTS_DEFAULT,
     force: bool = False,
@@ -743,6 +837,7 @@ def maybe_generate_report(
     report = build_report(
         db_path,
         benchmark_db=benchmark_db,
+        forecast_model=forecast_model,
         generated_at=now,
         interval_minutes=interval_minutes,
         recent_events=recent_events,
@@ -763,6 +858,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate the human-readable V24 model performance report")
     parser.add_argument("--db", default=RAW_DB_DEFAULT)
     parser.add_argument("--benchmark-db", default=BENCHMARK_DB_DEFAULT)
+    parser.add_argument("--forecast-model", default=FORECAST_MODEL_DEFAULT)
     parser.add_argument("--output", default=REPORT_OUTPUT_DEFAULT)
     parser.add_argument("--interval-minutes", type=int, default=REPORT_INTERVAL_MINUTES_DEFAULT)
     parser.add_argument("--recent-events", type=int, default=RECENT_EVENTS_DEFAULT)
@@ -772,6 +868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.db,
         output_path=args.output,
         benchmark_db=args.benchmark_db,
+        forecast_model=args.forecast_model,
         interval_minutes=args.interval_minutes,
         recent_events=args.recent_events,
         force=args.force,
