@@ -364,6 +364,12 @@ def _cycle_v24(
                     p, _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True), exit_fee_rate
                 )
         effect_equity = execution_cash + exec_open
+        entry_calibration = (
+            swing.build_entry_calibration(
+                conn, source_db, bid, snapshot, forecast_hash, config
+            )
+            if config.recurrent_swing_enabled else None
+        )
         candidates = []
         open_tokens = {str(p["token_key"]) for p in open_positions}
         pending_tokens = {
@@ -380,10 +386,13 @@ def _cycle_v24(
                 continue
             score, kind = _entry_score(state, policy)
             if config.recurrent_swing_enabled:
-                setup, kind = swing.short_term_setup(state, config, score, kind)
+                setup, kind = swing.short_term_setup(
+                    state, config, score, kind, entry_calibration
+                )
                 score = setup.score
                 state["recurrent_swing_entry_probability"] = setup.probability
                 state["recurrent_swing_entry_net_edge"] = setup.net_edge
+                state["recurrent_swing_entry_raw_net_edge"] = setup.raw_net_edge
                 state["recurrent_swing_entry_qualifies"] = float(setup.qualifies)
             else:
                 setup = None
@@ -516,6 +525,39 @@ def _cycle_v24(
                 ),
             )
 
+        rejection_reasons: dict[str, int] = {}
+        for candidate in candidates:
+            if not candidate["chosen"]:
+                reason = str(candidate.get("selection_reason") or "unknown")
+                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        swing_setups = [candidate["setup"] for candidate in candidates if candidate["setup"] is not None]
+        swing_probabilities = [setup.probability for setup in swing_setups]
+        swing_edges = [setup.net_edge for setup in swing_setups if math.isfinite(setup.net_edge)]
+        raw_edges = [setup.raw_net_edge for setup in swing_setups if math.isfinite(setup.raw_net_edge)]
+        entry_evaluation = {
+            "candidates": len(candidates),
+            "eligible": len(eligible),
+            "selected": len(selected),
+            "rejection_reasons": rejection_reasons,
+            "swing_probability": {
+                "mean": (sum(swing_probabilities) / len(swing_probabilities) if swing_probabilities else None),
+                "max": (max(swing_probabilities) if swing_probabilities else None),
+                "legacy_absolute_required": config.swing_entry_min_probability,
+                "active_required": (
+                    entry_calibration.as_dict().get("minimum_profitable_probability")
+                    if entry_calibration is not None and entry_calibration.ready
+                    else config.swing_entry_min_probability
+                ),
+            },
+            "net_edge": {
+                "max": (max(swing_edges) if swing_edges else None),
+                "positive_candidates": sum(value > 0.0 for value in swing_edges),
+                "legacy_formula_max": (max(raw_edges) if raw_edges else None),
+                "legacy_formula_positive_candidates": sum(value > 0.0 for value in raw_edges),
+            },
+            "calibration": entry_calibration.as_dict() if entry_calibration is not None else {"status": "disabled"},
+        }
+
         pending_created = []
         for c in selected:
             pid = str(uuid.uuid4())
@@ -627,6 +669,7 @@ def _cycle_v24(
         "policy_model_hash": policy_hash,
         "policy_version": policy_version,
         "policy_accounting_compatible": policy_compatible,
+        "entry_evaluation": entry_evaluation,
         "training_feedback": "disabled",
     }
 

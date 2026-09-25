@@ -69,6 +69,12 @@ class BenchmarkConfig:
     # or converted into a watched, retracement-gated re-entry opportunity.
     recurrent_swing_enabled: bool = True
     swing_entry_min_probability: float = 0.55
+    # Once enough champion-matched 60-minute outcomes mature, the absolute gate
+    # above is replaced by an empirical probability region and conservative
+    # outcome-regression edge. These bounds affect decisions, not model fitting.
+    swing_calibration_min_samples: int = 80
+    swing_calibration_min_tokens: int = 12
+    swing_calibration_max_samples: int = 5000
     swing_entry_max_occurrence_minutes: float = 60.0
     swing_entry_min_net_upside: float = 0.02
     swing_peak_boundary_minutes: float = 10.0
@@ -487,6 +493,12 @@ def _validate_munger_config(config: BenchmarkConfig) -> None:
         raise ValueError("Conviction quantiles must satisfy 0 < strong < exceptional < 1.")
     if config.conviction_calibration_min_scores < 1 or config.conviction_calibration_max_scores < 1:
         raise ValueError("Conviction calibration sample limits must be positive.")
+    if (
+        config.swing_calibration_min_samples < 20
+        or config.swing_calibration_min_tokens < 2
+        or config.swing_calibration_max_samples < config.swing_calibration_min_samples
+    ):
+        raise ValueError("Swing calibration needs at least 20 samples, two tokens, and a valid sample cap.")
     if not (0.0 <= config.correlation_threshold <= 1.0):
         raise ValueError("Correlation threshold must be between 0 and 1.")
     if config.correlation_min_overlap < 2 or config.correlation_lookback_minutes <= 0:
@@ -1924,6 +1936,9 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
         default=d.recurrent_swing_enabled,
     )
     p.add_argument("--swing-entry-min-probability", type=float, default=d.swing_entry_min_probability)
+    p.add_argument("--swing-calibration-min-samples", type=int, default=d.swing_calibration_min_samples)
+    p.add_argument("--swing-calibration-min-tokens", type=int, default=d.swing_calibration_min_tokens)
+    p.add_argument("--swing-calibration-max-samples", type=int, default=d.swing_calibration_max_samples)
     p.add_argument("--swing-entry-max-occurrence-minutes", type=float, default=d.swing_entry_max_occurrence_minutes)
     p.add_argument("--swing-entry-min-net-upside", type=float, default=d.swing_entry_min_net_upside)
     p.add_argument("--swing-peak-boundary-minutes", type=float, default=d.swing_peak_boundary_minutes)
