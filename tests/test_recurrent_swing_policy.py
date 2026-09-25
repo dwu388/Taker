@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 
 import joblib
 import pandas as pd
@@ -69,6 +70,83 @@ def test_short_horizon_heads_control_buy_now_instead_of_broad_lifecycle_probabil
     )
     assert uncertain.score < good.score
     assert uncertain.occurrence_spread_minutes == pytest.approx(149.0)
+
+
+def test_entry_calibration_uses_only_mature_champion_matched_outcomes(tmp_path):
+    source = tmp_path / "raw.sqlite"
+    wallet = tmp_path / "wallet.sqlite"
+    migrate_raw(source)
+    cfg = benchmark.BenchmarkConfig(
+        swing_calibration_min_samples=20,
+        swing_calibration_min_tokens=4,
+        swing_calibration_max_samples=100,
+    )
+    benchmark.init_benchmark(str(wallet), cfg)
+    base = pd.Timestamp("2026-09-01T00:00:00Z")
+    with sqlite3.connect(wallet) as conn, sqlite3.connect(source) as raw:
+        conn.row_factory = sqlite3.Row
+        benchmark.migrate(conn)
+        bid = str(conn.execute(
+            "SELECT benchmark_id FROM benchmark_account_v22 WHERE status='active'"
+        ).fetchone()[0])
+        observation_id = 0
+        for index in range(20):
+            token = f"T{index % 4}"
+            decision = base + pd.Timedelta(minutes=90 * index)
+            is_good = index >= 10
+            state = short_setup(
+                p_first_peak_by_5m=0.08 if is_good else 0.02,
+                p_first_peak_by_10m=0.09 if is_good else 0.025,
+                p_first_peak_by_15m=0.10 if is_good else 0.03,
+                p_first_peak_by_30m=0.11 if is_good else 0.035,
+                p_first_peak_by_60m=0.12 if is_good else 0.04,
+            )
+            conn.execute(
+                """INSERT INTO benchmark_candidates_v22
+                (benchmark_id,snapshot_at,token_key,market_cap_usd,entry_score,score_kind,
+                 chosen,state_json,forecast_model_hash,policy_model_hash)
+                VALUES(?,?,?,?,0,'recurrent_swing_bootstrap',0,?,'frozen',NULL)""",
+                (bid, decision.isoformat(), token, 100.0, json.dumps(state)),
+            )
+            for minute in range(61):
+                observation_id += 1
+                progress = minute / 60.0
+                market_cap = 100.0 * (1.0 + (0.30 if is_good else -0.20) * progress)
+                raw.execute(
+                    """INSERT INTO axiom_observations
+                    (observation_id,token_key,snapshot_at,market_cap_usd)
+                    VALUES(?,?,?,?)""",
+                    (observation_id, token, (decision + pd.Timedelta(minutes=minute)).isoformat(), market_cap),
+                )
+        conn.commit()
+        raw.commit()
+        calibration = swing.build_entry_calibration(
+            conn, str(source), bid,
+            base + pd.Timedelta(minutes=90 * 20 + 61), "frozen", cfg,
+        )
+
+    assert calibration.ready
+    assert calibration.sample_size == 20
+    assert calibration.token_count == 4
+    good, _ = swing.short_term_setup(short_setup(
+        p_first_peak_by_5m=0.08,
+        p_first_peak_by_10m=0.09,
+        p_first_peak_by_15m=0.10,
+        p_first_peak_by_30m=0.11,
+        p_first_peak_by_60m=0.12,
+    ), cfg, 0.4, "bootstrap", calibration)
+    bad, _ = swing.short_term_setup(short_setup(
+        p_first_peak_by_5m=0.02,
+        p_first_peak_by_10m=0.025,
+        p_first_peak_by_15m=0.03,
+        p_first_peak_by_30m=0.035,
+        p_first_peak_by_60m=0.04,
+    ), cfg, 0.4, "bootstrap", calibration)
+    assert good.qualifies
+    assert good.calibration_status == "ready"
+    assert good.probability < cfg.swing_entry_min_probability
+    assert not bad.qualifies
+    assert bad.reason == "no_calibrated_profitable_probability_region"
 
 
 def test_peak_is_decision_boundary_not_an_unconditional_sale():

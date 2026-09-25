@@ -58,7 +58,13 @@ minute-sensitive heads are present, a new entry must have a positive, friction-
 adjusted setup across the 5/10/15/30/60-minute peak probabilities, next-occurrence
 quantiles and next-peak magnitude. Broader later-higher, second-peak, downside and
 death forecasts provide lifecycle context rather than substituting for a timely
-entry signal.
+entry signal. After at least 80 mature observations across 12 tokens, the entry
+overlay replaces its bootstrap absolute thresholds with champion-hash-specific
+calibration from realized 60-minute paths. It uses token-balanced regression and
+one-sided confidence bounds, and it permits only probability regions whose
+friction- and drawdown-adjusted realized reward is conservatively positive. The
+current cycle reports the calibration sample, probability bins, edge distribution
+and every rejection reason under `entry_evaluation`.
 
 An approaching first peak is a decision boundary, not an automatic sale. The
 wallet compares remaining hold-through value with the value of selling, releasing
