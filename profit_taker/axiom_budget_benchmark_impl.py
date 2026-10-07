@@ -63,7 +63,8 @@ class BenchmarkConfig:
     max_hold_minutes: float = 72.0 * 60.0
     missing_close_minutes: float = 50.0
     reentry_cooldown_minutes: float = 20.0
-    friction_bps_round_trip: float = 100.0
+    # Total assumed entry plus exit fee in basis points; split evenly at fills.
+    friction_bps_round_trip: float = 85.0
     # Recurrent swing overlay. Short-horizon heads answer "buy now"; recurrent
     # lifecycle heads decide whether an approaching peak should be held through
     # or converted into a watched, retracement-gated re-entry opportunity.
@@ -428,11 +429,16 @@ def init_benchmark(db: str, config: BenchmarkConfig, *, reset: bool = False) -> 
         migrate(conn)
         existing = _account(conn)
         if existing and not reset:
+            saved_config = _config_from_saved_json(existing["config_json"])
             return {
                 "initialized": False,
                 "reason": "active benchmark already exists",
                 "benchmark_id": existing["benchmark_id"],
                 "cash_usd": existing["cash_usd"],
+                "friction_bps_round_trip": saved_config.friction_bps_round_trip,
+                "fee_change_requires_new_benchmark": (
+                    saved_config.friction_bps_round_trip != config.friction_bps_round_trip
+                ),
             }
         if reset:
             conn.execute("UPDATE benchmark_account_v22 SET status='retired' WHERE status='active'")
@@ -476,6 +482,8 @@ def _config_from_saved_json(value: str) -> BenchmarkConfig:
 
 
 def _validate_munger_config(config: BenchmarkConfig) -> None:
+    if not math.isfinite(config.friction_bps_round_trip) or not (0 <= config.friction_bps_round_trip < 20000):
+        raise ValueError("Round-trip fee must be finite and between 0 and 20000 basis points.")
     fractions = (
         config.ordinary_position_fraction,
         config.strong_position_fraction,

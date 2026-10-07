@@ -17,6 +17,11 @@ def test_munger_defaults_match_the_1000_account_plan():
     benchmark._validate_munger_config(cfg)
 
     assert cfg.initial_cash_usd == 1000.0
+    assert cfg.friction_bps_round_trip == 85.0
+    entry_rate, exit_rate = benchmark._entry_exit_rates(cfg)
+    assert entry_rate == pytest.approx(0.00425)
+    assert exit_rate == pytest.approx(0.00425)
+    assert 50.0 / (1 + entry_rate) * (1 - exit_rate) < 50.0
     assert cfg.position_fraction == 0.05
     assert cfg.ordinary_position_fraction * cfg.initial_cash_usd == 50.0
     assert cfg.strong_position_fraction * cfg.initial_cash_usd == 75.0
@@ -25,6 +30,21 @@ def test_munger_defaults_match_the_1000_account_plan():
     assert cfg.max_total_exposure_fraction == 0.30
     assert cfg.max_correlated_exposure_fraction == 0.15
     assert cfg.min_cash_reserve_fraction == 0.70
+
+
+def test_existing_wallet_retains_its_recorded_fee(tmp_path):
+    path = tmp_path / "wallet.sqlite"
+    old = benchmark.BenchmarkConfig(friction_bps_round_trip=100.0)
+    benchmark.init_benchmark(str(path), old)
+    existing = benchmark.init_benchmark(str(path), benchmark.BenchmarkConfig())
+    assert existing["initialized"] is False
+    assert existing["friction_bps_round_trip"] == 100.0
+    assert existing["fee_change_requires_new_benchmark"] is True
+    with sqlite3.connect(path) as conn:
+        recorded = conn.execute(
+            "SELECT config_json FROM benchmark_account_v22 WHERE status='active'"
+        ).fetchone()[0]
+    assert benchmark._config_from_saved_json(recorded).friction_bps_round_trip == 100.0
 
 
 def test_conviction_tiers_use_only_prior_same_kind_scores():

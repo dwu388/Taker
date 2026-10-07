@@ -72,6 +72,30 @@ def test_short_horizon_heads_control_buy_now_instead_of_broad_lifecycle_probabil
     assert uncertain.occurrence_spread_minutes == pytest.approx(149.0)
 
 
+
+def test_fee_blocks_a_small_predicted_swing_but_allows_a_larger_one():
+    cfg = benchmark.BenchmarkConfig(swing_entry_min_net_upside=0.0)
+    # With certain peak occurrence and no modeled downside, isolate the fee gate.
+    state = short_setup(
+        p_first_peak_by_5m=1.0, p_first_peak_by_10m=1.0,
+        p_first_peak_by_15m=1.0, p_first_peak_by_30m=1.0,
+        p_first_peak_by_60m=1.0, next_occurrence_q50=0.0,
+        next_occurrence_q25=0.0, next_occurrence_q75=0.0,
+        next_occurrence_q90=0.0, next_confirmation_lag_q50=0.0,
+        p_death_by_60m=0.0, p_hit_minus50_by_60m=0.0,
+        next_peak_multiple_q25=1.008, next_peak_multiple_q50=1.008,
+    )
+    small, _ = swing.short_term_setup(state, cfg, 0.5, "bootstrap")
+    assert not small.qualifies
+    assert small.reason == "short_peak_upside_below_friction_buffer"
+    assert small.net_edge < 0.0
+
+    state.update(next_peak_multiple_q25=1.02, next_peak_multiple_q50=1.02)
+    larger, _ = swing.short_term_setup(state, cfg, 0.5, "bootstrap")
+    assert larger.qualifies
+    assert larger.net_edge > 0.0
+
+
 def test_entry_calibration_uses_only_mature_champion_matched_outcomes(tmp_path):
     source = tmp_path / "raw.sqlite"
     wallet = tmp_path / "wallet.sqlite"
