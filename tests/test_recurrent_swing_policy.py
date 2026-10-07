@@ -72,6 +72,30 @@ def test_short_horizon_heads_control_buy_now_instead_of_broad_lifecycle_probabil
     assert uncertain.occurrence_spread_minutes == pytest.approx(149.0)
 
 
+def test_new_wallet_requires_fee_covering_short_setup():
+    cfg = benchmark.BenchmarkConfig(swing_entry_min_net_upside=0.0)
+    assert cfg.axiom_net_fee_bps_per_side == 85.0
+    weak = short_setup(
+        p_first_peak_by_5m=1.0, p_first_peak_by_10m=1.0,
+        p_first_peak_by_15m=1.0, p_first_peak_by_30m=1.0,
+        p_first_peak_by_60m=1.0, next_occurrence_q50=0.0,
+        next_peak_multiple_q25=1.05, next_peak_multiple_q50=1.05,
+        p_death_by_60m=0.0, p_hit_minus50_by_60m=0.0,
+    )
+    too_small, _ = swing.short_term_setup(weak, cfg, 0.5, "bootstrap")
+    assert not too_small.qualifies
+    assert too_small.reason == "short_peak_upside_below_friction_buffer"
+    assert too_small.net_edge < 0
+
+    weak.update(next_peak_multiple_q25=1.15, next_peak_multiple_q50=1.15)
+    larger, _ = swing.short_term_setup(weak, cfg, 0.5, "bootstrap")
+    assert larger.qualifies
+
+    missing, _ = swing.short_term_setup({"p_first_peak_by_720m": 0.9}, cfg, 0.5, "bootstrap")
+    assert not missing.qualifies
+    assert missing.reason == "missing_short_horizon_fee_evidence"
+
+
 def test_entry_calibration_uses_only_mature_champion_matched_outcomes(tmp_path):
     source = tmp_path / "raw.sqlite"
     wallet = tmp_path / "wallet.sqlite"

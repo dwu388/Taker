@@ -18,6 +18,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from . import paper_execution_costs as costs
+
 try:
     from . import axiom_peak_structure as peak
     from . import axiom_self_teach as selfteach
@@ -63,7 +65,16 @@ class BenchmarkConfig:
     max_hold_minutes: float = 72.0 * 60.0
     missing_close_minutes: float = 50.0
     reentry_cooldown_minutes: float = 20.0
+    # Retained for older wallets. New wallets apply the per-side cost scenario below.
     friction_bps_round_trip: float = 100.0
+    execution_cost_model: str = "axiom_cost_scenario"
+    axiom_net_fee_bps_per_side: float = 85.0  # Gold tier, after cashback
+    pool_fee_bps_per_side: float = 125.0  # Conservative unknown-route Pump fee
+    execution_slippage_bps_per_side: float = 50.0  # Assumed realized haircut, not max slippage
+    priority_fee_sol_per_side: float = 0.001
+    bribe_sol_per_side: float = 0.001
+    network_fee_sol_per_side: float = 0.000005  # One Solana signature
+    sol_usd_reference: float = 150.0  # Explicit fixed-cost scenario; update for your SOL quote
     # Recurrent swing overlay. Short-horizon heads answer "buy now"; recurrent
     # lifecycle heads decide whether an approaching peak should be held through
     # or converted into a watched, retracement-gated re-entry opportunity.
@@ -428,11 +439,14 @@ def init_benchmark(db: str, config: BenchmarkConfig, *, reset: bool = False) -> 
         migrate(conn)
         existing = _account(conn)
         if existing and not reset:
+            saved = _config_from_saved_json(existing["config_json"])
             return {
                 "initialized": False,
                 "reason": "active benchmark already exists",
                 "benchmark_id": existing["benchmark_id"],
                 "cash_usd": existing["cash_usd"],
+                "execution_cost_model": saved.execution_cost_model,
+                "fee_change_requires_new_benchmark": asdict(saved) != asdict(config),
             }
         if reset:
             conn.execute("UPDATE benchmark_account_v22 SET status='retired' WHERE status='active'")
@@ -461,6 +475,8 @@ def init_benchmark(db: str, config: BenchmarkConfig, *, reset: bool = False) -> 
             "benchmark_id": benchmark_id,
             "initial_cash_usd": config.initial_cash_usd,
             "mode": "isolated_paper_benchmark",
+            "execution_cost_model": config.execution_cost_model,
+            "sol_usd_reference": config.sol_usd_reference,
         }
 
 
@@ -471,11 +487,16 @@ def _config_from_saved_json(value: str) -> BenchmarkConfig:
     except Exception:
         raw = {}
     defaults = asdict(BenchmarkConfig())
+    # Historical wallet configs stored only a combined round-trip friction. Never
+    # reinterpret their past fills, open marks or remaining exits under new defaults.
+    if "execution_cost_model" not in raw:
+        defaults["execution_cost_model"] = "legacy_round_trip"
     defaults.update({k: raw[k] for k in defaults if k in raw})
     return BenchmarkConfig(**defaults)
 
 
 def _validate_munger_config(config: BenchmarkConfig) -> None:
+    costs.validate(config)
     fractions = (
         config.ordinary_position_fraction,
         config.strong_position_fraction,
@@ -681,8 +702,7 @@ def _allocation_amount(
     )
 
 def _entry_exit_rates(config: BenchmarkConfig) -> tuple[float, float]:
-    half = max(0.0, config.friction_bps_round_trip) / 20000.0
-    return half, half
+    return costs.variable_rates(config)
 
 
 def _is_disappearance_reason(reason: str | None) -> bool:
@@ -710,10 +730,10 @@ def _execution_proxy_mc(
     return entry + frac * (observed - entry)
 
 
-def _proceeds_at_mc(pos: sqlite3.Row, mc: float, exit_fee_rate: float) -> tuple[float, float]:
-    gross = float(pos["exposure_units"]) * float(mc)
-    fee = gross * exit_fee_rate
-    return gross - fee, fee
+def _proceeds_at_mc(
+    pos: sqlite3.Row, mc: float, exit_fee_rate: float, config: BenchmarkConfig
+) -> tuple[float, float]:
+    return costs.exit_fill(float(pos["exposure_units"]), mc, config)
 
 
 def _classify_exit(reason: str, price_available: bool) -> str:
@@ -742,8 +762,8 @@ def _backfill_closed_execution_columns(
         unavailable = _is_disappearance_reason(reason)
         kind = _classify_exit(reason, not unavailable)
         exec_mc = _execution_proxy_mc(pos, observed_mc, config, unavailable=unavailable)
-        observed_proceeds, observed_fee = _proceeds_at_mc(pos, observed_mc, exit_fee_rate)
-        execution_proceeds, execution_fee = _proceeds_at_mc(pos, exec_mc, exit_fee_rate)
+        observed_proceeds, observed_fee = _proceeds_at_mc(pos, observed_mc, exit_fee_rate, config)
+        execution_proceeds, execution_fee = _proceeds_at_mc(pos, exec_mc, exit_fee_rate, config)
         spent = float(pos["entry_cash_spent_usd"])
         observed_pnl = observed_proceeds - spent
         execution_pnl = execution_proceeds - spent
@@ -784,9 +804,10 @@ def _execution_cash_from_ledger(
     return float(initial_cash) - spent + proceeds
 
 
-def _liquidation_value(pos: sqlite3.Row, mc: float, exit_fee_rate: float) -> float:
-    gross = float(pos["exposure_units"]) * float(mc)
-    return gross * (1.0 - exit_fee_rate)
+def _liquidation_value(
+    pos: sqlite3.Row, mc: float, exit_fee_rate: float, config: BenchmarkConfig
+) -> float:
+    return costs.exit_fill(float(pos["exposure_units"]), mc, config)[0]
 
 
 def _close_position(
@@ -805,8 +826,8 @@ def _close_position(
     unavailable = exit_kind == "disappearance_terminal"
     execution_mc = _execution_proxy_mc(pos, observed_mc, config, unavailable=unavailable)
 
-    observed_proceeds, observed_exit_fee = _proceeds_at_mc(pos, observed_mc, exit_fee_rate)
-    execution_proceeds, execution_exit_fee = _proceeds_at_mc(pos, execution_mc, exit_fee_rate)
+    observed_proceeds, observed_exit_fee = _proceeds_at_mc(pos, observed_mc, exit_fee_rate, config)
+    execution_proceeds, execution_exit_fee = _proceeds_at_mc(pos, execution_mc, exit_fee_rate, config)
     spent = float(pos["entry_cash_spent_usd"])
     observed_pnl = observed_proceeds - spent
     execution_pnl = execution_proceeds - spent
@@ -1044,9 +1065,9 @@ def _cycle_legacy(
             if row is None:
                 absent = max(0.0, (snapshot - _to_ts(pos["last_seen_at"])).total_seconds() / 60.0)
                 observed_mc = float(pos["last_mc"])
-                observed_liq = _liquidation_value(pos, observed_mc, exit_fee_rate)
+                observed_liq = _liquidation_value(pos, observed_mc, exit_fee_rate, config)
                 execution_mc = _execution_proxy_mc(pos, observed_mc, config, unavailable=True)
-                execution_liq = _liquidation_value(pos, execution_mc, exit_fee_rate)
+                execution_liq = _liquidation_value(pos, execution_mc, exit_fee_rate, config)
                 current_return = observed_mc / float(pos["entry_mc"]) - 1.0
                 terminal = absent >= config.missing_close_minutes
                 conn.execute(
@@ -1084,7 +1105,7 @@ def _cycle_legacy(
             current_return = mc / float(pos["entry_mc"]) - 1.0
             mfe = max(float(pos["mfe_pct"]), current_return)
             mae = min(float(pos["mae_pct"]), current_return)
-            liquidation = _liquidation_value(pos, mc, exit_fee_rate)
+            liquidation = _liquidation_value(pos, mc, exit_fee_rate, config)
             hold_score, hold_kind = _hold_score(mark_state, policy)
             held = max(0.0, (snapshot - _to_ts(pos["opened_at"])).total_seconds() / 60.0)
             action = "HOLD"
@@ -1145,7 +1166,7 @@ def _cycle_legacy(
                 execution_open_before_entries += float(p["last_mark_value_usd"])
             else:
                 proxy_mc = _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True)
-                execution_open_before_entries += _liquidation_value(p, proxy_mc, exit_fee_rate)
+                execution_open_before_entries += _liquidation_value(p, proxy_mc, exit_fee_rate, config)
         effectiveness_equity_before_entries = execution_cash + execution_open_before_entries
 
         candidates: list[dict[str, Any]] = []
@@ -1205,12 +1226,10 @@ def _cycle_legacy(
             # so five 20% slots can never overdraft a $1,000 account.
             target_cash_spend = max(0.0, effectiveness_equity_before_entries * config.position_fraction)
             cash_spend = min(cash, execution_cash, target_cash_spend)
-            if cash_spend < 1.0:
+            if cash_spend < max(1.0, costs.fixed_fee_usd(config) + 0.01):
                 continue
-            notional = cash_spend / (1.0 + entry_fee_rate)
-            entry_fee = cash_spend - notional
             mc = float(c["market_cap_usd"])
-            units = notional / mc
+            notional, entry_fee, units = costs.entry_fill(cash_spend, mc, config)
             position_id = str(uuid.uuid4())
             conn.execute(
                 """
@@ -1225,7 +1244,7 @@ def _cycle_legacy(
                     position_id, benchmark_id, c["token_key"], snapshot.isoformat(), mc, notional,
                     entry_fee, cash_spend, units, c["score"], c["score_kind"], _json(c["state"]),
                     forecast_hash, policy_hash, policy_version, snapshot.isoformat(), mc,
-                    notional * (1.0 - exit_fee_rate),
+                    costs.exit_fill(units, mc, config)[0],
                 ),
             )
             cash -= cash_spend
@@ -1264,7 +1283,7 @@ def _cycle_legacy(
             else:
                 stale_open_positions += 1
                 proxy_mc = _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True)
-                execution_mark = _liquidation_value(p, proxy_mc, exit_fee_rate)
+                execution_mark = _liquidation_value(p, proxy_mc, exit_fee_rate, config)
             execution_open_liq += execution_mark
             execution_unrealized += execution_mark - float(p["entry_cash_spent_usd"])
 
@@ -1398,16 +1417,16 @@ def _cycle_v24(
                     cancelled.append({"token_key":token,"missing_minutes":mins})
                 continue
             reserved=min(float(pen["reserved_cash_usd"]),cash,execution_cash)
-            if reserved<1.0:
+            if reserved<max(1.0,costs.fixed_fee_usd(config)+0.01):
                 conn.execute("UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason='insufficient_cash_at_fill' WHERE pending_id=?",(snapshot.isoformat(),pen["pending_id"]));continue
-            notional=reserved/(1.0+entry_fee_rate); fee=reserved-notional; mc=float(row["market_cap_usd"]); units=notional/mc; pid=str(uuid.uuid4())
+            mc=float(row["market_cap_usd"]); notional,fee,units=costs.entry_fill(reserved,mc,config); pid=str(uuid.uuid4())
             conn.execute("""INSERT INTO benchmark_positions_v22
                 (position_id,benchmark_id,token_key,opened_at,entry_mc,entry_notional_usd,entry_fee_usd,entry_cash_spent_usd,
                  exposure_units,entry_score,entry_score_kind,entry_state_json,forecast_model_hash,policy_model_hash,policy_version,status,
                  last_seen_at,last_mc,last_mark_value_usd,mfe_pct,mae_pct,entry_decision_at,entry_fill_kind)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,0,0,?,'next_observable')""",
                 (pid,bid,token,snapshot.isoformat(),mc,notional,fee,reserved,units,pen["entry_score"],pen["entry_score_kind"],pen["entry_state_json"],
-                 pen["forecast_model_hash"],pen["policy_model_hash"],pen["policy_version"],snapshot.isoformat(),mc,notional*(1-exit_fee_rate),pen["decision_at"]))
+                 pen["forecast_model_hash"],pen["policy_model_hash"],pen["policy_version"],snapshot.isoformat(),mc,costs.exit_fill(units, mc, config)[0],pen["decision_at"]))
             conn.execute("UPDATE benchmark_pending_entries_v24 SET status='filled',filled_at=?,fill_mc=? WHERE pending_id=?",(snapshot.isoformat(),mc,pen["pending_id"]))
             cash-=reserved; execution_cash-=reserved; entries.append({"position_id":pid,"token_key":token,"decision_mc":float(pen["decision_mc"]),"entry_mc":mc,"cash_spent_usd":reserved,"fill_kind":"next_observable"})
 
@@ -1416,7 +1435,7 @@ def _cycle_v24(
         for pos in open_positions:
             token=str(pos["token_key"]); row=current_series.get(token); pending_exit=_to_ts(pos["pending_exit_at"]) if pos["pending_exit_at"] else None
             if row is None:
-                terminal,absent=terminal_absence(_to_ts(pos["last_seen_at"])); observed_mc=float(pos["last_mc"]); observed_liq=_liquidation_value(pos,observed_mc,exit_fee_rate); proxy=_execution_proxy_mc(pos,observed_mc,config,unavailable=True); exliq=_liquidation_value(pos,proxy,exit_fee_rate); ret=observed_mc/float(pos["entry_mc"])-1
+                terminal,absent=terminal_absence(_to_ts(pos["last_seen_at"])); observed_mc=float(pos["last_mc"]); observed_liq=_liquidation_value(pos,observed_mc,exit_fee_rate, config); proxy=_execution_proxy_mc(pos,observed_mc,config,unavailable=True); exliq=_liquidation_value(pos,proxy,exit_fee_rate, config); ret=observed_mc/float(pos["entry_mc"])-1
                 conn.execute("""INSERT OR REPLACE INTO benchmark_marks_v22
                     (mark_id,benchmark_id,position_id,token_key,snapshot_at,market_cap_usd,liquidation_value_usd,return_pct,mfe_pct,mae_pct,hold_score,action,state_json,forecast_model_hash,policy_model_hash,price_available,mark_kind,execution_liquidation_value_usd)
                     VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,0,?,?)""",
@@ -1430,7 +1449,7 @@ def _cycle_v24(
             if pending_exit is not None and snapshot>pending_exit:
                 fresh=conn.execute("SELECT * FROM benchmark_positions_v22 WHERE position_id=?",(pos["position_id"],)).fetchone(); closed=_close_position(conn,fresh,snapshot,mc,str(pos["pending_exit_reason"] or "policy_exit_next_observable"),exit_fee_rate,config,price_available=True)
                 cash+=closed["observed_proceeds_usd"]; execution_cash+=closed["execution_proceeds_usd"]; exits.append(closed); open_tokens.discard(token);continue
-            state=_safe_state(row); mark_state=_state_with_position(state,pos,mc,snapshot); ret=mc/float(pos["entry_mc"])-1; mfe=max(float(pos["mfe_pct"]),ret); mae=min(float(pos["mae_pct"]),ret); liq=_liquidation_value(pos,mc,exit_fee_rate); hold_score,kind=_hold_score(mark_state,policy); held=max(0.0,(snapshot-_to_ts(pos["opened_at"])).total_seconds()/60.0)
+            state=_safe_state(row); mark_state=_state_with_position(state,pos,mc,snapshot); ret=mc/float(pos["entry_mc"])-1; mfe=max(float(pos["mfe_pct"]),ret); mae=min(float(pos["mae_pct"]),ret); liq=_liquidation_value(pos,mc,exit_fee_rate, config); hold_score,kind=_hold_score(mark_state,policy); held=max(0.0,(snapshot-_to_ts(pos["opened_at"])).total_seconds()/60.0)
             action="HOLD";reason=None
             if held>=config.max_hold_minutes:action,reason="EXIT_DECISION","max_hold_72h"
             elif held>=config.min_hold_minutes and hold_score<=0:action,reason="EXIT_DECISION",f"{kind}_hold_value_nonpositive"
@@ -1446,7 +1465,7 @@ def _cycle_v24(
         exec_open=0.0
         for p in open_positions:
             if str(p["token_key"]) in current_series:exec_open+=float(p["last_mark_value_usd"])
-            else:exec_open+=_liquidation_value(p,_execution_proxy_mc(p,float(p["last_mc"]),config,unavailable=True),exit_fee_rate)
+            else:exec_open+=_liquidation_value(p,_execution_proxy_mc(p,float(p["last_mc"]),config,unavailable=True),exit_fee_rate, config)
         effect_equity=execution_cash+exec_open
         candidates=[]
         open_tokens={str(p["token_key"]) for p in open_positions}; pending_tokens={str(r[0]) for r in conn.execute("SELECT token_key FROM benchmark_pending_entries_v24 WHERE benchmark_id=? AND status='pending'",(bid,)).fetchall()}
@@ -1480,7 +1499,7 @@ def _cycle_v24(
         for p in open_positions:
             obsval=float(p["last_mark_value_usd"]);open_liq+=obsval;unreal+=obsval-float(p["entry_cash_spent_usd"])
             if str(p["token_key"]) in current_series:exval=obsval
-            else:stale+=1;exval=_liquidation_value(p,_execution_proxy_mc(p,float(p["last_mc"]),config,unavailable=True),exit_fee_rate)
+            else:stale+=1;exval=_liquidation_value(p,_execution_proxy_mc(p,float(p["last_mc"]),config,unavailable=True),exit_fee_rate, config)
             exec_open_liq+=exval;exunreal+=exval-float(p["entry_cash_spent_usd"])
         observed_realized=float(conn.execute("SELECT COALESCE(SUM(realized_pnl_usd),0) FROM benchmark_positions_v22 WHERE benchmark_id=? AND status='closed'",(bid,)).fetchone()[0] or 0.0); execution_realized=float(conn.execute("SELECT COALESCE(SUM(COALESCE(execution_realized_pnl_usd,realized_pnl_usd)),0) FROM benchmark_positions_v22 WHERE benchmark_id=? AND status='closed'",(bid,)).fetchone()[0] or 0.0)
         execution_cash=_execution_cash_from_ledger(conn,bid,float(acct["initial_cash_usd"])); observed_equity=cash+open_liq; execution_equity=execution_cash+exec_open_liq
@@ -1503,24 +1522,45 @@ def _max_drawdown(equity: pd.Series) -> float | None:
 
 
 
-def friction_stress_curves_from_closed(closed: pd.DataFrame, initial_cash: float, bps_values=(100.0,300.0,500.0,1000.0)) -> dict[str, Any]:
-    """Replay the same closed trade set under alternative round-trip friction.
+def friction_stress_curves_from_closed(
+    closed: pd.DataFrame, initial_cash: float,
+    bps_values=(100.0, 300.0, 500.0, 1000.0),
+    config: BenchmarkConfig | None = None,
+) -> dict[str, Any]:
+    """Fixed-trade replay under additional round-trip costs for a new wallet.
 
-    This does not pretend position selection/sizing would be identical under a
-    different cost regime; it is an intentionally transparent fixed-trade stress.
+    Selection and trade sizes are held fixed. Historical legacy callers retain
+    the original alternative-total-friction interpretation.
     """
-    out={}
-    if closed.empty:
-        return {f"{int(b)}bps": {"equity_usd": float(initial_cash), "return_pct": 0.0, "trades": 0} for b in bps_values}
+    scenario = config is not None and config.execution_cost_model != "legacy_round_trip"
+    entry_base, exit_base = costs.variable_rates(config) if scenario else (0.0, 0.0)
+    fixed = costs.fixed_fee_usd(config) if scenario else 0.0
+    out = {}
     for b in bps_values:
-        half=max(0.0,float(b))/20000.0; pnl=0.0
-        for _,r in closed.iterrows():
-            notional=float(r.get("entry_notional_usd") or 0.0); units=float(r.get("exposure_units") or 0.0)
-            exit_mc=r.get("exit_mc_execution_proxy")
-            if pd.isna(exit_mc): exit_mc=r.get("exit_mc")
-            if notional<=0 or units<=0 or pd.isna(exit_mc): continue
-            stressed_spent=notional*(1.0+half); stressed_proceeds=units*float(exit_mc)*(1.0-half); pnl+=stressed_proceeds-stressed_spent
-        equity=float(initial_cash)+pnl; out[f"{int(b)}bps"]={"equity_usd":equity,"pnl_usd":pnl,"return_pct":equity/float(initial_cash)-1.0,"trades":int(len(closed))}
+        half = max(0.0, float(b)) / 20000.0
+        pnl = 0.0
+        for _, row in closed.iterrows():
+            notional = float(row.get("entry_notional_usd") or 0.0)
+            units = float(row.get("exposure_units") or 0.0)
+            exit_mc = row.get("exit_mc_execution_proxy")
+            if pd.isna(exit_mc):
+                exit_mc = row.get("exit_mc")
+            if notional <= 0 or units <= 0 or pd.isna(exit_mc):
+                continue
+            spent = notional * (1.0 + entry_base + half) + fixed
+            proceeds = max(0.0, units * float(exit_mc) * (1.0 - exit_base - half) - fixed)
+            pnl += proceeds - spent
+        equity = float(initial_cash) + pnl
+        key = f"+{int(b)}bps" if scenario else f"{int(b)}bps"
+        out[key] = {
+            "equity_usd": equity, "pnl_usd": pnl,
+            "return_pct": equity / float(initial_cash) - 1.0,
+            "trades": int(len(closed)),
+            "cost_interpretation": (
+                "additional_round_trip_bps_above_saved_scenario"
+                if scenario else "alternative_total_round_trip_bps"
+            ),
+        }
     return out
 
 def status(db: str) -> dict[str, Any]:
@@ -1580,8 +1620,7 @@ def status(db: str) -> dict[str, Any]:
                         proxy_mc = observed_mc
                 else:
                     proxy_mc = observed_mc
-                gross = float(row["exposure_units"]) * proxy_mc
-                execution_open_value += gross * (1.0 - exit_fee_rate)
+                execution_open_value += costs.exit_fill(float(row["exposure_units"]), proxy_mc, config)[0]
 
         execution_equity = execution_cash + execution_open_value
         observed_realized = float(closed["realized_pnl_usd"].sum()) if not closed.empty else 0.0
@@ -1651,7 +1690,7 @@ def status(db: str) -> dict[str, Any]:
         if not eq.empty and "execution_equity_usd" in eq.columns:
             exec_eq = pd.to_numeric(eq["execution_equity_usd"], errors="coerce").dropna()
             execution_dd = _max_drawdown(exec_eq) if not exec_eq.empty else None
-        friction_stress=friction_stress_curves_from_closed(closed,initial,(100.0,300.0,500.0,1000.0))
+        friction_stress=friction_stress_curves_from_closed(closed,initial,(100.0,300.0,500.0,1000.0),config)
         pending_row = conn.execute(
             """SELECT COUNT(*),COALESCE(SUM(reserved_cash_usd),0)
                FROM benchmark_pending_entries_v24 WHERE benchmark_id=? AND status='pending'""",
@@ -1705,6 +1744,21 @@ def status(db: str) -> dict[str, Any]:
             "benchmark_id": bid,
             "created_at": acct["created_at"],
             "initial_budget_usd": initial,
+            "execution_cost_assumptions": {
+                "model": config.execution_cost_model,
+                "axiom_net_fee_bps_per_side": config.axiom_net_fee_bps_per_side,
+                "pool_fee_bps_per_side": config.pool_fee_bps_per_side,
+                "execution_slippage_bps_per_side": config.execution_slippage_bps_per_side,
+                "priority_fee_sol_per_side": config.priority_fee_sol_per_side,
+                "bribe_sol_per_side": config.bribe_sol_per_side,
+                "network_fee_sol_per_side": config.network_fee_sol_per_side,
+                "sol_usd_reference": config.sol_usd_reference,
+                "fixed_cost_usd_per_side": costs.fixed_fee_usd(config),
+                "ordinary_same_price_round_trip_cost_fraction": costs.round_trip_cost_fraction(
+                    config, initial * config.ordinary_position_fraction
+                ),
+                "note": "Saved scenario, not a live quote or verified pool route.",
+            },
             # Compatibility fields retain the original observed-price interpretation.
             "cash_usd": float(acct["cash_usd"]),
             "equity_usd": observed_equity,
@@ -1931,6 +1985,14 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--missing-close-minutes", type=float, default=d.missing_close_minutes)
     p.add_argument("--reentry-cooldown-minutes", type=float, default=d.reentry_cooldown_minutes)
     p.add_argument("--friction-bps-round-trip", type=float, default=d.friction_bps_round_trip)
+    p.add_argument("--execution-cost-model", choices=("axiom_cost_scenario", "legacy_round_trip"), default=d.execution_cost_model)
+    p.add_argument("--axiom-net-fee-bps-per-side", type=float, default=d.axiom_net_fee_bps_per_side)
+    p.add_argument("--pool-fee-bps-per-side", type=float, default=d.pool_fee_bps_per_side)
+    p.add_argument("--execution-slippage-bps-per-side", type=float, default=d.execution_slippage_bps_per_side)
+    p.add_argument("--priority-fee-sol-per-side", type=float, default=d.priority_fee_sol_per_side)
+    p.add_argument("--bribe-sol-per-side", type=float, default=d.bribe_sol_per_side)
+    p.add_argument("--network-fee-sol-per-side", type=float, default=d.network_fee_sol_per_side)
+    p.add_argument("--sol-usd-reference", type=float, default=d.sol_usd_reference)
     p.add_argument(
         "--no-recurrent-swing", dest="recurrent_swing_enabled", action="store_false",
         default=d.recurrent_swing_enabled,
