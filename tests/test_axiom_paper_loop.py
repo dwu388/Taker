@@ -242,6 +242,9 @@ def test_live_orders_cannot_fill_on_boards_copied_during_prediction(tmp_path, mo
     benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig())
     snapshot = pd.Timestamp.now(tz='UTC') - pd.Timedelta(minutes=2)
     frame = pd.DataFrame({'token_key': ['A'], 'market_cap_usd': [100.0],
+        'p_first_peak_by_5m': [0.85], 'p_first_peak_by_10m': [0.88],
+        'p_first_peak_by_15m': [0.90], 'p_first_peak_by_30m': [0.92],
+        'p_first_peak_by_60m': [0.94],
         'p_first_peak_by_720m': [0.9], 'pred_next_substantial_peak_multiple_q50': [2.0],
         'pred_time_to_next_substantial_peak_minutes_q50': [10.0],
         'p_death_by_720m': [0.0], 'p_hit_minus50_by_720m': [0.0], 'v24_model_hash': ['frozen']})

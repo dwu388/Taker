@@ -17,6 +17,8 @@ def test_munger_defaults_match_the_1000_account_plan():
     benchmark._validate_munger_config(cfg)
 
     assert cfg.initial_cash_usd == 1000.0
+    assert cfg.execution_cost_model == "axiom_cost_scenario"
+    assert cfg.axiom_net_fee_bps_per_side == 85.0
     assert cfg.position_fraction == 0.05
     assert cfg.ordinary_position_fraction * cfg.initial_cash_usd == 50.0
     assert cfg.strong_position_fraction * cfg.initial_cash_usd == 75.0
@@ -25,6 +27,25 @@ def test_munger_defaults_match_the_1000_account_plan():
     assert cfg.max_total_exposure_fraction == 0.30
     assert cfg.max_correlated_exposure_fraction == 0.15
     assert cfg.min_cash_reserve_fraction == 0.70
+
+
+def test_old_wallet_keeps_its_round_trip_cost_model(tmp_path):
+    path = tmp_path / "wallet.sqlite"
+    benchmark.init_benchmark(str(path), benchmark.BenchmarkConfig(execution_cost_model="legacy_round_trip"))
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE benchmark_account_v22 SET config_json=? WHERE status='active'",
+            ('{"friction_bps_round_trip":100.0}',),
+        )
+        raw = conn.execute(
+            "SELECT config_json FROM benchmark_account_v22 WHERE status='active'"
+        ).fetchone()[0]
+    restored = benchmark._config_from_saved_json(raw)
+    assert restored.execution_cost_model == "legacy_round_trip"
+    assert benchmark._entry_exit_rates(restored) == pytest.approx((0.005, 0.005))
+    existing = benchmark.init_benchmark(str(path), benchmark.BenchmarkConfig())
+    assert existing["execution_cost_model"] == "legacy_round_trip"
+    assert existing["fee_change_requires_new_benchmark"]
 
 
 def test_conviction_tiers_use_only_prior_same_kind_scores():
@@ -141,6 +162,14 @@ def test_v24_cycle_reserves_five_percent_without_retraining(tmp_path, monkeypatc
             "token_key": [f"T{i}" for i in range(5)],
             "market_cap_usd": [100.0] * 5,
             "p_first_peak_by_720m": [0.9] * 5,
+            "p_first_peak_by_5m": [0.9] * 5,
+            "p_first_peak_by_10m": [0.9] * 5,
+            "p_first_peak_by_15m": [0.9] * 5,
+            "p_first_peak_by_30m": [0.9] * 5,
+            "p_first_peak_by_60m": [0.9] * 5,
+            "next_occurrence_q50": [10.0] * 5,
+            "next_peak_multiple_q25": [2.0] * 5,
+            "next_peak_multiple_q50": [2.0] * 5,
             "pred_next_substantial_peak_multiple_q50": [2.0] * 5,
             "pred_time_to_next_substantial_peak_minutes_q50": [10.0] * 5,
             "p_death_by_720m": [0.0] * 5,
@@ -237,6 +266,14 @@ def test_exceptional_candidate_can_exceed_five_positions_within_exposure_caps(
             "token_key": tokens,
             "market_cap_usd": [100.0] * len(tokens),
             "pred_test_score": scores,
+            "p_first_peak_by_5m": [0.9] * len(tokens),
+            "p_first_peak_by_10m": [0.9] * len(tokens),
+            "p_first_peak_by_15m": [0.9] * len(tokens),
+            "p_first_peak_by_30m": [0.9] * len(tokens),
+            "p_first_peak_by_60m": [0.9] * len(tokens),
+            "next_occurrence_q50": [10.0] * len(tokens),
+            "next_peak_multiple_q25": [2.0] * len(tokens),
+            "next_peak_multiple_q50": [2.0] * len(tokens),
             "v24_model_hash": ["frozen"] * len(tokens),
         })
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from . import axiom_budget_benchmark_impl as _impl
 from . import recurrent_swing_policy as swing
+from . import paper_execution_costs as costs
 from .absence_utils import verified_absence_minutes
 
 for _name in dir(_impl):
@@ -131,13 +132,13 @@ def _cycle_v24(
             current_row = current_series.get(pos_token)
             if current_row is not None:
                 fill_open_value += _liquidation_value(
-                    pos, float(current_row["market_cap_usd"]), exit_fee_rate
+                    pos, float(current_row["market_cap_usd"]), exit_fee_rate, config
                 )
             else:
                 fill_open_value += _liquidation_value(
                     pos,
                     _execution_proxy_mc(pos, float(pos["last_mc"]), config, unavailable=True),
-                    exit_fee_rate,
+                    exit_fee_rate, config
                 )
         fill_effect_equity = execution_cash + fill_open_value
         for pen in pending:
@@ -182,17 +183,15 @@ def _cycle_v24(
                 committed_bucket=fill_committed_by_bucket.get(bucket, 0.0),
                 config=config,
             )
-            if reserved < 1.0:
+            if reserved < max(1.0, costs.fixed_fee_usd(config) + 0.01):
                 conn.execute(
                     "UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason='exposure_or_cash_cap_at_fill' WHERE pending_id=?",
                     (snapshot.isoformat(), pen["pending_id"]),
                 )
                 swing.release_watch(conn, pen["swing_watch_id"])
                 continue
-            notional = reserved / (1.0 + entry_fee_rate)
-            fee = reserved - notional
             mc = float(row["market_cap_usd"])
-            units = notional / mc
+            notional, fee, units = costs.entry_fill(reserved, mc, config)
             pid = str(uuid.uuid4())
             swing_sequence = int(conn.execute(
                 "SELECT COUNT(*) FROM benchmark_positions_v22 WHERE benchmark_id=? AND token_key=?",
@@ -209,7 +208,7 @@ def _cycle_v24(
                     pid, bid, token, snapshot.isoformat(), mc, notional, fee, reserved, units,
                     pen["entry_score"], pen["entry_score_kind"], pen["entry_state_json"],
                     pen["forecast_model_hash"], pen["policy_model_hash"], pen["policy_version"],
-                    snapshot.isoformat(), mc, notional * (1 - exit_fee_rate), pen["decision_at"],
+                    snapshot.isoformat(), mc, costs.exit_fill(units, mc, config)[0], pen["decision_at"],
                     tier, target_fraction, bucket, pen["swing_watch_id"], swing_sequence,
                 ),
             )
@@ -249,9 +248,9 @@ def _cycle_v24(
             if row is None:
                 terminal, absent = terminal_absence(_to_ts(pos["last_seen_at"]))
                 observed_mc = float(pos["last_mc"])
-                observed_liq = _liquidation_value(pos, observed_mc, exit_fee_rate)
+                observed_liq = _liquidation_value(pos, observed_mc, exit_fee_rate, config)
                 proxy = _execution_proxy_mc(pos, observed_mc, config, unavailable=True)
-                exliq = _liquidation_value(pos, proxy, exit_fee_rate)
+                exliq = _liquidation_value(pos, proxy, exit_fee_rate, config)
                 ret = observed_mc / float(pos["entry_mc"]) - 1
                 conn.execute(
                     """INSERT OR REPLACE INTO benchmark_marks_v22
@@ -300,7 +299,7 @@ def _cycle_v24(
             ret = mc / float(pos["entry_mc"]) - 1
             mfe = max(float(pos["mfe_pct"]), ret)
             mae = min(float(pos["mae_pct"]), ret)
-            liq = _liquidation_value(pos, mc, exit_fee_rate)
+            liq = _liquidation_value(pos, mc, exit_fee_rate, config)
             hold_score, kind = _hold_score(mark_state, policy)
             swing_decision = (
                 swing.peak_boundary_decision(state, ret, config)
@@ -361,7 +360,7 @@ def _cycle_v24(
                 exec_open += float(p["last_mark_value_usd"])
             else:
                 exec_open += _liquidation_value(
-                    p, _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True), exit_fee_rate
+                    p, _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True), exit_fee_rate, config
                 )
         effect_equity = execution_cash + exec_open
         entry_calibration = (
@@ -535,6 +534,15 @@ def _cycle_v24(
         swing_edges = [setup.net_edge for setup in swing_setups if math.isfinite(setup.net_edge)]
         raw_edges = [setup.raw_net_edge for setup in swing_setups if math.isfinite(setup.raw_net_edge)]
         entry_evaluation = {
+            "cost_scenario": {
+                "model": config.execution_cost_model,
+                "variable_bps_per_side": entry_fee_rate * 10000.0,
+                "fixed_usd_per_side": costs.fixed_fee_usd(config),
+                "sol_usd_reference": config.sol_usd_reference,
+                "ordinary_same_price_round_trip_cost_fraction": costs.round_trip_cost_fraction(
+                    config, config.initial_cash_usd * config.ordinary_position_fraction
+                ),
+            },
             "candidates": len(candidates),
             "eligible": len(eligible),
             "selected": len(selected),
@@ -600,7 +608,7 @@ def _cycle_v24(
             else:
                 stale += 1
                 exval = _liquidation_value(
-                    p, _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True), exit_fee_rate
+                    p, _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True), exit_fee_rate, config
                 )
             exec_open_liq += exval
             exunreal += exval - float(p["entry_cash_spent_usd"])

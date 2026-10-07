@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from . import paper_execution_costs as costs
+
 
 WATCH_TABLE = "benchmark_swing_watch_v24"
 SHORT_HORIZON_WEIGHTS = ((5, 0.30), (10, 0.25), (15, 0.20), (30, 0.15), (60, 0.10))
@@ -189,6 +191,16 @@ class EntryCalibration:
         }
 
 
+def _assumed_cash(config: Any) -> float:
+    # Tier is assigned after entry scoring. The ordinary budget is the most
+    # fee-sensitive default position and avoids overstating small-trade edge.
+    return float(config.initial_cash_usd) * float(config.ordinary_position_fraction)
+
+
+def _assumed_round_trip_cost(config: Any) -> float:
+    return costs.round_trip_cost_fraction(config, _assumed_cash(config))
+
+
 def _setup_metrics(state: dict[str, float], config: Any) -> dict[str, float | None] | None:
     probabilities: list[tuple[float, float]] = []
     for horizon, weight in SHORT_HORIZON_WEIGHTS:
@@ -223,8 +235,9 @@ def _setup_metrics(state: dict[str, float], config: Any) -> dict[str, float | No
     timing_discount = 1.0 / (1.0 + timing_risk / 60.0)
     death = _prob(_first(state, "p_death_by_60m", "p_death_by_30m", "p_death_by_720m", "p_death_by_1440m"))
     downside = _prob(_first(state, "p_hit_minus50_by_60m", "p_hit_minus50_by_720m", "p_hit_minus50_by_1440m"))
-    friction = max(0.0, float(config.friction_bps_round_trip)) / 10000.0
-    raw_net_edge = probability * conservative_upside * timing_discount - friction - 0.30 * death - 0.20 * downside
+    friction = _assumed_round_trip_cost(config)
+    gain_factor = costs.gross_gain_multiplier(config, _assumed_cash(config))
+    raw_net_edge = probability * conservative_upside * timing_discount * gain_factor - friction - 0.30 * death - 0.20 * downside
     return {
         "probability": probability,
         "occurrence": occurrence,
@@ -236,6 +249,7 @@ def _setup_metrics(state: dict[str, float], config: Any) -> dict[str, float | No
         "death_probability": death,
         "downside_probability": downside,
         "raw_net_edge": raw_net_edge,
+        "gain_factor": gain_factor,
     }
 
 
@@ -247,7 +261,11 @@ def short_term_setup(
     if metrics is None:
         fallback = ShortTermSetup(
             available=False,
-            qualifies=math.isfinite(base_score) and base_score > float(config.min_entry_score),
+            qualifies=(
+                config.execution_cost_model == "legacy_round_trip"
+                and math.isfinite(base_score)
+                and base_score > float(config.min_entry_score)
+            ),
             score=float(base_score),
             probability=0.0,
             occurrence_q50_minutes=None,
@@ -261,7 +279,11 @@ def short_term_setup(
             raw_net_edge=float(base_score),
             calibration_status="not_applicable",
             calibrated_probability_floor=None,
-            reason="legacy_forecast_without_minute_heads",
+            reason=(
+                "legacy_forecast_without_minute_heads"
+                if config.execution_cost_model == "legacy_round_trip"
+                else "missing_short_horizon_fee_evidence"
+            ),
         )
         return fallback, base_kind
     probability = float(metrics["probability"])
@@ -272,7 +294,7 @@ def short_term_setup(
     conservative_upside = float(metrics["conservative_upside"])
     death = float(metrics["death_probability"])
     downside = float(metrics["downside_probability"])
-    friction = max(0.0, float(config.friction_bps_round_trip)) / 10000.0
+    friction = _assumed_round_trip_cost(config)
     raw_net_edge = float(metrics["raw_net_edge"])
     calibration_status = "legacy_absolute_threshold"
     calibrated_probability_floor = None
@@ -297,7 +319,7 @@ def short_term_setup(
     elif (
         qualifies
         and (calibration is None or not calibration.ready)
-        and conservative_upside < friction + float(config.swing_entry_min_net_upside)
+        and conservative_upside * float(metrics["gain_factor"]) < friction + float(config.swing_entry_min_net_upside)
     ):
         qualifies, reason = False, "short_peak_upside_below_friction_buffer"
     elif qualifies and net_edge <= 0.0:
@@ -431,7 +453,7 @@ def build_entry_calibration(
         terminals.setdefault(str(token), []).append(parsed)
 
     training: list[dict[str, Any]] = []
-    friction = max(0.0, float(config.friction_bps_round_trip)) / 10000.0
+    friction = _assumed_round_trip_cost(config)
     for candidate in candidates:
         at = candidate["snapshot_at"]
         deadline = at + pd.Timedelta(minutes=CALIBRATION_HORIZON_MINUTES)
@@ -452,7 +474,10 @@ def build_entry_calibration(
             ending = min(0.0, ending) + recognition * max(0.0, ending)
         # Same mature 60-minute economic objective used by policy training:
         # reward peak opportunity while charging terminal loss, drawdown and fees.
-        reward = 0.70 * best + 0.30 * ending - 0.50 * abs(min(0.0, worst)) - friction
+        reward = (
+            (0.70 * best + 0.30 * ending) * costs.gross_gain_multiplier(config, _assumed_cash(config))
+            - 0.50 * abs(min(0.0, worst)) - friction
+        )
         record = {name: float(candidate["metrics"][name]) for name in CALIBRATION_FEATURES}
         record.update(token_key=candidate["token_key"], reward=float(np.clip(reward, -1.0, 5.0)))
         training.append(record)
@@ -536,7 +561,7 @@ def peak_boundary_decision(
     setup, _ = short_term_setup(state, config, 0.0, "bootstrap")
     occurrence = setup.occurrence_q50_minutes
     near_probability = _prob(_first(state, "p_first_peak_by_10m", "p_first_peak_by_5m", "p_first_peak_by_15m"))
-    friction = max(0.0, float(config.friction_bps_round_trip)) / 10000.0
+    friction = _assumed_round_trip_cost(config)
     min_realized = max(float(config.swing_exit_min_return), 2.0 * friction)
     at_boundary = bool(
         setup.available
@@ -657,7 +682,7 @@ def reentry_eligibility(
         f"""UPDATE {WATCH_TABLE} SET last_evaluated_at=?,last_retrace_pct=? WHERE watch_id=?""",
         (snapshot.isoformat(), retrace, str(watch["watch_id"])),
     )
-    friction = max(0.0, float(config.friction_bps_round_trip)) / 10000.0
+    friction = _assumed_round_trip_cost(config)
     required_retrace = max(float(config.swing_reentry_min_retrace), 2.0 * friction)
     if age_minutes < float(config.swing_reentry_min_minutes):
         return False, "swing_reentry_minimum_wait", str(watch["watch_id"])

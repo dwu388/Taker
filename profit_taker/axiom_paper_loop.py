@@ -243,7 +243,15 @@ def trading_worker_main(args, stop, ingestion_ready, ready) -> None:
     while not ingestion_ready.wait(0.2):
         if stop.is_set():
             return
-    emit(wallet=benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig()))
+    fee_config = benchmark.BenchmarkConfig()
+    for name in (
+        "axiom_net_fee_bps_per_side", "pool_fee_bps_per_side",
+        "execution_slippage_bps_per_side", "priority_fee_sol_per_side",
+        "bribe_sol_per_side", "network_fee_sol_per_side", "sol_usd_reference",
+    ):
+        if hasattr(args, name):
+            setattr(fee_config, name, getattr(args, name))
+    emit(wallet=benchmark.init_benchmark(args.benchmark_db, fee_config))
     recovered = latest_snapshot(args.db)
     # Recovery history is collection-only. Snapshot identity is temporal rather
     # than textual because SQLite and Pandas may serialize the same instant with
@@ -318,7 +326,24 @@ def parse_args(argv=None):
     parser.add_argument("--policy-model", default="models/axiom_policy_v24/champion.joblib")
     parser.add_argument("--interval-seconds", type=float, default=60.0)
     parser.add_argument("--max-snapshot-age-seconds", type=float, default=180.0)
+    from .axiom_budget_benchmark_impl import BenchmarkConfig
+    defaults = BenchmarkConfig()
+    for name in (
+        "axiom_net_fee_bps_per_side", "pool_fee_bps_per_side",
+        "execution_slippage_bps_per_side", "priority_fee_sol_per_side",
+        "bribe_sol_per_side", "network_fee_sol_per_side", "sol_usd_reference",
+    ):
+        parser.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(defaults, name))
     args = parser.parse_args(argv)
+    from . import paper_execution_costs as costs
+    from .axiom_budget_benchmark_impl import BenchmarkConfig
+    costs.validate(BenchmarkConfig(**{
+        name: getattr(args, name) for name in (
+            "axiom_net_fee_bps_per_side", "pool_fee_bps_per_side",
+            "execution_slippage_bps_per_side", "priority_fee_sol_per_side",
+            "bribe_sol_per_side", "network_fee_sol_per_side", "sol_usd_reference",
+        )
+    }))
     import math
     for value in (args.interval_seconds, args.max_snapshot_age_seconds):
         if not math.isfinite(value) or value <= 0:
