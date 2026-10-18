@@ -45,6 +45,20 @@ def test_paper_loop_uses_same_hardened_collector_as_standard_loop():
     assert loop.collector is production_collector
 
 
+def test_identity_lookups_use_indexes_on_growing_capture_history(tmp_path):
+    args = args_for(tmp_path)
+    lookups = [
+        ("SELECT DISTINCT token_key FROM axiom_observations WHERE token_address=? AND token_key IS NOT NULL", ('mint',), 'idx_axiom_obs_mint_key'),
+        ("SELECT DISTINCT token_key,token_address FROM axiom_observations WHERE short_address_hint=? AND token_key IS NOT NULL", ('hint',), 'idx_axiom_obs_short_identity'),
+        ("SELECT DISTINCT token_key FROM axiom_observations WHERE short_address_hint=? AND token_address=?", ('hint', 'mint'), 'idx_axiom_obs_short_identity'),
+        ("SELECT DISTINCT token_address FROM axiom_observations WHERE token_key=? AND token_address IS NOT NULL", ('token',), 'idx_axiom_obs_key_mint'),
+    ]
+    with closing(sqlite3.connect(args.db)) as conn:
+        for query, params, expected_index in lookups:
+            plan = ' '.join(str(row[-1]) for row in conn.execute('EXPLAIN QUERY PLAN ' + query, params))
+            assert f'USING COVERING INDEX {expected_index}' in plan, plan
+
+
 def test_equivalent_snapshot_formats_trigger_one_trading_attempt(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     joblib.dump({'schema_version': v24.SCHEMA_VERSION}, args.forecast_model)
