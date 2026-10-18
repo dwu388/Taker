@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS axiom_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_axiom_obs_token_time ON axiom_observations(token_key, snapshot_at);
 CREATE INDEX IF NOT EXISTS idx_axiom_obs_time ON axiom_observations(snapshot_at);
+-- The collector checks these identities for every card on every capture.
+-- Without covering indexes, the short hint and mint checks scan all history.
+CREATE INDEX IF NOT EXISTS idx_axiom_obs_short_identity ON axiom_observations(short_address_hint, token_key, token_address);
+CREATE INDEX IF NOT EXISTS idx_axiom_obs_mint_key ON axiom_observations(token_address, token_key);
+CREATE INDEX IF NOT EXISTS idx_axiom_obs_key_mint ON axiom_observations(token_key, token_address);
 
 CREATE TABLE IF NOT EXISTS capture_payloads (
     cycle_id INTEGER PRIMARY KEY,
