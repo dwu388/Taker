@@ -976,6 +976,12 @@ def _read_current(
         )
     if exact_prediction_snapshot and preds["token_key"].duplicated().any():
         raise RuntimeError("Prediction CSV contains duplicate token identities for a live board.")
+    if exact_prediction_snapshot:
+        if "snapshot_at" not in preds.columns or preds.empty:
+            raise RuntimeError("Live prediction has no per-token snapshot timestamps.")
+        row_times = pd.to_datetime(preds["snapshot_at"], errors="coerce", utc=True, format="ISO8601")
+        if row_times.isna().any() or not row_times.eq(snapshot).all():
+            raise RuntimeError("Live prediction contains rows from another snapshot or invalid timestamps.")
     current = current_obs.merge(preds, on="token_key", how="left", suffixes=("", "__pred"), indicator=exact_prediction_snapshot)
     if exact_prediction_snapshot:
         missing = current.loc[
@@ -983,6 +989,11 @@ def _read_current(
         ].tolist()
         if missing:
             raise RuntimeError(f"Live prediction omitted priced board tokens: {missing[:10]}")
+        heads = [col for col in preds.columns if col.startswith(("p_", "pred_"))]
+        priced_rows = current["market_cap_usd"].gt(0)
+        if not heads or (priced_rows.any() and not current.loc[priced_rows, heads]
+                         .apply(pd.to_numeric, errors="coerce").notna().any(axis=1).all()):
+            raise RuntimeError("Live prediction lacks finite forecast heads for priced board tokens.")
         current = current.drop(columns=["_merge"])
     if "market_cap_usd__pred" in current.columns:
         current = current.drop(columns=["market_cap_usd__pred"])

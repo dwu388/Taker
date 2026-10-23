@@ -358,6 +358,27 @@ def test_live_board_requires_forecast_for_every_priced_token(tmp_path):
         benchmark._read_current(args.db, args.predictions, exact_prediction_snapshot=True)
 
 
+@pytest.mark.parametrize('prediction', [
+    {'snapshot_at': '2026-09-22T11:59:00Z', 'p_first_peak_by_720m': .9},
+    {'snapshot_at': '2026-09-22T12:00:00Z', 'p_first_peak_by_720m': float('nan')},
+])
+def test_live_board_rejects_wrong_time_or_empty_forecast(tmp_path, prediction):
+    args = args_for(tmp_path)
+    instant = '2026-09-22T12:00:00Z'
+    with sqlite3.connect(args.db) as conn:
+        conn.execute('INSERT INTO axiom_observations(token_key,snapshot_at,market_cap_usd) VALUES(?,?,?)',
+                     ('A', instant, 100.0))
+    # Include a second valid row so the maximum timestamp can identify the
+    # correct board even when another token has stale or empty predictions.
+    with sqlite3.connect(args.db) as conn:
+        conn.execute('INSERT INTO axiom_observations(token_key,snapshot_at,market_cap_usd) VALUES(?,?,?)',
+                     ('B', instant, 200.0))
+    pd.DataFrame([{'token_key': 'A', **prediction},
+                  {'token_key': 'B', 'snapshot_at': instant, 'p_first_peak_by_720m': .8}]).to_csv(args.predictions, index=False)
+    with pytest.raises(RuntimeError, match='another snapshot|finite forecast heads'):
+        benchmark._read_current(args.db, args.predictions, exact_prediction_snapshot=True)
+
+
 def test_live_decision_rejects_forecasts_from_another_champion(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     joblib.dump({'schema_version': v24.SCHEMA_VERSION}, args.forecast_model)
