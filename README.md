@@ -82,6 +82,16 @@ use future data. `v24_benchmark.bat status` reports active watches, completed
 re-entries, tokens with multiple swings and the highest swing sequence; benchmark
 exports include the swing-watch ledger.
 
+On Windows, run `v24_benchmark.bat status` to inspect the active paper wallet.
+`observable_exit_wins` counts closed positions sold on a later priced board with
+positive execution P&L after modeled costs. Its `profitable`, `closed`, and
+`win_rate` fields answer how often a paper buy could be sold profitably at an
+observed price. `unavailable_exit_estimates` counts terminal disappearance
+closes separately; those prices are conservative accounting proxies, not
+observed sales. The older top-level `win_rate` includes both kinds of close.
+For the broader model and collection report, run `performance_report.bat` and
+read `data\CURRENT_MODEL_PERFORMANCE.txt`.
+
 V24 model outputs default to `models/axiom_v24`, policy artifacts to
 `models/axiom_policy_v24`, and predictions to `data/axiom_predictions_v24.csv`.
 

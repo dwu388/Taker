@@ -63,6 +63,35 @@ def test_current_board_keeps_visible_unpriced_identity(tmp_path):
     assert pd.isna(current.iloc[0]["market_cap_usd"])
 
 
+def test_status_counts_only_priced_profitable_sales_as_observable_wins(tmp_path):
+    wallet = tmp_path / "wallet.sqlite"
+    paper.init_benchmark(str(wallet), paper.BenchmarkConfig(recurrent_swing_enabled=False))
+    at = "2026-10-20T12:00:00+00:00"
+    with sqlite3.connect(wallet) as conn:
+        bid = conn.execute("SELECT benchmark_id FROM benchmark_account_v22").fetchone()[0]
+        for pid, available, kind, pnl in (
+            ("SOLD_WIN", 1, "policy_exit", 12.0),
+            ("SOLD_LOSS", 1, "policy_exit", -4.0),
+            ("PROXY", 0, "disappearance_terminal", 9.0),
+        ):
+            conn.execute(
+                """INSERT INTO benchmark_positions_v22
+                (position_id,benchmark_id,token_key,opened_at,entry_mc,entry_notional_usd,
+                 entry_fee_usd,entry_cash_spent_usd,exposure_units,entry_state_json,status,
+                 last_seen_at,last_mc,last_mark_value_usd,mfe_pct,mae_pct,closed_at,
+                 realized_pnl_usd,realized_return_pct,execution_realized_pnl_usd,
+                 execution_realized_return_pct,price_available_at_exit,exit_kind)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,'closed',?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pid, bid, pid, at, 100, 50, 0, 50, .5, '{}', at, 100, 50,
+                 0, 0, at, pnl, pnl / 50, pnl, pnl / 50, available, kind),
+            )
+    report = paper.status(str(wallet))
+    assert report["observable_exit_wins"]["profitable"] == 1
+    assert report["observable_exit_wins"]["closed"] == 2
+    assert report["observable_exit_wins"]["win_rate"] == .5
+    assert report["unavailable_exit_estimates"]["closed"] == 1
+
+
 def test_unpriced_board_and_collector_backed_terminal_close(tmp_path, monkeypatch):
     raw, wallet = tmp_path / "raw.sqlite", tmp_path / "wallet.sqlite"
     model, predictions = tmp_path / "model.joblib", tmp_path / "pred.csv"
@@ -106,6 +135,10 @@ def test_unpriced_board_and_collector_backed_terminal_close(tmp_path, monkeypatc
     assert result["open_positions"] == 0
     assert result["position_lifecycle"][0]["verified_missing_minutes"] >= 50
     assert paper.status(str(wallet))["open_positions"] == 0
+    win_report = paper.status(str(wallet))
+    assert win_report["observable_exit_wins"]["closed"] == 0
+    assert win_report["observable_exit_wins"]["win_rate"] is None
+    assert win_report["unavailable_exit_estimates"]["closed"] == 1
     assert paper._cycle_v24(str(raw), str(wallet), str(predictions), str(model),
                             str(tmp_path / "absent-policy.joblib"), paper.BenchmarkConfig())["processed"] is False
     with sqlite3.connect(wallet) as conn:

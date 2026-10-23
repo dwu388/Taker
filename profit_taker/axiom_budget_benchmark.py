@@ -55,7 +55,9 @@ def _cycle_v24(
         )
     policy = loaded_policy if policy_compatible else None
     forecast_hash = _hash_file(forecast_model) or _hash_file(predictions_path)
-    if live_decisions and "v24_model_hash" in current.columns:
+    if live_decisions:
+        if "v24_model_hash" not in current.columns:
+            raise RuntimeError("Live forecasts do not include a V24 champion model hash.")
         hashes = set(current.loc[current["market_cap_usd"].gt(0), "v24_model_hash"].dropna().astype(str))
         if hashes != {str(forecast_hash)}:
             raise RuntimeError("Live forecasts do not match the current V24 champion model.")
@@ -769,6 +771,32 @@ def status(db: str) -> dict[str, Any]:
     result["position_lifecycle"] = lifecycle
     result["stale_open_positions"] = result["execution_conservative"]["stale_open_positions"]
     result["lifecycle_warnings"] = [d for d in lifecycle if d["lifecycle_state"] not in ("OBSERVED_PRICED", "OBSERVED_UNCHANGED")]
+    # Separate observable, priced exits from synthetic disappearance settlement.
+    # A proxy close is useful for conservative equity, but is not evidence that
+    # a buy could actually have been sold for a profit at that price.
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            """SELECT price_available_at_exit,exit_kind,
+                      COALESCE(execution_realized_pnl_usd,realized_pnl_usd)
+               FROM benchmark_positions_v22
+               WHERE benchmark_id=? AND status='closed'""",
+            (result["benchmark_id"],),
+        ).fetchall()
+    priced = [float(pnl) for available, kind, pnl in rows
+              if available == 1 and kind != "disappearance_terminal" and pnl is not None]
+    proxy_rows = [(available, kind, pnl) for available, kind, pnl in rows
+                  if available != 1 or kind == "disappearance_terminal"]
+    result["observable_exit_wins"] = {
+        "profitable": sum(pnl > 0 for pnl in priced),
+        "closed": len(priced),
+        "win_rate": sum(pnl > 0 for pnl in priced) / len(priced) if priced else None,
+        "net_pnl_usd": sum(priced),
+        "definition": "next-observable priced exits with positive execution P&L after modeled costs",
+    }
+    result["unavailable_exit_estimates"] = {
+        "closed": len(proxy_rows),
+        "execution_pnl_usd": sum(float(pnl) for _, _, pnl in proxy_rows if pnl is not None),
+    }
     return result
 
 
