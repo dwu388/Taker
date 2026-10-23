@@ -183,6 +183,14 @@ def predict_and_trade(args, benchmark, stop) -> str | None:
         args.db, args.forecast_model, args.predictions, require_latest=False,
     )
     predicted_snapshot = str(predictions.get("snapshot_at") or requested_snapshot)
+    if canonical_snapshot(predicted_snapshot) != canonical_snapshot(requested_snapshot):
+        # Inference ignores unpriced cards. If an entire newer board is
+        # unpriced, it may return the preceding priced board. The wallet must
+        # neither replay that board nor hot-loop on this capture.
+        emit(wallet_skipped="prediction_not_latest_capture",
+             requested_snapshot_at=requested_snapshot,
+             predicted_snapshot_at=predicted_snapshot)
+        return requested_snapshot
     timestamp = datetime.fromisoformat(predicted_snapshot.replace("Z", "+00:00"))
     if stop.is_set() or age() > args.max_snapshot_age_seconds:
         emit(wallet_skipped="stopping_or_prediction_too_old", snapshot_at=predicted_snapshot)
@@ -269,7 +277,7 @@ def trading_worker_main(args, stop, ingestion_ready, ready) -> None:
         last_attempted = newest_identity
         try:
             processed = predict_and_trade(args, benchmark, stop)
-            if processed is not None:
+            if processed is not None and canonical_snapshot(processed) == newest_identity:
                 last_attempted = canonical_snapshot(processed)
         except Exception as exc:
             emit(processing_error=type(exc).__name__, message=str(exc), snapshot_at=newest)

@@ -109,7 +109,9 @@ def test_paper_and_benchmark_use_contiguous_run_start_for_absence():
     benchmark_source = inspect.getsource(benchmark._cycle_v24)
 
     assert "verified_absence_minutes(run_start, run_end)" in paper_source
-    assert "verified_absence_minutes(run_start, run_end)" in benchmark_source
+    # The live benchmark verifies raw collector cycles in the shared helper;
+    # the model lifetime path continues to use its derived heartbeat table.
+    assert "collector_absence(" in benchmark_source
     assert "run_end - last_seen" not in paper_source
     assert "run_end - last_seen" not in benchmark_source
 
