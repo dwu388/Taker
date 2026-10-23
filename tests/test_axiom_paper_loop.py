@@ -261,7 +261,8 @@ def test_live_orders_cannot_fill_on_boards_copied_during_prediction(tmp_path, mo
         'p_first_peak_by_60m': [0.94],
         'p_first_peak_by_720m': [0.9], 'pred_next_substantial_peak_multiple_q50': [2.0],
         'pred_time_to_next_substantial_peak_minutes_q50': [10.0],
-        'p_death_by_720m': [0.0], 'p_hit_minus50_by_720m': [0.0], 'v24_model_hash': ['frozen']})
+        'p_death_by_720m': [0.0], 'p_hit_minus50_by_720m': [0.0],
+        'v24_model_hash': [benchmark._hash_file(args.forecast_model)]})
     monkeypatch.setattr(benchmark, '_read_current', lambda *_, **_kw: (snapshot, frame))
     def cycle():
         return benchmark._cycle_v24(args.db, args.benchmark_db, args.predictions,
@@ -344,6 +345,33 @@ def test_live_board_read_is_pinned_to_prediction_snapshot(tmp_path, monkeypatch)
     assert set(current.token_key) == {'abc...pump'}
 
 
+def test_live_board_requires_forecast_for_every_priced_token(tmp_path):
+    args = args_for(tmp_path)
+    instant = '2026-09-22T12:00:00.000+00:00'
+    with sqlite3.connect(args.db) as conn:
+        conn.executemany(
+            'INSERT INTO axiom_observations(token_key,snapshot_at,market_cap_usd) VALUES(?,?,?)',
+            [('A', instant, 100.0), ('B', instant, 200.0)],
+        )
+    pd.DataFrame([{'token_key': 'A', 'snapshot_at': instant, 'p_first_peak_by_720m': 0.9}]).to_csv(args.predictions, index=False)
+    with pytest.raises(RuntimeError, match='omitted priced board tokens'):
+        benchmark._read_current(args.db, args.predictions, exact_prediction_snapshot=True)
+
+
+def test_live_decision_rejects_forecasts_from_another_champion(tmp_path, monkeypatch):
+    args = args_for(tmp_path)
+    joblib.dump({'schema_version': v24.SCHEMA_VERSION}, args.forecast_model)
+    benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig())
+    instant = pd.Timestamp('2026-09-22T12:00:00Z')
+    board = pd.DataFrame([{'token_key': 'A', 'market_cap_usd': 100.0,
+                           'v24_model_hash': 'different-model', 'p_first_peak_by_720m': .8}])
+    monkeypatch.setattr(benchmark, '_read_current', lambda *_a, **_kw: (instant, board))
+    with pytest.raises(RuntimeError, match='do not match'):
+        benchmark._cycle_v24(args.db, args.benchmark_db, args.predictions,
+                             args.forecast_model, args.policy_model,
+                             benchmark.BenchmarkConfig(), live_decisions=True)
+
+
 def test_paper_prediction_allows_ingestion_to_advance(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     mock_parser(monkeypatch)
@@ -362,3 +390,22 @@ def test_paper_prediction_allows_ingestion_to_advance(tmp_path, monkeypatch):
     )
     assert loop.predict_and_trade(args, fake, stop) == loop.latest_snapshot(args.db)
     assert captured == {'require_latest': False}
+
+
+def test_unpriced_newest_board_does_not_replay_older_prediction(tmp_path, monkeypatch):
+    args = args_for(tmp_path)
+    mock_parser(monkeypatch)
+    newest = loop.now_iso()
+    loop.collector.process_capture(args, 'MC', newest)
+    older = (pd.Timestamp(newest) - pd.Timedelta(minutes=1)).isoformat()
+    decisions = []
+    messages = []
+    fake = SimpleNamespace(
+        refresh_predictions=lambda *_a, **_kw: {'snapshot_at': older},
+        _cycle_v24=lambda *_a, **_kw: decisions.append('wallet'),
+        BenchmarkConfig=lambda: None,
+    )
+    monkeypatch.setattr(loop, 'emit', lambda **values: messages.append(values))
+    assert loop.predict_and_trade(args, fake, threading.Event()) == newest
+    assert decisions == []
+    assert messages[-1]['wallet_skipped'] == 'prediction_not_latest_capture'

@@ -5,7 +5,7 @@ from __future__ import annotations
 from . import axiom_budget_benchmark_impl as _impl
 from . import recurrent_swing_policy as swing
 from . import paper_execution_costs as costs
-from .absence_utils import verified_absence_minutes
+from .absence_utils import collector_absence
 
 for _name in dir(_impl):
     if not _name.startswith("__"):
@@ -55,30 +55,31 @@ def _cycle_v24(
         )
     policy = loaded_policy if policy_compatible else None
     forecast_hash = _hash_file(forecast_model) or _hash_file(predictions_path)
+    if live_decisions and "v24_model_hash" in current.columns:
+        hashes = set(current.loc[current["market_cap_usd"].gt(0), "v24_model_hash"].dropna().astype(str))
+        if hashes != {str(forecast_hash)}:
+            raise RuntimeError("Live forecasts do not match the current V24 champion model.")
     policy_hash = available_policy_hash if policy_compatible else None
     policy_version = _policy_version(policy, policy_model) if policy_compatible else "bootstrap_pending_v24_policy_promotion"
     entry_fee_rate, exit_fee_rate = _entry_exit_rates(config)
 
-    def terminal_absence(last_seen: pd.Timestamp) -> tuple[bool, float]:
+    def priced(row: pd.Series | None) -> bool:
+        mc = _finite_float(row.get("market_cap_usd")) if row is not None else None
+        return mc is not None and mc > 0
+
+    def terminal_absence(token: str, last_seen: pd.Timestamp) -> dict[str, Any]:
         elapsed = max(0.0, (snapshot - last_seen).total_seconds() / 60.0)
-        if is_v24_forecast and v24 is not None:
-            try:
-                with sqlite3.connect(source_db, timeout=10.0) as src:
-                    src.execute("PRAGMA busy_timeout=10000")
-                    src.execute("PRAGMA query_only=ON")
-                    run_start, run_end, n = v24._contiguous_capture_absence(
-                        src, last_seen, v24.V24Config(), upto=snapshot
-                    )
-                    if run_start is None or run_end is None:
-                        return False, elapsed
-                    valid = verified_absence_minutes(run_start, run_end)
-                    return bool(
-                        valid >= config.missing_close_minutes
-                        and n >= v24.V24Config().heartbeat_min_valid_captures_for_death
-                    ), valid
-            except Exception:
-                return False, elapsed
-        return elapsed >= config.missing_close_minutes, elapsed
+        cfg = v24.V24Config()
+        with sqlite3.connect(source_db, timeout=10.0) as src:
+            src.execute("PRAGMA busy_timeout=10000")
+            src.execute("PRAGMA query_only=ON")
+            evidence = collector_absence(
+                src, token, last_seen, snapshot,
+                max_gap_minutes=cfg.heartbeat_max_gap_minutes,
+                minimum_captures=cfg.heartbeat_min_valid_captures_for_death,
+                close_minutes=config.missing_close_minutes,
+            )
+        return {"wall_missing_minutes": elapsed, **evidence}
 
     with sqlite3.connect(benchmark_db, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
@@ -130,7 +131,7 @@ def _cycle_v24(
                 fill_committed_by_bucket.get(bucket, 0.0) + float(pos["entry_cash_spent_usd"])
             )
             current_row = current_series.get(pos_token)
-            if current_row is not None:
+            if priced(current_row):
                 fill_open_value += _liquidation_value(
                     pos, float(current_row["market_cap_usd"]), exit_fee_rate, config
                 )
@@ -146,14 +147,14 @@ def _cycle_v24(
                 continue
             token = str(pen["token_key"])
             row = current_series.get(token)
-            if row is None:
-                terminal, mins = terminal_absence(_to_ts(pen["decision_at"]))
-                if terminal:
+            if row is None or not priced(row):
+                evidence = terminal_absence(token, _to_ts(pen["decision_at"])) if row is None else {"terminal": False}
+                if evidence["terminal"]:
                     conn.execute(
                         "UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason=? WHERE pending_id=?",
                         (snapshot.isoformat(), "unavailable_before_next_observable_fill", pen["pending_id"]),
                     )
-                    cancelled.append({"token_key": token, "missing_minutes": mins})
+                    cancelled.append({"token_key": token, "missing_minutes": evidence["verified_missing_minutes"]})
                     swing.release_watch(conn, pen["swing_watch_id"])
                 continue
             other_reserved = float(conn.execute(
@@ -241,12 +242,48 @@ def _cycle_v24(
             (bid,),
         ).fetchall()
         open_tokens = {str(p["token_key"]) for p in open_positions}
+        lifecycle = []
         for pos in open_positions:
             token = str(pos["token_key"])
             row = current_series.get(token)
             pending_exit = _to_ts(pos["pending_exit_at"]) if pos["pending_exit_at"] else None
-            if row is None:
-                terminal, absent = terminal_absence(_to_ts(pos["last_seen_at"]))
+            if row is None or not priced(row):
+                present = row is not None
+                evidence = ({"terminal": False, "wall_missing_minutes": 0.0,
+                             "verified_missing_minutes": 0.0, "verified_absent_captures": 0,
+                             "absence_run_start": None, "absence_run_end": None}
+                            if present else terminal_absence(token, _to_ts(pos["last_seen_at"])))
+                terminal = evidence["terminal"]
+                age = _finite_float(row.get("age_minutes")) if present else None
+                # The last raw card provides age even if the prediction no longer
+                # includes this token. Age-out is a diagnostic, not proof of absence.
+                if not present:
+                    with sqlite3.connect(source_db, timeout=10.0) as src:
+                        last_age = src.execute(
+                            "SELECT age_minutes FROM axiom_observations WHERE token_key=? ORDER BY observation_id DESC LIMIT 1",
+                            (token,),
+                        ).fetchone()
+                    age = _finite_float(last_age[0]) if last_age else None
+                near_age_out = age is not None and v24 is not None and age >= v24.V24Config().age_out_minutes - config.missing_close_minutes
+                state = ("OBSERVED_UNPRICED" if present else
+                         "TERMINAL_UNAVAILABLE" if terminal else
+                         "AGE_OUT_AMBIGUOUS" if near_age_out else "MISSING_UNVERIFIED")
+                priced_mark = conn.execute(
+                    """SELECT snapshot_at FROM benchmark_marks_v22
+                       WHERE position_id=? AND mark_kind='observed'
+                       ORDER BY snapshot_at DESC LIMIT 1""", (pos["position_id"],),
+                ).fetchone()
+                last_priced = _to_ts(priced_mark[0] if priced_mark else pos["opened_at"])
+                diagnostic = {"token_key": token, "position_id": pos["position_id"],
+                              "last_seen_at": snapshot.isoformat() if present else pos["last_seen_at"],
+                              "last_priced_at": last_priced.isoformat(),
+                              "board_present": present, "mark_kind": "unpriced_visible" if present else "stale_last_observed",
+                              "lifecycle_state": state, "terminal_reason": "natural_axiom_age_out" if terminal and age is not None and age >= v24.V24Config().age_out_minutes else "dead_after_valid_capture_absence" if terminal else None,
+                              "exit_kind": "disappearance_terminal" if terminal else None,
+                              "price_available_at_exit": False, "unchanged_mc_minutes": 0.0, **evidence}
+                lifecycle.append(diagnostic)
+                if present:
+                    conn.execute("UPDATE benchmark_positions_v22 SET last_seen_at=? WHERE position_id=?", (snapshot.isoformat(), pos["position_id"]))
                 observed_mc = float(pos["last_mc"])
                 observed_liq = _liquidation_value(pos, observed_mc, exit_fee_rate, config)
                 proxy = _execution_proxy_mc(pos, observed_mc, config, unavailable=True)
@@ -259,15 +296,15 @@ def _cycle_v24(
                     (
                         str(uuid.uuid4()), bid, pos["position_id"], token, snapshot.isoformat(), observed_mc,
                         observed_liq, ret, float(pos["mfe_pct"]), float(pos["mae_pct"]),
-                        "DISAPPEARANCE_CLOSE" if terminal else "MISSING_HOLD",
-                        _json({"missing_minutes": absent}), forecast_hash, policy_hash,
-                        "disappearance_terminal" if terminal else "stale_last_observed", exliq,
+                        "DISAPPEARANCE_CLOSE" if terminal else "UNPRICED_HOLD" if present else "MISSING_HOLD",
+                        _json(diagnostic), forecast_hash, policy_hash,
+                        "disappearance_terminal" if terminal else diagnostic["mark_kind"], exliq,
                     ),
                 )
                 if terminal:
                     closed = _close_position(
                         conn, pos, snapshot, observed_mc,
-                        str(pos["pending_exit_reason"] or "dead_after_valid_capture_absence"),
+                        diagnostic["terminal_reason"],
                         exit_fee_rate, config, price_available=False,
                     )
                     cash += closed["observed_proceeds_usd"]
@@ -276,6 +313,20 @@ def _cycle_v24(
                     open_tokens.discard(token)
                 continue
             mc = float(row["market_cap_usd"])
+            last_changed = conn.execute(
+                """SELECT snapshot_at FROM benchmark_marks_v22 WHERE position_id=?
+                   AND mark_kind='observed' AND market_cap_usd<>?
+                   ORDER BY snapshot_at DESC LIMIT 1""", (pos["position_id"], mc),
+            ).fetchone()
+            unchanged_since = _to_ts(last_changed[0] if last_changed else pos["opened_at"])
+            lifecycle.append({"token_key": token, "position_id": pos["position_id"],
+                              "last_seen_at": snapshot.isoformat(), "last_priced_at": snapshot.isoformat(),
+                              "board_present": True, "mark_kind": "observed",
+                              "lifecycle_state": "OBSERVED_UNCHANGED" if mc == float(pos["last_mc"]) else "OBSERVED_PRICED",
+                              "terminal_reason": None, "exit_kind": None, "price_available_at_exit": True,
+                              "wall_missing_minutes": 0.0, "verified_missing_minutes": 0.0,
+                              "verified_absent_captures": 0,
+                              "unchanged_mc_minutes": max(0.0, (snapshot - unchanged_since).total_seconds()/60.0) if mc == float(pos["last_mc"]) else 0.0})
             if pending_exit is not None and snapshot > pending_exit:
                 fresh = conn.execute(
                     "SELECT * FROM benchmark_positions_v22 WHERE position_id=?", (pos["position_id"],)
@@ -328,6 +379,7 @@ def _cycle_v24(
                     and swing_decision["reason"] == "hold_strong_near_second_peak"
                 ) and hold_score <= 0:
                     action, reason = "EXIT_DECISION", f"{kind}_hold_value_nonpositive"
+            mark_state["lifecycle"] = lifecycle[-1]
             conn.execute(
                 "UPDATE benchmark_positions_v22 SET last_seen_at=?,last_mc=?,last_mark_value_usd=?,mfe_pct=?,mae_pct=? WHERE position_id=?",
                 (snapshot.isoformat(), mc, liq, mfe, mae, pos["position_id"]),
@@ -356,7 +408,7 @@ def _cycle_v24(
         ).fetchone()[0] or 0.0)
         exec_open = 0.0
         for p in open_positions:
-            if str(p["token_key"]) in current_series:
+            if priced(current_series.get(str(p["token_key"]))):
                 exec_open += float(p["last_mark_value_usd"])
             else:
                 exec_open += _liquidation_value(
@@ -377,6 +429,8 @@ def _cycle_v24(
             ).fetchall()
         }
         for _, row in current.iterrows():
+            if not priced(row):
+                continue
             token = str(row["token_key"])
             if token in open_tokens or token in pending_tokens:
                 continue
@@ -603,7 +657,7 @@ def _cycle_v24(
             obsval = float(p["last_mark_value_usd"])
             open_liq += obsval
             unreal += obsval - float(p["entry_cash_spent_usd"])
-            if str(p["token_key"]) in current_series:
+            if priced(current_series.get(str(p["token_key"]))):
                 exval = obsval
             else:
                 stale += 1
@@ -663,6 +717,9 @@ def _cycle_v24(
         "effectiveness_total_return_pct": execution_equity / config.initial_cash_usd - 1,
         "effectiveness_accounting": "execution_conservative_next_observable",
         "open_positions": len(open_positions),
+        "stale_open_positions": stale,
+        "position_lifecycle": lifecycle,
+        "lifecycle_warnings": [d for d in lifecycle if d["lifecycle_state"] not in ("OBSERVED_PRICED", "OBSERVED_UNCHANGED")],
         "entries": entries,
         "pending_entries": pending_created,
         "cancelled_pending": cancelled,
@@ -683,6 +740,39 @@ def _cycle_v24(
 
 
 _impl._cycle_v24 = _cycle_v24
+
+
+_base_status = _impl.status
+
+
+def status(db: str) -> dict[str, Any]:
+    result = _base_status(db)
+    if not result.get("initialized", True):
+        return result
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT p.position_id,p.token_key,m.state_json
+               FROM benchmark_positions_v22 p
+               LEFT JOIN benchmark_marks_v22 m ON m.mark_id=(
+                   SELECT mark_id FROM benchmark_marks_v22
+                   WHERE position_id=p.position_id ORDER BY snapshot_at DESC LIMIT 1)
+               WHERE p.benchmark_id=? AND p.status='open'""",
+            (result["benchmark_id"],),
+        ).fetchall()
+    lifecycle = []
+    for row in rows:
+        state = json.loads(row["state_json"] or "{}")
+        item = state.get("lifecycle") or (state if "lifecycle_state" in state else None)
+        if item:
+            lifecycle.append(item)
+    result["position_lifecycle"] = lifecycle
+    result["stale_open_positions"] = result["execution_conservative"]["stale_open_positions"]
+    result["lifecycle_warnings"] = [d for d in lifecycle if d["lifecycle_state"] not in ("OBSERVED_PRICED", "OBSERVED_UNCHANGED")]
+    return result
+
+
+_impl.status = status  # CLI status/export uses the same diagnostics.
 
 
 def main() -> None:

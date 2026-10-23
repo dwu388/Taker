@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS capture_cycles (
     completed INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_capture_cycles_instant ON capture_cycles(datetime(captured_at));
 
 CREATE TABLE IF NOT EXISTS axiom_observations (
     observation_id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -949,7 +949,7 @@ def _read_current(
         latest_snapshot_raw = str(latest[0])
         current_obs = pd.read_sql_query(
             """
-            SELECT observation_id,token_key,market_cap_usd,name
+            SELECT observation_id,token_key,market_cap_usd,name,age_minutes
             FROM axiom_observations
             WHERE snapshot_at=?
             ORDER BY observation_id
@@ -969,15 +969,25 @@ def _read_current(
         .drop_duplicates("token_key", keep="last")
         .sort_values("token_key")
     )
-    current_obs = current_obs[["token_key", "market_cap_usd", "name"]]
+    current_obs = current_obs[["token_key", "market_cap_usd", "name", "age_minutes"]]
     if pred_snapshot is not None and abs((pred_snapshot - snapshot).total_seconds()) > 180:
         raise RuntimeError(
             f"Prediction CSV is stale: predictions={pred_snapshot.isoformat()}, latest_capture={snapshot.isoformat()}"
         )
-    current = current_obs.merge(preds, on="token_key", how="left", suffixes=("", "__pred"))
+    if exact_prediction_snapshot and preds["token_key"].duplicated().any():
+        raise RuntimeError("Prediction CSV contains duplicate token identities for a live board.")
+    current = current_obs.merge(preds, on="token_key", how="left", suffixes=("", "__pred"), indicator=exact_prediction_snapshot)
+    if exact_prediction_snapshot:
+        missing = current.loc[
+            (current["market_cap_usd"] > 0) & current["_merge"].eq("left_only"), "token_key"
+        ].tolist()
+        if missing:
+            raise RuntimeError(f"Live prediction omitted priced board tokens: {missing[:10]}")
+        current = current.drop(columns=["_merge"])
     if "market_cap_usd__pred" in current.columns:
         current = current.drop(columns=["market_cap_usd__pred"])
-    current = current[current["market_cap_usd"].notna()].copy()
+    # Board membership is independent of whether the OCR yielded a price.
+    # Entry/fill paths must still require a usable market cap.
     return snapshot, current
 
 
