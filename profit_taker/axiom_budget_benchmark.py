@@ -5,6 +5,7 @@ from __future__ import annotations
 from . import axiom_budget_benchmark_impl as _impl
 from . import recurrent_swing_policy as swing
 from . import paper_execution_costs as costs
+from . import selective_paper_policy as selective
 from .absence_utils import collector_absence
 
 for _name in dir(_impl):
@@ -56,10 +57,13 @@ def _cycle_v24(
     policy = loaded_policy if policy_compatible else None
     forecast_hash = _hash_file(forecast_model) or _hash_file(predictions_path)
     if live_decisions:
+        if not forecast_bundle or forecast_bundle.get("schema_version") != v24.SCHEMA_VERSION:
+            raise RuntimeError("Live paper execution requires a valid V24 forecast champion.")
         if "v24_model_hash" not in current.columns:
             raise RuntimeError("Live forecasts do not include a V24 champion model hash.")
-        hashes = set(current.loc[current["market_cap_usd"].gt(0), "v24_model_hash"].dropna().astype(str))
-        if hashes != {str(forecast_hash)}:
+        row_hashes = current.loc[current["market_cap_usd"].gt(0), "v24_model_hash"]
+        hashes = set(row_hashes.astype(str))
+        if row_hashes.isna().any() or hashes != {str(forecast_hash)}:
             raise RuntimeError("Live forecasts do not match the current V24 champion model.")
     policy_hash = available_policy_hash if policy_compatible else None
     policy_version = _policy_version(policy, policy_model) if policy_compatible else "bootstrap_pending_v24_policy_promotion"
@@ -105,6 +109,12 @@ def _cycle_v24(
                 "snapshot_at": snapshot.isoformat(),
             }
         current_series = {str(r["token_key"]): r for _, r in current.iterrows()}
+        precision = (selective.build_calibration(conn, source_db, bid, snapshot, forecast_hash, config)
+                     if config.selective_entry_enabled else None)
+        if config.selective_entry_enabled:
+            # This execution policy uses the forecast and shadow-trade evidence;
+            # a separately trained policy head does not control its decisions.
+            policy_hash, policy_version = None, selective.VERSION
         cash = float(acct["cash_usd"])
         execution_cash = _execution_cash_from_ledger(conn, bid, float(acct["initial_cash_usd"]))
         entries = []
@@ -148,6 +158,22 @@ def _cycle_v24(
             if snapshot <= _to_ts(pen["decision_at"]):
                 continue
             token = str(pen["token_key"])
+            pending_state = json.loads(pen["entry_state_json"] or "{}")
+            selective_order = pending_state.get("selective_policy_version") == selective.VERSION
+            cancel_reason = None
+            if config.selective_entry_enabled and not selective_order:
+                cancel_reason = "selective_policy_upgrade_requires_new_decision"
+            elif selective_order:
+                if (snapshot - _to_ts(pen["decision_at"])).total_seconds() > config.selective_max_entry_delay_minutes * 60:
+                    cancel_reason = "selective_entry_expired"
+                elif pen["forecast_model_hash"] != forecast_hash:
+                    cancel_reason = "selective_entry_champion_changed"
+            if cancel_reason:
+                conn.execute("UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason=? WHERE pending_id=?",
+                             (snapshot.isoformat(), cancel_reason, pen["pending_id"]))
+                swing.release_watch(conn, pen["swing_watch_id"])
+                cancelled.append({"token_key": token, "reason": cancel_reason})
+                continue
             row = current_series.get(token)
             if row is None or not priced(row):
                 evidence = terminal_absence(token, _to_ts(pen["decision_at"])) if row is None else {"terminal": False}
@@ -194,6 +220,19 @@ def _cycle_v24(
                 swing.release_watch(conn, pen["swing_watch_id"])
                 continue
             mc = float(row["market_cap_usd"])
+            if selective_order:
+                fill_signal = selective.signal(pending_state, config, reserved, float(pen["decision_mc"]), mc)
+                # Equity/cash caps can shrink the final allocation. Recheck both
+                # fixed costs and precision evidence at that exact dollar size.
+                fill_setup = precision.assess(pending_state, reserved)[0] if precision is not None else None
+                if not fill_signal["eligible"] or fill_setup is None or not fill_setup.qualifies:
+                    cancel_reason = fill_signal["reason"] if not fill_signal["eligible"] else "selective_fill_evidence_changed"
+                    conn.execute("UPDATE benchmark_pending_entries_v24 SET status='cancelled',cancelled_at=?,cancel_reason=? WHERE pending_id=?",
+                                 (snapshot.isoformat(), cancel_reason, pen["pending_id"]))
+                    swing.release_watch(conn, pen["swing_watch_id"])
+                    cancelled.append({"token_key": token, "reason": cancel_reason})
+                    continue
+                pending_state["selective_fill_evidence"] = fill_setup.precision_evidence
             notional, fee, units = costs.entry_fill(reserved, mc, config)
             pid = str(uuid.uuid4())
             swing_sequence = int(conn.execute(
@@ -209,7 +248,7 @@ def _cycle_v24(
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,0,0,?,'next_observable',?,?,?,?,?)""",
                 (
                     pid, bid, token, snapshot.isoformat(), mc, notional, fee, reserved, units,
-                    pen["entry_score"], pen["entry_score_kind"], pen["entry_state_json"],
+                    pen["entry_score"], pen["entry_score_kind"], _json(pending_state),
                     pen["forecast_model_hash"], pen["policy_model_hash"], pen["policy_version"],
                     snapshot.isoformat(), mc, costs.exit_fill(units, mc, config)[0], pen["decision_at"],
                     tier, target_fraction, bucket, pen["swing_watch_id"], swing_sequence,
@@ -353,10 +392,14 @@ def _cycle_v24(
             mfe = max(float(pos["mfe_pct"]), ret)
             mae = min(float(pos["mae_pct"]), ret)
             liq = _liquidation_value(pos, mc, exit_fee_rate, config)
-            hold_score, kind = _hold_score(mark_state, policy)
+            entry_state = json.loads(pos["entry_state_json"] or "{}")
+            selective_plan = entry_state.get("selective_exit_plan")
+            if selective_plan is None and config.selective_entry_enabled:
+                selective_plan = selective.exit_plan(config)
+            hold_score, kind = (0.0, selective.VERSION) if selective_plan is not None else _hold_score(mark_state, policy)
             swing_decision = (
                 swing.peak_boundary_decision(state, ret, config)
-                if config.recurrent_swing_enabled else None
+                if config.recurrent_swing_enabled and selective_plan is None else None
             )
             if swing_decision is not None:
                 mark_state["recurrent_swing_at_peak_boundary"] = float(
@@ -371,7 +414,15 @@ def _cycle_v24(
             held = max(0.0, (snapshot - _to_ts(pos["opened_at"])).total_seconds() / 60.0)
             action = "HOLD"
             reason = None
-            if held >= config.max_hold_minutes:
+            if selective_plan is not None:
+                net_return = liq / float(pos["entry_cash_spent_usd"]) - 1.0
+                reason = selective.exit_reason(net_return, held, selective_plan)
+                mark_state["selective_net_return"] = net_return
+                mark_state["selective_exit_plan"] = selective_plan
+                mark_state["selective_policy_version"] = selective.VERSION
+                if reason is not None:
+                    action = "EXIT_DECISION"
+            elif held >= config.max_hold_minutes:
                 action, reason = "EXIT_DECISION", "max_hold_72h"
             elif held >= config.min_hold_minutes:
                 if swing_decision is not None and swing_decision["sell"]:
@@ -417,7 +468,7 @@ def _cycle_v24(
                     p, _execution_proxy_mc(p, float(p["last_mc"]), config, unavailable=True), exit_fee_rate, config
                 )
         effect_equity = execution_cash + exec_open
-        entry_calibration = (
+        entry_calibration = precision if precision is not None else (
             swing.build_entry_calibration(
                 conn, source_db, bid, snapshot, forecast_hash, config
             )
@@ -439,8 +490,14 @@ def _cycle_v24(
             state = _safe_state(row)
             if not state:
                 continue
-            score, kind = _entry_score(state, policy)
-            if config.recurrent_swing_enabled:
+            if precision is not None:
+                setup, kind = precision.assess(state, max(0.0, effect_equity * config.ordinary_position_fraction))
+                score = setup.score
+                state["selective_policy_version"] = selective.VERSION
+                state["selective_exit_plan"] = selective.exit_plan(config)
+                state["selective_entry_evidence"] = setup.precision_evidence
+            elif config.recurrent_swing_enabled:
+                score, kind = _entry_score(state, policy)
                 setup, kind = swing.short_term_setup(
                     state, config, score, kind, entry_calibration
                 )
@@ -450,6 +507,7 @@ def _cycle_v24(
                 state["recurrent_swing_entry_raw_net_edge"] = setup.raw_net_edge
                 state["recurrent_swing_entry_qualifies"] = float(setup.qualifies)
             else:
+                score, kind = _entry_score(state, policy)
                 setup = None
             if math.isfinite(score):
                 candidates.append({
@@ -555,6 +613,14 @@ def _cycle_v24(
             if reserve < 1.0:
                 c["selection_reason"] = "exposure_or_cash_cap"
                 continue
+            if precision is not None:
+                sized_setup, _ = precision.assess(c["state"], reserve)
+                if not sized_setup.qualifies:
+                    c["selection_reason"] = sized_setup.reason
+                    continue
+                c["setup"] = sized_setup
+                c["score"] = sized_setup.score
+                c["state"]["selective_entry_evidence"] = sized_setup.precision_evidence
             c["chosen"] = True
             c["reserved_cash"] = reserve
             c["selection_reason"] = (
@@ -566,6 +632,10 @@ def _cycle_v24(
             committed_by_bucket[bucket] = committed_by_bucket.get(bucket, 0.0) + reserve
 
         for c in candidates:
+            # Shadow trials start only after the decision could actually exist.
+            # Historical rows without availability are never used as evidence.
+            if precision is not None:
+                c["state"]["selective_available_at"] = snapshot.isoformat()
             conn.execute(
                 """INSERT OR REPLACE INTO benchmark_candidates_v22
                 (benchmark_id,snapshot_at,token_key,market_cap_usd,entry_score,score_kind,chosen,state_json,
@@ -607,7 +677,7 @@ def _cycle_v24(
                 "mean": (sum(swing_probabilities) / len(swing_probabilities) if swing_probabilities else None),
                 "max": (max(swing_probabilities) if swing_probabilities else None),
                 "legacy_absolute_required": config.swing_entry_min_probability,
-                "active_required": (
+                "active_required": None if precision is not None else (
                     entry_calibration.as_dict().get("minimum_profitable_probability")
                     if entry_calibration is not None and entry_calibration.ready
                     else config.swing_entry_min_probability
@@ -620,6 +690,14 @@ def _cycle_v24(
                 "legacy_formula_positive_candidates": sum(value > 0.0 for value in raw_edges),
             },
             "calibration": entry_calibration.as_dict() if entry_calibration is not None else {"status": "disabled"},
+            "decision_policy_version": selective.VERSION if precision is not None else "recurrent_swing_legacy",
+            "selective_entry_requirements": ({
+                "win_rate_lower_bound": config.selective_min_win_lower_bound,
+                "net_return_lower_bound": config.selective_min_net_edge,
+                "reference_tokens": config.selective_reference_tokens,
+                "validation_tokens_per_region": config.selective_min_validation_tokens,
+                "exit_plan": selective.exit_plan(config),
+            } if precision is not None else None),
         }
 
         pending_created = []
@@ -693,10 +771,18 @@ def _cycle_v24(
             "UPDATE benchmark_account_v22 SET cash_usd=?,execution_cash_usd=?,last_snapshot_at=? WHERE benchmark_id=?",
             (cash, execution_cash, snapshot.isoformat(), bid),
         )
+        available_at = snapshot.isoformat()
         if live_decisions:
             # A queued board may have been copied while prediction was running.
             # Such a board must never fill an order before it actually existed.
             available_at = max(snapshot, pd.Timestamp.now(tz="UTC")).isoformat()
+            if precision is not None:
+                for candidate in candidates:
+                    candidate["state"]["selective_available_at"] = available_at
+                    conn.execute("UPDATE benchmark_candidates_v22 SET state_json=? WHERE benchmark_id=? AND snapshot_at=? AND token_key=?",
+                                 (_json(candidate["state"]), bid, snapshot.isoformat(), candidate["token_key"]))
+                    conn.execute("UPDATE benchmark_pending_entries_v24 SET entry_state_json=? WHERE benchmark_id=? AND token_key=? AND decision_at=? AND status='pending'",
+                                 (_json(candidate["state"]), bid, candidate["token_key"], snapshot.isoformat()))
             conn.execute(
                 """UPDATE benchmark_pending_entries_v24 SET decision_at=?
                 WHERE benchmark_id=? AND status='pending' AND decision_at=?""",
@@ -707,6 +793,8 @@ def _cycle_v24(
                 WHERE benchmark_id=? AND status='open' AND pending_exit_at=?""",
                 (available_at, bid, snapshot.isoformat()),
             )
+        conn.execute("INSERT OR REPLACE INTO benchmark_decision_clock_v24 VALUES(?,?,?)",
+                     (bid, snapshot.isoformat(), available_at))
         conn.commit()
     return {
         "processed": True,
@@ -777,14 +865,25 @@ def status(db: str) -> dict[str, Any]:
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
             """SELECT price_available_at_exit,exit_kind,
-                      COALESCE(execution_realized_pnl_usd,realized_pnl_usd)
+                      COALESCE(execution_realized_pnl_usd,realized_pnl_usd),entry_state_json
                FROM benchmark_positions_v22
                WHERE benchmark_id=? AND status='closed'""",
             (result["benchmark_id"],),
         ).fetchall()
-    priced = [float(pnl) for available, kind, pnl in rows
+        account_config = conn.execute("SELECT config_json FROM benchmark_account_v22 WHERE benchmark_id=?",
+                                      (result["benchmark_id"],)).fetchone()
+        config = _config_from_saved_json(account_config[0])
+        reasons = conn.execute(
+            """SELECT selection_reason,COUNT(*) FROM benchmark_candidates_v22
+               WHERE benchmark_id=? AND snapshot_at=(SELECT MAX(snapshot_at)
+                   FROM benchmark_candidates_v22 WHERE benchmark_id=?) GROUP BY selection_reason""",
+            (result["benchmark_id"], result["benchmark_id"])).fetchall()
+        latest_candidate = conn.execute(
+            "SELECT snapshot_at,state_json FROM benchmark_candidates_v22 WHERE benchmark_id=? ORDER BY snapshot_at DESC LIMIT 1",
+            (result["benchmark_id"],)).fetchone()
+    priced = [float(pnl) for available, kind, pnl, _ in rows
               if available == 1 and kind != "disappearance_terminal" and pnl is not None]
-    proxy_rows = [(available, kind, pnl) for available, kind, pnl in rows
+    proxy_rows = [(available, kind, pnl) for available, kind, pnl, _ in rows
                   if available != 1 or kind == "disappearance_terminal"]
     result["observable_exit_wins"] = {
         "profitable": sum(pnl > 0 for pnl in priced),
@@ -796,6 +895,30 @@ def status(db: str) -> dict[str, Any]:
     result["unavailable_exit_estimates"] = {
         "closed": len(proxy_rows),
         "execution_pnl_usd": sum(float(pnl) for _, _, pnl in proxy_rows if pnl is not None),
+    }
+    by_policy = {}
+    for available, kind, pnl, encoded in rows:
+        version = json.loads(encoded or "{}").get("selective_policy_version", "legacy_entry")
+        group = by_policy.setdefault(version, {"closed": 0, "priced_exits": 0,
+                                               "profitable_priced_exits": 0, "execution_pnl_usd": 0.0})
+        group["closed"] += 1
+        group["execution_pnl_usd"] += float(pnl or 0.0)
+        if available == 1 and kind != "disappearance_terminal" and pnl is not None:
+            group["priced_exits"] += 1
+            group["profitable_priced_exits"] += int(pnl > 0)
+    for group in by_policy.values():
+        group["observable_win_rate"] = (group["profitable_priced_exits"] / group["priced_exits"]
+                                         if group["priced_exits"] else None)
+    result["performance_by_entry_policy"] = by_policy
+    result["entry_policy"] = {
+        "version": selective.VERSION if config.selective_entry_enabled else "recurrent_swing_legacy",
+        "required_win_lower_bound": config.selective_min_win_lower_bound if config.selective_entry_enabled else None,
+        "required_net_return_lower_bound": config.selective_min_net_edge if config.selective_entry_enabled else None,
+        "latest_candidate_reasons": dict(reasons),
+        "latest_candidate_snapshot_at": latest_candidate[0] if latest_candidate else None,
+        "latest_evidence_sample": (json.loads(latest_candidate[1]).get("selective_entry_evidence")
+                                   if latest_candidate else None),
+        "exit_plan": selective.exit_plan(config) if config.selective_entry_enabled else None,
     }
     return result
 
@@ -849,6 +972,7 @@ def main() -> None:
         result = cycle(
             args.source_db, args.benchmark_db, args.predictions,
             args.forecast_model, args.policy_model, _config_from_args(args),
+            live_decisions=True,
         )
     elif args.cmd == "loop":
         loop(

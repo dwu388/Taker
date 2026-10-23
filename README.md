@@ -53,34 +53,51 @@ are capped at 30%, at least 70% remains unreserved cash, and empirically highly
 correlated tokens share a 15% risk-bucket cap. Existing benchmark databases gain
 these defaults through the additive migration; no model retraining is required.
 
-The paper wallet also treats each token as a recurrent swing lifecycle. When the
-minute-sensitive heads are present, a new entry must have a positive, friction-
-adjusted setup across the 5/10/15/30/60-minute peak probabilities, next-occurrence
-quantiles and next-peak magnitude. Broader later-higher, second-peak, downside and
-death forecasts provide lifecycle context rather than substituting for a timely
-entry signal. After at least 80 mature observations across 12 tokens, the entry
-overlay replaces its bootstrap absolute thresholds with champion-hash-specific
-calibration from realized 60-minute paths. It uses token-balanced regression and
-one-sided confidence bounds, and it permits only probability regions whose
-friction- and drawdown-adjusted realized reward is conservatively positive. The
-current cycle reports the calibration sample, probability bins, edge distribution
-and every rejection reason under `entry_evaluation`.
+The default paper execution policy is `selective_net_exit_v1`. The old overlay
+calibrated an opportunity reward containing the best future price, then sold with
+a different bootstrap rule. A positive opportunity reward did not establish that
+most executable trades would be profitable. The selective policy uses the trained
+forecast as its signal and validates actual next-observation shadow trades.
 
-An approaching first peak is a decision boundary, not an automatic sale. The
-wallet compares remaining hold-through value with the value of selling, releasing
-capital and retaining an option to re-enter. Strong, nearby second-peak evidence
-keeps the position open. A swing sale creates a durable watch record. Before the
-normal 20-minute cooldown expires, the same token can re-enter only after all of
-these are observed causally: a minimum three-minute wait, enough retracement to
-cover at least twice modeled round-trip friction, lifecycle evidence for another
-peak, and a newly recomputed qualifying short-term setup. This prevents immediate
-SELL/BUY churn while allowing an early second swing when the evidence supports it.
+New buys require all five 5/10/15/30/60-minute peak heads, ordered peak-magnitude
+quantiles, a timely occurrence forecast and a 60-minute death prediction. The
+lower (q25) peak price must cover the proposed order's full costs, the 3% net
+profit target and an additional 2% margin. Death probability is capped at 10%;
+if a separate minus-50% head exists its probability is capped at 20%. Missing
+optional downside predictions are identified in the evidence, not reported as
+measured zero risk.
 
-The strategy remains next-observation executable and paper-only. It does not alter
-V24 training labels, retrain a champion, feed benchmark results into training, or
-use future data. `v24_benchmark.bat status` reports active watches, completed
-re-entries, tokens with multiple swings and the highest swing sequence; benchmark
-exports include the swing-watch ledger.
+The weighted peak signal defines regions using 40 earlier distinct tokens.
+Later, disjoint tokens validate those regions after an execution-window embargo.
+Only one prospective candidate per token is used. An entry needs at least 20
+validation tokens in its region, a one-sided 99% Wilson win-rate lower bound of
+at least 75%, and a net-return lower bound of at least +1%. The mean-return bound
+uses mean minus 2.326 standard errors. These are conservative screening rules,
+not guaranteed coverage under dependent market outcomes or a promised live win
+rate. Unsupported signal regions are rejected rather than extrapolated.
+
+Shadow trades use only boards actually processed by the wallet, recorded decision
+availability, later buy/sell prices, and the exact proposed dollar size and saved
+cost scenario. Missing exit prices or capture gaps after a fill count as full
+losses **for the entry screen**; they never count as wins or fabricate ledger
+sales. Old peak-opportunity records lacking decision availability are excluded.
+Rejected candidates continue building evidence, so the wallet can initially make
+no new buys while it observes enough qualifying tokens.
+
+Live positions and shadow trades share net exit signals: take profit at +3%,
+stop loss at -10%, or exit after 60 minutes. Each signal fills on a later priced
+board, so realized profit/loss can cross those thresholds. The old bootstrap hold
+score cannot override these exits. New positions save their exit plan; existing
+positions receive the current risk/time exits as they become observable. Pending
+buys expire after three minutes, are cancelled on champion replacement, and are
+rechecked for price jumps and final-allocation fees before filling. The old
+recurrent swing overlay remains available with `selective_entry_enabled=False`
+for reproduction of earlier research runs.
+
+Existing wallets adopt the new decision defaults without resetting funds or
+changing saved fees. Trained artifacts and raw collection remain intact; benchmark
+outcomes remain isolated from V24 training. After updating code, restart
+`run_paper_loop.bat` to use the revised execution policy.
 
 On Windows, run `v24_benchmark.bat status` to inspect the active paper wallet.
 `observable_exit_wins` counts closed positions sold on a later priced board with
@@ -89,6 +106,10 @@ positive execution P&L after modeled costs. Its `profitable`, `closed`, and
 observed price. `unavailable_exit_estimates` counts terminal disappearance
 closes separately; those prices are conservative accounting proxies, not
 observed sales. The older top-level `win_rate` includes both kinds of close.
+`entry_policy` reports the active rules and latest rejection counts;
+`performance_by_entry_policy` keeps old entry results separate from the new
+selective entries, so the historical 21 trades do not become evidence of the
+new strategy's live success. Cycle logs include evidence under `entry_evaluation`.
 For the broader model and collection report, run `performance_report.bat` and
 read `data\CURRENT_MODEL_PERFORMANCE.txt`.
 

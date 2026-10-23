@@ -104,6 +104,7 @@ class ShortTermSetup:
     calibration_status: str
     calibrated_probability_floor: float | None
     reason: str
+    precision_evidence: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +124,7 @@ class ShortTermSetup:
             "calibration_status": self.calibration_status,
             "calibrated_probability_floor": self.calibrated_probability_floor,
             "reason": self.reason,
+            "precision_evidence": self.precision_evidence,
         }
 
 

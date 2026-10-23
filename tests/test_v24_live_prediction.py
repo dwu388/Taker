@@ -229,7 +229,7 @@ def test_predict_current_never_enters_training_frame_and_publishes_atomically(
     )
     assert cycle["processed"] is True
     assert cycle["snapshot_at"] == latest.isoformat()
-    assert cycle["policy_version"] == "bootstrap"
+    assert cycle["policy_version"] == "selective_net_exit_v1"
     refreshed = benchmark.refresh_predictions(str(db), str(model), str(output))
     assert refreshed["skipped"] is True
     assert refreshed["reason"] == "prediction_already_current_for_frozen_model"

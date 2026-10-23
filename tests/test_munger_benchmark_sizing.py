@@ -153,7 +153,7 @@ def test_v24_cycle_reserves_five_percent_without_retraining(tmp_path, monkeypatc
     migrate_raw(source)
     joblib.dump({"schema_version": v24.SCHEMA_VERSION}, model)
     predictions.write_text("token_key,v24_model_hash\n", encoding="utf-8")
-    benchmark.init_benchmark(str(benchmark_db), benchmark.BenchmarkConfig())
+    benchmark.init_benchmark(str(benchmark_db), benchmark.BenchmarkConfig(selective_entry_enabled=False))
 
     snapshot = pd.Timestamp("2026-09-20T12:00:00Z")
 
@@ -251,7 +251,7 @@ def test_exceptional_candidate_can_exceed_five_positions_within_exposure_caps(
     migrate_raw(source)
     joblib.dump({"schema_version": v24.SCHEMA_VERSION}, model)
     predictions.write_text("token_key,v24_model_hash\n", encoding="utf-8")
-    cfg = benchmark.BenchmarkConfig(conviction_calibration_min_scores=5)
+    cfg = benchmark.BenchmarkConfig(conviction_calibration_min_scores=5, selective_entry_enabled=False)
     benchmark.init_benchmark(str(benchmark_db), cfg)
 
     clock = {"snapshot": pd.Timestamp("2026-09-20T12:00:00Z"), "exceptional": False}

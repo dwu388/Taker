@@ -253,7 +253,9 @@ def test_shutdown_suppresses_wallet_and_snapshot_age_is_rechecked(tmp_path, monk
 def test_live_orders_cannot_fill_on_boards_copied_during_prediction(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     joblib.dump({'schema_version': v24.SCHEMA_VERSION}, args.forecast_model)
-    benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig())
+    # Preserve the legacy overlay fixture; selective timing is tested with
+    # executable validation evidence in test_selective_paper_policy.py.
+    benchmark.init_benchmark(args.benchmark_db, benchmark.BenchmarkConfig(selective_entry_enabled=False))
     snapshot = pd.Timestamp.now(tz='UTC') - pd.Timedelta(minutes=2)
     frame = pd.DataFrame({'token_key': ['A'], 'market_cap_usd': [100.0],
         'p_first_peak_by_5m': [0.85], 'p_first_peak_by_10m': [0.88],
@@ -361,6 +363,7 @@ def test_live_board_requires_forecast_for_every_priced_token(tmp_path):
 @pytest.mark.parametrize('prediction', [
     {'snapshot_at': '2026-09-22T11:59:00Z', 'p_first_peak_by_720m': .9},
     {'snapshot_at': '2026-09-22T12:00:00Z', 'p_first_peak_by_720m': float('nan')},
+    {'snapshot_at': '2026-09-22T12:00:00Z', 'p_first_peak_by_720m': float('inf')},
 ])
 def test_live_board_rejects_wrong_time_or_empty_forecast(tmp_path, prediction):
     args = args_for(tmp_path)

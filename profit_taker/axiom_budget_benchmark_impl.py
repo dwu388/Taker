@@ -99,6 +99,20 @@ class BenchmarkConfig:
     swing_watch_min_later_probability: float = 0.35
     swing_watch_min_second_upside: float = 0.03
     swing_watch_max_minutes: float = 240.0
+    # Selective execution policy. Missing fields in an existing wallet receive
+    # these defaults; saved fees and historical fills are never rewritten.
+    selective_entry_enabled: bool = True
+    selective_min_win_lower_bound: float = 0.75
+    selective_min_validation_tokens: int = 20
+    selective_reference_tokens: int = 40
+    selective_min_net_edge: float = 0.01
+    selective_take_profit_net: float = 0.03
+    selective_stop_loss_net: float = 0.10
+    selective_max_hold_minutes: float = 60.0
+    selective_max_entry_delay_minutes: float = 3.0
+    selective_max_path_gap_minutes: float = 3.0
+    selective_max_death_probability: float = 0.10
+    selective_max_downside_probability: float = 0.20
     # For unavailable/disappeared tokens, preserve all observed downside but only
     # recognize this fraction of positive MC movement in the execution ledger.
     # 0.0 means a stale/disappearance mark can never create paper profit.
@@ -238,6 +252,9 @@ def _ensure_column(conn: sqlite3.Connection, table: str, definition: str) -> Non
 
 
 def migrate(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS benchmark_decision_clock_v24 (
+        benchmark_id TEXT NOT NULL, snapshot_at TEXT NOT NULL, available_at TEXT NOT NULL,
+        PRIMARY KEY(benchmark_id,snapshot_at))""")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS benchmark_account_v22 (
@@ -497,6 +514,8 @@ def _config_from_saved_json(value: str) -> BenchmarkConfig:
 
 def _validate_munger_config(config: BenchmarkConfig) -> None:
     costs.validate(config)
+    from . import selective_paper_policy as selective
+    selective.validate(config)
     fractions = (
         config.ordinary_position_fraction,
         config.strong_position_fraction,
@@ -991,8 +1010,8 @@ def _read_current(
             raise RuntimeError(f"Live prediction omitted priced board tokens: {missing[:10]}")
         heads = [col for col in preds.columns if col.startswith(("p_", "pred_"))]
         priced_rows = current["market_cap_usd"].gt(0)
-        if not heads or (priced_rows.any() and not current.loc[priced_rows, heads]
-                         .apply(pd.to_numeric, errors="coerce").notna().any(axis=1).all()):
+        if not heads or (priced_rows.any() and not np.isfinite(current.loc[priced_rows, heads]
+                         .apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)).any(axis=1).all()):
             raise RuntimeError("Live prediction lacks finite forecast heads for priced board tokens.")
         current = current.drop(columns=["_merge"])
     if "market_cap_usd__pred" in current.columns:
@@ -1004,6 +1023,7 @@ def _read_current(
 
 def cycle(
     source_db: str, benchmark_db: str, predictions_path: str, forecast_model: str, policy_model: str, config: BenchmarkConfig,
+    *, live_decisions: bool = False,
 ) -> dict[str, Any]:
     """V24 forecasts use next-observation order fills; legacy benchmark models keep their original accounting semantics."""
     is_v24=False
@@ -1014,6 +1034,11 @@ def cycle(
             pr=_load_predictions(predictions_path); is_v24=bool("v24_model_hash" in pr.columns and pr["v24_model_hash"].notna().any())
     except Exception:
         is_v24=False
+    if live_decisions:
+        if not is_v24:
+            raise RuntimeError("Live paper execution requires a valid V24 forecast; legacy fallback is disabled.")
+        return _cycle_v24(source_db, benchmark_db, predictions_path, forecast_model, policy_model,
+                          config, live_decisions=True)
     fn=_cycle_v24 if is_v24 else _cycle_legacy
     return fn(source_db,benchmark_db,predictions_path,forecast_model,policy_model,config)
 
@@ -1962,7 +1987,8 @@ def loop(
         started = time.monotonic()
         try:
             pred = refresh_predictions(source_db, forecast_model, predictions_path)
-            result = cycle(source_db, benchmark_db, predictions_path, forecast_model, policy_model, config)
+            result = cycle(source_db, benchmark_db, predictions_path, forecast_model, policy_model, config,
+                           live_decisions=True)
             print(json.dumps({"predictions": pred, "benchmark": result}, indent=2, default=str), flush=True)
         except Exception as exc:
             print(json.dumps({"error": type(exc).__name__, "message": str(exc)}, indent=2), flush=True)
