@@ -254,7 +254,7 @@ def test_v24_wallet_can_sell_first_swing_and_reenter_same_token_lifecycle(
     migrate_raw(source)
     joblib.dump({"schema_version": v24.SCHEMA_VERSION}, model)
     predictions.write_text("token_key,v24_model_hash\n", encoding="utf-8")
-    benchmark.init_benchmark(str(wallet), benchmark.BenchmarkConfig())
+    benchmark.init_benchmark(str(wallet), benchmark.BenchmarkConfig(selective_entry_enabled=False))
 
     clock = {"at": pd.Timestamp("2026-09-22T12:00:00Z"), "mc": 100.0, "state": short_setup()}
 
