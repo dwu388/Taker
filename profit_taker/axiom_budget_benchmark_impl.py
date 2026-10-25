@@ -102,10 +102,11 @@ class BenchmarkConfig:
     # Selective execution policy. Missing fields in an existing wallet receive
     # these defaults; saved fees and historical fills are never rewritten.
     selective_entry_enabled: bool = True
-    selective_min_win_lower_bound: float = 0.75
+    selective_min_win_lower_bound: float = 0.50
     selective_min_validation_tokens: int = 20
     selective_reference_tokens: int = 40
     selective_min_net_edge: float = 0.01
+    selective_warmup_position_fraction: float = 0.03
     selective_take_profit_net: float = 0.03
     selective_stop_loss_net: float = 0.10
     selective_max_hold_minutes: float = 60.0
@@ -509,6 +510,11 @@ def _config_from_saved_json(value: str) -> BenchmarkConfig:
     if "execution_cost_model" not in raw:
         defaults["execution_cost_model"] = "legacy_round_trip"
     defaults.update({k: raw[k] for k in defaults if k in raw})
+    # The v1 wallet saved the old policy default in full. Upgrade that default
+    # only when the v2 sizing field is absent; never rewrite the wallet or fees.
+    if ("selective_warmup_position_fraction" not in raw
+            and raw.get("selective_min_win_lower_bound") == 0.75):
+        defaults["selective_min_win_lower_bound"] = 0.50
     return BenchmarkConfig(**defaults)
 
 

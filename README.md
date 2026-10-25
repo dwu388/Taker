@@ -53,7 +53,7 @@ are capped at 30%, at least 70% remains unreserved cash, and empirically highly
 correlated tokens share a 15% risk-bucket cap. Existing benchmark databases gain
 these defaults through the additive migration; no model retraining is required.
 
-The default paper execution policy is `selective_net_exit_v1`. The old overlay
+The default paper execution policy is `selective_net_exit_v2`. The old overlay
 calibrated an opportunity reward containing the best future price, then sold with
 a different bootstrap rule. A positive opportunity reward did not establish that
 most executable trades would be profitable. The selective policy uses the trained
@@ -61,28 +61,33 @@ forecast as its signal and validates actual next-observation shadow trades.
 
 New buys require all five 5/10/15/30/60-minute peak heads, ordered peak-magnitude
 quantiles, a timely occurrence forecast and a 60-minute death prediction. The
-lower (q25) peak price must cover the proposed order's full costs, the 3% net
-profit target and an additional 2% margin. Death probability is capped at 10%;
+lower (q25) peak forecast must cover the proposed order's full costs and 1% net;
+the median (q50) must cover the 3% net profit target and another 2% margin.
+The median occurrence forecast must be within 30 minutes. These are forecast
+screens, not promises of sale at the predicted peak. Death probability is capped at 10%;
 if a separate minus-50% head exists its probability is capped at 20%. Missing
 optional downside predictions are identified in the evidence, not reported as
 measured zero risk.
 
 The weighted peak signal defines regions using 40 earlier distinct tokens.
 Later, disjoint tokens validate those regions after an execution-window embargo.
-Only one prospective candidate per token is used. An entry needs at least 20
-validation tokens in its region, a one-sided 99% Wilson win-rate lower bound of
-at least 75%, and a net-return lower bound of at least +1%. The mean-return bound
-uses mean minus 2.326 standard errors. These are conservative screening rules,
-not guaranteed coverage under dependent market outcomes or a promised live win
-rate. Unsupported signal regions are rejected rather than extrapolated.
+Only one prospective candidate per token is used. While fewer than 20 filled
+validation trades exist in a region, a forecast-screened candidate can enter at
+up to 3% of equity, with at most one open or pending warm-up position. Five or
+more validation trades with a nonpositive mean net return or fewer than half wins
+veto further warm-up entries in that region. At 20 trades, entries need a one-sided
+90% Wilson win-rate lower bound of at least 50% and a mean net-return lower bound
+of at least +1% (mean minus 1.282 standard errors). These exploratory screens
+cannot guarantee a future win rate or a particular number of trades. Once
+reference regions exist, unsupported signal scores are rejected rather than extrapolated.
 
 Shadow trades use only boards actually processed by the wallet, recorded decision
 availability, later buy/sell prices, and the exact proposed dollar size and saved
 cost scenario. Missing exit prices or capture gaps after a fill count as full
 losses **for the entry screen**; they never count as wins or fabricate ledger
 sales. Old peak-opportunity records lacking decision availability are excluded.
-Rejected candidates continue building evidence, so the wallet can initially make
-no new buys while it observes enough qualifying tokens.
+Rejected candidates continue building evidence. Version 1 shadow observations
+are not silently relabeled as version 2 evidence; new evidence builds prospectively.
 
 Live positions and shadow trades share net exit signals: take profit at +3%,
 stop loss at -10%, or exit after 60 minutes. Each signal fills on a later priced

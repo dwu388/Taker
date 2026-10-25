@@ -491,7 +491,8 @@ def _cycle_v24(
             if not state:
                 continue
             if precision is not None:
-                setup, kind = precision.assess(state, max(0.0, effect_equity * config.ordinary_position_fraction))
+                setup, kind = precision.assess(state, max(0.0, effect_equity * min(
+                    config.ordinary_position_fraction, config.selective_warmup_position_fraction)))
                 score = setup.score
                 state["selective_policy_version"] = selective.VERSION
                 state["selective_exit_plan"] = selective.exit_plan(config)
@@ -567,6 +568,8 @@ def _cycle_v24(
             tier = _conviction_tier(c["score"], threshold_cache[c["kind"]])
             c["conviction_tier"] = tier
             c["target_fraction"] = _tier_fraction(tier, config)
+            if precision is not None and c["setup"].reason == "selective_forecast_warmup":
+                c["target_fraction"] = min(c["target_fraction"], config.selective_warmup_position_fraction)
             c["target_cash"] = effect_equity * c["target_fraction"]
             c["selection_reason"] = "eligible"
             eligible.append(c)
@@ -593,6 +596,10 @@ def _cycle_v24(
         cash_after_reservations = max(0.0, min(cash, execution_cash) - reserved)
         selected = []
         for c in eligible:
+            if (precision is not None and c["setup"].reason == "selective_forecast_warmup"
+                    and occupied_positions + len(selected) > 0):
+                c["selection_reason"] = "selective_warmup_slot_limit"
+                continue
             within_base_limit = len(selected) < base_slots
             exceptional_overflow = (
                 not within_base_limit and c["conviction_tier"] == "exceptional"
