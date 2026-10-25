@@ -42,26 +42,62 @@ def test_wins_require_later_token_evidence_and_positive_net_edge():
     assert kind == selective.VERSION
     assert setup.qualifies
     assert setup.precision_evidence["validation_tokens"] == 25
-    assert setup.precision_evidence["win_lower_bound"] >= .75
+    assert setup.precision_evidence["win_lower_bound"] >= .50
     assert setup.net_edge >= .01
     assert setup.precision_evidence["downside_head_available"] is False
     # A confident-looking forecast never substitutes for realized evidence.
     empty = calibration([]).assess(forecast(), 50.0)[0]
-    assert not empty.qualifies
-    assert empty.reason == "insufficient_selective_reference"
+    assert empty.qualifies and empty.reason == "selective_forecast_warmup"
     thin = calibration([trial(i) for i in range(39)]).assess(forecast(), 50.0)[0]
-    assert not thin.qualifies
-    assert thin.reason == "insufficient_selective_validation_tokens"
+    assert thin.qualifies and thin.reason == "selective_forecast_warmup"
 
 
 def test_large_lucky_winners_cannot_mask_low_precision():
     samples = [trial(i) for i in range(20)]
-    samples += [trial(i, (100.0, 300.0, 300.0) if i < 80 else (100.0, 80.0, 80.0)) for i in range(20, 120)]
+    samples += [trial(i, (100.0, 300.0, 300.0) if i < 60 else (100.0, 80.0, 80.0)) for i in range(20, 120)]
     setup = calibration(samples).assess(forecast(), 50.0)[0]
     assert setup.net_edge > 0
-    assert setup.precision_evidence["wins"] == 60
-    assert setup.reason == "selective_win_evidence_below_target"
+    assert setup.precision_evidence["wins"] == 40
+    assert setup.reason == "selective_early_outcomes_unprofitable"
     assert not setup.qualifies
+
+
+def test_cost_positive_moderate_forecast_can_trade_during_warmup():
+    empty = calibration([])
+    state = forecast(.08, next_occurrence_q50=12,
+                     next_peak_multiple_q25=1.10, next_peak_multiple_q50=1.20)
+    setup = empty.assess(state, 30)[0]
+    assert setup.qualifies and setup.reason == "selective_forecast_warmup"
+    assert setup.precision_evidence["net_peak_q25"] >= empty.config.selective_min_net_edge
+    assert not empty.assess({**state, "next_peak_multiple_q25": 1.05}, 30)[0].qualifies
+    assert not empty.assess({**state, "next_occurrence_q50": 45}, 30)[0].qualifies
+    assert not empty.assess({**state, "p_death_by_60m": .5}, 30)[0].qualifies
+
+
+def test_five_bad_executable_outcomes_stop_warmup_entries():
+    samples = [trial(i) for i in range(20)]
+    samples += [trial(i, (100, 80, 80)) for i in range(20, 25)]
+    setup = calibration(samples).assess(forecast(), 50)[0]
+    assert setup.precision_evidence["validation_tokens"] == 5
+    assert not setup.qualifies
+    assert setup.reason == "selective_early_outcomes_unprofitable"
+
+
+def test_fresh_wallet_warmup_uses_one_small_position(tmp_path, monkeypatch):
+    source, wallet = tmp_path / "raw.sqlite", tmp_path / "wallet.sqlite"
+    model = tmp_path / "model.joblib"
+    migrate_raw(source)
+    joblib.dump({"schema_version": v24.SCHEMA_VERSION}, model)
+    paper.init_benchmark(str(wallet), paper.BenchmarkConfig())
+    snapshot = pd.Timestamp("2026-09-01T00:00:00Z")
+    board = pd.DataFrame([{"token_key": token, "market_cap_usd": 100.0, **forecast(.08)}
+                          for token in ("A", "B")])
+    monkeypatch.setattr(paper, "_read_current", lambda *_a, **_kw: (snapshot, board))
+    result = paper._cycle_v24(str(source), str(wallet), "unused.csv", str(model), "missing.joblib",
+                             paper.BenchmarkConfig())
+    assert len(result["pending_entries"]) == 1
+    assert result["pending_entries"][0]["reserved_cash_usd"] == pytest.approx(30.0)
+    assert result["entry_evaluation"]["rejection_reasons"]["selective_warmup_slot_limit"] == 1
 
 
 def test_replay_cannot_sell_at_hindsight_peak_or_same_decision_price():
@@ -237,7 +273,12 @@ def test_existing_config_gets_selective_defaults_without_changing_saved_fees():
         "execution_cost_model": "axiom_cost_scenario", "sol_usd_reference": 103.0}))
     assert cfg.selective_entry_enabled
     assert cfg.sol_usd_reference == 103.0
-    assert cfg.selective_min_win_lower_bound == .75
+    assert cfg.selective_min_win_lower_bound == .50
+    assert cfg.selective_warmup_position_fraction == .03
+    old = paper._config_from_saved_json(json.dumps({"execution_cost_model": "axiom_cost_scenario",
+        "sol_usd_reference": 103.0, "selective_min_win_lower_bound": .75}))
+    assert old.selective_min_win_lower_bound == .50
+    assert old.sol_usd_reference == 103.0
 
 
 def test_live_selective_decisions_record_real_availability_and_reject_incomplete_hashes(tmp_path, monkeypatch):

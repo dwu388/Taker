@@ -21,9 +21,10 @@ import pandas as pd
 from . import paper_execution_costs as costs
 from . import recurrent_swing_policy as swing
 
-VERSION = "selective_net_exit_v1"
-# One-sided 99% bounds for each of at most three fixed reference regions.
-CONFIDENCE_Z = 2.3263478740408408
+VERSION = "selective_net_exit_v2"
+# One-sided 90% bounds. A 99% lower bound above 75% required virtually
+# perfect small samples and made the first paper trade impossible.
+CONFIDENCE_Z = 1.2815515655446004
 
 
 def validate(config: Any) -> None:
@@ -40,6 +41,8 @@ def validate(config: Any) -> None:
             raise ValueError(f"{name} must be finite and positive.")
     if config.selective_stop_loss_net >= 1:
         raise ValueError("Selective stop loss must be below 100%.")
+    if not 0 < config.selective_warmup_position_fraction <= 1:
+        raise ValueError("Warm-up position fraction must be between zero and one.")
     if config.selective_reference_tokens < 20 or config.selective_min_validation_tokens < 20:
         raise ValueError("Selective reference and validation samples need at least 20 distinct tokens.")
 
@@ -74,7 +77,8 @@ def signal(state: dict[str, Any], config: Any, cash: float,
     downside = swing._finite(state.get("p_hit_minus50_by_60m"))
     result = {"eligible": False, "reason": "incomplete_selective_forecast", "probability": 0.0,
               "q25": q25, "q50": q50, "occurrence": occurrence,
-              "death": death, "downside": downside, "net_peak_q25": None}
+              "death": death, "downside": downside, "net_peak_q25": None,
+              "net_peak_q50": None}
     # The active V24 hazard model supplies death, but some champions do not
     # train a separate minus-50% barrier head. Never pretend that missing head
     # is a measured zero risk; executable outcome validation covers losses too.
@@ -94,11 +98,13 @@ def signal(state: dict[str, Any], config: Any, cash: float,
     _, _, units = costs.entry_fill(cash, fill_mc, config)
     proceeds, _ = costs.exit_fill(units, decision_mc * q25, config)
     result["net_peak_q25"] = proceeds / cash - 1.0
-    if occurrence > min(config.swing_entry_max_occurrence_minutes, config.selective_max_hold_minutes):
+    median_proceeds, _ = costs.exit_fill(units, decision_mc * q50, config)
+    result["net_peak_q50"] = median_proceeds / cash - 1.0
+    if occurrence > min(30.0, config.swing_entry_max_occurrence_minutes, config.selective_max_hold_minutes):
         result["reason"] = "selective_peak_too_distant"
     elif death > config.selective_max_death_probability or (downside is not None and downside > config.selective_max_downside_probability):
         result["reason"] = "selective_downside_risk_too_high"
-    elif result["net_peak_q25"] < config.selective_take_profit_net + config.swing_entry_min_net_upside:
+    elif result["net_peak_q25"] < config.selective_min_net_edge or result["net_peak_q50"] < config.selective_take_profit_net + config.swing_entry_min_net_upside:
         result["reason"] = "selective_lower_upside_below_cost_buffer"
     elif costs.round_trip_cost_fraction(config, cash) >= config.selective_stop_loss_net:
         result["reason"] = "selective_cost_exceeds_loss_budget"
@@ -178,7 +184,7 @@ class Calibration:
                 "mature_unique_tokens": len(self.trials), "forecast_model_hash": self.model_hash,
                 "asof": self.asof.isoformat(), "required_win_lower_bound": self.config.selective_min_win_lower_bound,
                 "minimum_validation_tokens_per_region": self.config.selective_min_validation_tokens,
-                "confidence_per_region": 0.99, "maximum_regions": 3,
+                "confidence_per_region": 0.90, "maximum_regions": 3,
                 "outcome": "net next-observation exit; unresolved filled paths count as losses"}
 
     def regions(self, cash: float) -> dict[str, Any]:
@@ -231,24 +237,37 @@ class Calibration:
         info = signal(state, self.config, cash)
         reason = info["reason"]
         evidence = {**self.as_dict(), "cash_usd": cash, "net_peak_q25": info["net_peak_q25"],
+                    "net_peak_q50": info["net_peak_q50"],
                     "downside_head_available": info["downside_head_available"]}
         net_edge, qualifies, floor = 0.0, False, None
-        if info["eligible"]:
+        if info["eligible"] and self.status == "selective_source_outcomes_unavailable":
+            reason = self.status
+        elif info["eligible"]:
+            # During warm-up, accept only the forecast-supported, cost-positive
+            # setup. Do not fabricate a validated win rate from zero trades.
+            net_edge = min(info["net_peak_q25"], info["net_peak_q50"])
+            qualifies, reason = True, "selective_forecast_warmup"
             result = self.regions(cash)
             selected = next((r for r in result["regions"]
                              if r["lower"] <= info["probability"] <= r["upper"]), None)
-            reason = result["status"] if not result["regions"] else "outside_selective_reference_support"
+            if result["regions"] and selected is None:
+                qualifies, reason = False, "outside_selective_reference_support"
             if selected is not None:
                 evidence.update(selected)
                 floor = selected["lower"]
-                net_edge = selected["net_return_lower_bound"] or 0.0
-                if selected["validation_tokens"] < self.config.selective_min_validation_tokens:
-                    reason = "insufficient_selective_validation_tokens"
+                n = selected["validation_tokens"]
+                if n >= 5 and (selected["win_rate"] < 0.5 or selected["mean_net_return"] <= 0):
+                    qualifies, reason = False, "selective_early_outcomes_unprofitable"
+                elif n < self.config.selective_min_validation_tokens:
+                    reason = "selective_forecast_warmup"
                 elif selected["win_lower_bound"] < self.config.selective_min_win_lower_bound:
+                    qualifies = False
                     reason = "selective_win_evidence_below_target"
-                elif net_edge < self.config.selective_min_net_edge:
+                elif selected["net_return_lower_bound"] is None or selected["net_return_lower_bound"] < self.config.selective_min_net_edge:
+                    qualifies = False
                     reason = "selective_net_edge_below_buffer"
                 else:
+                    net_edge = selected["net_return_lower_bound"]
                     qualifies, reason = True, "selective_evidence_qualified"
         evidence["reason"] = reason
         setup = swing.ShortTermSetup(
@@ -295,7 +314,7 @@ def build_calibration(conn: sqlite3.Connection, source_db: str, benchmark_id: st
             mc = float(mc)
             if not math.isfinite(mc) or mc <= 0:
                 continue
-            if not signal(state, config, config.initial_cash_usd * config.ordinary_position_fraction)["eligible"]:
+            if not signal(state, config, config.initial_cash_usd * config.selective_warmup_position_fraction)["eligible"]:
                 continue
             candidates[token] = (at, available, mc, state)
         except (TypeError, ValueError, KeyError):
@@ -307,6 +326,9 @@ def build_calibration(conn: sqlite3.Connection, source_db: str, benchmark_id: st
         (benchmark_id, snapshot.isoformat())).fetchall()
     clocks = {pd.Timestamp(at): pd.Timestamp(available) for at, available in clock_rows
               if pd.Timestamp(available) <= snapshot}
+    if not clocks:
+        result.status = "selective_source_outcomes_unavailable"
+        return result
     tokens = list(candidates)
     paths: dict[str, dict[pd.Timestamp, float]] = {token: {} for token in tokens}
     try:
